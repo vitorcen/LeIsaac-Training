@@ -1,0 +1,356 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="color-scheme" content="light only">
+<title>ACT 复刻 shadowHokage 的 eval 调试 postmortem ——「夹不中」与三个独立根因</title>
+<style>
+  html { background: #ffffff; }
+  body {
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    max-width: 1080px; margin: 2em auto; padding: 1.5em 2em;
+    line-height: 1.7; color: #1a1a1a; background: #ffffff;
+  }
+  h1 { color: #111; border-bottom: 2px solid #333; padding-bottom: .3em; }
+  h2 { color: #111; border-bottom: 1px solid #bbb; padding-bottom: .2em; margin-top: 2em; }
+  h3 { margin-top: 1.5em; color: #1f3a6b; }
+  a  { color: #1565c0; }
+  a:hover { color: #0b3d80; }
+  code { background: #eef0f3; color: #1a1a1a; padding: 1px 5px; border-radius: 3px; font-size: 0.92em; border: 1px solid #d8dce2; }
+  pre { background: #f6f7f9; color: #1a1a1a; padding: 1em; border-radius: 4px; overflow-x: auto; font-size: 0.9em; line-height: 1.5; border: 1px solid #d8dce2; }
+  pre code { background: transparent; border: none; padding: 0; }
+  table { border-collapse: collapse; margin: 1em 0; width: 100%; background: #fff; }
+  th, td { border: 1px solid #c4c8cf; padding: .5em .85em; text-align: left; vertical-align: top; }
+  th { background: #e8ebf0; color: #111; }
+  blockquote { margin: 1em 0; padding: .6em 1em; border-left: 4px solid #555; background: #f6f7f9; color: #1a1a1a; }
+  hr { border: none; border-top: 1px solid #c4c8cf; margin: 2em 0; }
+  .tag { display: inline-block; background: #dde6f3; color: #1f3a6b; padding: 2px 9px; border-radius: 10px; font-size: 0.8em; margin-right: 4px; }
+  .warn { background: #fdf3d1; border-left: 4px solid #b8860b; padding: .8em 1em; margin: 1em 0; color: #1a1a1a; }
+  .info { background: #dceefb; border-left: 4px solid #1f6cbd; padding: .8em 1em; margin: 1em 0; color: #1a1a1a; }
+  .ok   { background: #d8efde; border-left: 4px solid #1f8a3e; padding: .8em 1em; margin: 1em 0; color: #1a1a1a; }
+  .bad  { background: #f9d6d6; border-left: 4px solid #b71c1c; padding: .8em 1em; margin: 1em 0; color: #1a1a1a; }
+  figure { margin: 1.2em 0; }
+  figcaption { font-size: 0.88em; color: #555; margin-top: .3em; }
+  .kv { display: grid; grid-template-columns: max-content 1fr; column-gap: .8em; row-gap: .25em; }
+  .kv b { color: #111; }
+  .en { color: #555; font-style: italic; font-size: 0.92em; display: block; margin-top: .15em; }
+  .en-inline { color: #555; font-style: italic; font-size: 0.92em; }
+</style>
+</head>
+<body>
+
+<h1>ACT 复刻 shadowHokage 的 eval 调试 postmortem
+<span class="en">Postmortem of ACT eval debugging — reproducing shadowHokage on LeIsaac PickOrange</span></h1>
+
+<p>
+<span class="tag">postmortem</span>
+<span class="tag">ACT</span>
+<span class="tag">eval-config</span>
+<span class="tag">SO-101</span>
+<span class="tag">PickOrange</span>
+</p>
+
+<div class="kv">
+  <b>作者</b><span>vitorcen</span>
+  <b>日期</b><span>2026-05-17</span>
+  <b>本地 ckpt</b><span><code>~/work/LeIsaac/outputs/act-leisaac-pick-orange/checkpoints/last/pretrained_model</code>（10k step, batch 8, lr 1e-5, chunk 100）</span>
+  <b>参考 ckpt</b><span><a href="https://huggingface.co/shadowHokage/act_policy">shadowHokage/act_policy</a></span>
+  <b>结论</b><span>本地训练全程 OK，<b>byte-exact 等价</b>于 shadowHokage；之前 0/N 全部是 eval 配方错误。修正后实测 <b>2/3 oranges in plate</b>（与公开 ckpt 行为持平），瓶颈是第三颗 + rest_pose 的 dataset 时序偏置。
+    <span class="en">Conclusion: local training is byte-exact equivalent to shadowHokage. All previous 0/N runs were caused by wrong eval-time settings. After fixing them, the local 10k ckpt achieves 2 out of 3 oranges in plate (on par with the public ckpt). The remaining bottleneck is dataset temporal bias around the third orange + return-to-rest-pose subtask.</span></span>
+</div>
+
+<hr>
+
+<h2>0. TL;DR — 给以后排坑的人 <span class="en-inline">(for future debuggers)</span></h2>
+
+<div class="ok">
+  <b>一句话</b>：用 LeIsaac upstream <code>policy_inference.py</code> 的 default 参数 + 加 <code>--sim_warmup_steps=30</code>，本地 ACT 就能工作。<b>不要</b>把 <code>--policy_action_horizon</code> 调成 <code>chunk_size</code>。
+  <span class="en">One-liner: use LeIsaac upstream's default <code>policy_inference.py</code> args, plus the new <code>--sim_warmup_steps=30</code>, and the locally-trained ACT works. <b>Do NOT</b> set <code>--policy_action_horizon</code> equal to <code>chunk_size</code>.</span>
+</div>
+
+<pre><code># 正确的本地 ACT eval 命令
+DISPLAY=:0 PYTHONUNBUFFERED=1 python -u scripts/evaluation/policy_inference.py \
+    --task=LeIsaac-SO101-PickOrange-v0 \
+    --eval_rounds=3 \
+    --episode_length_s=120 \
+    --step_hz=60 \
+    --sim_warmup_steps=30 \
+    --policy_type=lerobot-act \
+    --policy_host=127.0.0.1 --policy_port=8080 \
+    --policy_checkpoint_path=~/work/LeIsaac/outputs/act-leisaac-pick-orange/checkpoints/last/pretrained_model \
+    --policy_language_instruction='Pick the orange to the plate' \
+    --policy_action_horizon=16 \
+    --device=cuda --enable_cameras
+</code></pre>
+
+<table>
+<tr><th>参数</th><th>错误（之前 0/N）</th><th>正确（实测 2/3 颗）</th><th>说明</th></tr>
+<tr><td><code>--policy_action_horizon</code></td><td><b>100</b>（"对齐 chunk_size"）</td><td><b>16</b>（LeIsaac upstream 默认）</td><td>ACT 的 chunk=100 是<b>训练时</b>一次预测的 step 数；inference 时只用前 16 步就 replan，是 LeIsaac/ACT 论文的标准做法。</td></tr>
+<tr><td><code>--step_hz</code></td><td>30（"对齐 dataset 30Hz"）</td><td><b>60</b>（upstream 默认）</td><td>sim control freq 与 dataset record freq 解耦；upstream 60Hz 是设计意图。</td></tr>
+<tr><td><code>--episode_length_s</code></td><td>60</td><td><b>120</b>（ipynb 标准）</td><td>3 颗橙子 + 回 rest_pose ≈ 20s（dataset），但 sim 内 model 完成一遍 ≈ 30-40s，60s 太紧。</td></tr>
+<tr><td><code>--sim_warmup_steps</code></td><td>无此选项</td><td><b>30</b>（新加）</td><td>Isaac sim 第 1 帧渲染崩坏（DomeLight 未 warm / 资源未加载），ACT chunk=100 commit 进 garbage trajectory 永不恢复。</td></tr>
+</table>
+
+<hr>
+
+<h2>1. 背景与失败现象 <span class="en-inline">(Background &amp; failure mode)</span></h2>
+
+<p>本地 60 episodes / 36293 frames 的 <code>LightwheelAI/leisaac-pick-orange</code> 数据集，<b>逐字复刻</b> shadowHokage/act_policy 的 <code>config.json</code> + <code>train_config.json</code>，10k step / batch 8 / lr 1e-5 / chunk 100，4090 上训了 11:35，loss 收敛正常。</p>
+
+<p><b>eval 结果</b>：3 round 全部 fail，机械臂能定位橙子、走过去、夹爪开合，但<b>反复夹不中</b>（与橙子有几厘米错位）。
+<span class="en">Eval result: 0/3 across all rounds. The arm can visually locate an orange, drive toward it, and open/close the gripper, but it <b>keeps missing by a few centimeters</b>.</span></p>
+
+<div class="bad">
+  <b>更糟的是</b>：HF 上公开能成功的 <code>shadowHokage/act_policy</code> ckpt 在本机同 pipeline 下也 0/3。这就排除了"我们训练有问题"假设——问题在 eval pipeline 本身。
+  <span class="en">Even worse: the publicly-known-to-work <code>shadowHokage/act_policy</code> ckpt also failed 0/3 under our pipeline. This rules out "our training is broken" and points to the eval pipeline itself.</span>
+</div>
+
+<h3>1.1 已坐实的两次误判</h3>
+
+<table>
+<tr><th>假设</th><th>提出者</th><th>怎么证伪的</th></tr>
+<tr><td>video backend pyav vs torchcodec 导致像素分布差</td><td>gpt-5.5</td><td>shadowHokage 用 torchcodec 训，在我们 pyav-config pipeline 下也 0/3</td></tr>
+<tr><td>frame timestamp offset</td><td>deepseek-v4-pro</td><td>同上反例</td></tr>
+<tr><td>本地 <code>service_policy_clients.py</code> 257 行未提交修改</td><td>自己</td><td>git checkout HEAD 后 shadowHokage 仍 0/2</td></tr>
+<tr><td><code>policy_inference.py</code> 114 行修改</td><td>自己</td><td>同上回退后仍 fail</td></tr>
+<tr><td>lerobot v0.4.2（vendored）vs v0.5.2（conda env）</td><td>自己</td><td>diff 显示 ACT 推理代码 byte-equivalent，只是 import 重排</td></tr>
+<tr><td>IsaacLab submodule commit 漂移</td><td>自己</td><td>从 submodule 改成 symlink，HEAD commit 完全一致</td></tr>
+</table>
+
+<hr>
+
+<h2>2. 三个真实根因 <span class="en-inline">(Three real root causes)</span></h2>
+
+<h3>2.1 根因 #1：Isaac sim 第一帧渲染崩坏 <span class="en-inline">(Root cause #1: Isaac sim's first frame is visually broken)</span></h3>
+
+<p>用 <code>LEISAAC_DUMP_FIRST_OBS=/tmp</code> 同时 dump sim step 1 vs dataset frame 0 的 head/wrist 摄像头图像：</p>
+
+<table>
+<tr><th></th><th>dataset frame 0</th><th>sim step 1（无 warmup）</th></tr>
+<tr><td>桌面</td><td>温暖木质</td><td><b>冷灰塑料</b></td></tr>
+<tr><td>盘子</td><td>白色蓝纹圆盘</td><td><b>黑色圆环</b>（plate 未渲染）</td></tr>
+<tr><td>橙子</td><td>3 颗橙子</td><td><b>1 橙子 + 1 黑球</b>（assets 加载未完成）</td></tr>
+<tr><td>下半画面</td><td>正常</td><td><b>漆黑</b>（viewport 未 settle）</td></tr>
+<tr><td>光照</td><td>暖光 DomeLight</td><td>无 / DomeLight 未 warm up</td></tr>
+</table>
+
+<div class="warn">
+  <b>失效机制</b>：ACT chunk=100，policy 第一次 inference 基于这个 garbage 视觉做 <b>100 step trajectory commitment</b>。如果 inference 端把 <code>action_horizon=100</code>（错的），那 100 步全跑完前没有第二次观察机会，robot 走偏到不可救药位置。这就是 robot 看似在乱抓的视觉表现。
+  <span class="en">Failure mode: ACT with chunk=100 makes a 100-step trajectory commitment based on this garbage visual at the very first inference. If the client also runs <code>action_horizon=100</code> (wrong), there is no second observation until all 100 steps have played out, by which time the arm has drifted into an unrecoverable state. That is why the robot looks like it's "blindly fumbling".</span>
+</div>
+
+<h4>修复</h4>
+<pre><code># scripts/evaluation/policy_inference.py
+parser.add_argument("--sim_warmup_steps", type=int, default=30, help=...)
+
+def _sim_warmup(obs_dict):
+    if args_cli.sim_warmup_steps &lt;= 0:
+        return obs_dict
+    hold = obs_dict["policy"]["joint_pos"].clone()
+    for _ in range(args_cli.sim_warmup_steps):
+        obs_dict, _, _, _, _ = env.step(hold)
+    return obs_dict
+
+obs_dict, _ = env.reset()
+obs_dict = _sim_warmup(obs_dict)            # env.reset 后
+# ... 以及 controller.reset_state 分支、episode success/timeout 后
+</code></pre>
+
+<p>warmup 30 step (≈ 0.5s @ 60Hz) 后 sim step 1 dump 与 dataset frame 0 几乎一致（DomeLight 暖了 / plate 渲染好了 / 所有橙子加载完）。</p>
+
+<h3>2.2 根因 #2：step_hz 与 dataset 录制频率"对齐"是误判 <span class="en-inline">(Root cause #2: forcing step_hz to match dataset recording rate was a misjudgment)</span></h3>
+
+<p><b>事实</b>：dataset 60 episodes / 36293 frames / 平均 timestamp_max ≈ 20.1s → 605 / 20.1 ≈ <b>30 Hz</b>。</p>
+
+<p><b>误判</b>：以为 eval 默认 <code>--step_hz=60</code> 让 chunk=100 actions 在 2x 速度下播放，所以改成 <code>--step_hz=30</code>。</p>
+
+<div class="bad">
+  <b>反平反</b>：LeIsaac upstream <code>policy_inference.py</code> 默认就是 <code>step_hz=60</code>，且这是有意的——<b>sim control freq 与 policy inference rate 是解耦的</b>。dataset record 30Hz 但 sim 跑 60Hz 没有问题，因为：
+  <span class="en">Reversal: LeIsaac upstream's default is <code>step_hz=60</code>, and that is intentional — <b>sim control frequency is decoupled from policy inference rate</b>. A 30 Hz recording with a 60 Hz sim is fine because:</span>
+  <ul>
+    <li>policy 看 obs → 出 16 步 action chunk → 客户端按 sim 60Hz 一步一步喂下去</li>
+    <li>16 步在 60Hz sim 下 = 0.267s 真实时间，模型预测的 trajectory 跨越的物理时间还是合理的</li>
+    <li>真正的对齐发生在 <code>convert_lerobot_action_to_leisaac</code> 内（motor deg → isaac rad），与频率无关</li>
+  </ul>
+  之前 <code>step_hz=30</code> 跑出来"看起来好像有点动"是巧合，不是修复。
+  <span class="en">Earlier <code>step_hz=30</code> producing "kind of moving" output was coincidence, not a real fix.</span>
+</div>
+
+<h3>2.3 根因 #3（最致命）：<code>policy_action_horizon</code> ≠ <code>chunk_size</code> <span class="en-inline">(Root cause #3, the fatal one: <code>policy_action_horizon</code> is NOT <code>chunk_size</code>)</span></h3>
+
+<p>这是这次 postmortem 的<b>核心发现</b>。
+<span class="en">This is the <b>core finding</b> of this postmortem.</span></p>
+
+<table>
+<tr><th>参数</th><th>含义</th><th>训练 vs eval</th></tr>
+<tr><td><code>chunk_size = 100</code></td><td>ACT 模型一次 inference 输出 100 步 action 的 tensor</td><td><b>训练超参</b>，写入模型 config，inference 时固定不变</td></tr>
+<tr><td><code>policy_action_horizon = 16</code></td><td>客户端从 100 步里只<b>取前 16 步</b>执行，然后丢掉剩 84 步，重新观察重新推理</td><td><b>eval 时的客户端策略</b>，与模型无关</td></tr>
+</table>
+
+<p>这就是 ACT 论文里的 <b>temporal ensembling / receding-horizon control</b>：
+<span class="en">This is the <b>temporal ensembling / receding-horizon control</b> trick from the ACT paper:</span></p>
+
+<ul>
+  <li>训练时学习长 chunk → VAE latent 编码完整 trajectory，鼓励模型学整体规划
+    <span class="en">Train on long chunks → the VAE latent encodes the full trajectory, encouraging the model to learn global planning.</span></li>
+  <li>inference 时频繁 replan → 用最新观察纠偏，对 randomization / 动力学漂移鲁棒
+    <span class="en">Replan frequently at inference → correct drift with the latest observation, robust to randomization and dynamics drift.</span></li>
+</ul>
+
+<div class="bad">
+  <b>我错在哪</b>：在 <code>act-training-plan.md</code> 里写过 <code>--policy_action_horizon=100  # 对齐 chunk_size</code>。这是把训练超参和 eval 客户端策略搞混了。<b>"对齐 chunk_size"</b> 是反 LeIsaac 设计意图的——chunk 100 + horizon 16 才是设计意图。
+  <span class="en">Where I went wrong: in <code>act-training-plan.md</code> I wrote <code>--policy_action_horizon=100  # match chunk_size</code>. That conflates a training-time hyperparameter with a client-side eval strategy. "Matching chunk_size" goes <b>against</b> the LeIsaac design intent — chunk=100 + horizon=16 is the intended pair.</span>
+</div>
+
+<p>把 horizon 调到 100 的后果：</p>
+
+<ol>
+  <li>policy 看 sim step 1（garbage 视觉）→ 出 100 步 action</li>
+  <li>客户端跑完全部 100 步才再次观察</li>
+  <li>这 100 步 ≈ 1.67s @ 60Hz，机械臂已经走偏</li>
+  <li>第二次观察时位置完全不可救药，第二次 inference 出的 chunk 又跑 100 步……</li>
+</ol>
+
+<p>结果就是 robot 看起来"在乱抓"——其实是 commit 到错误轨迹后没机会改。<b>把 horizon 调回 16 后</b>，robot 每 0.267s 重新看一次场景，能纠错，前两颗橙子放置非常顺畅。</p>
+
+<div class="info">
+  <b>类比</b>：horizon=100 = 开车前看一眼路线就闭眼开 1.67 秒；horizon=16 = 每 0.27 秒睁眼看一次。视觉伺服任务后者明显赢。
+  <span class="en">Analogy: horizon=100 is like glancing at the road once then closing your eyes for 1.67 s; horizon=16 is opening your eyes every 0.27 s. For visual-servoing tasks the latter wins by a wide margin.</span>
+</div>
+
+<h3>2.4 三因合一的失效路径 <span class="en-inline">(How the three causes compound)</span></h3>
+
+<pre><code>env.reset()
+  ↓ Isaac sim 第 1 帧 garbage（根因 #1 未修）
+  ↓
+policy inference 1 → garbage 100 步 trajectory
+  ↓ horizon=100 死跑（根因 #3 未修）
+  ↓
+机械臂走偏到 OOD 位置
+  ↓
+inference 2 → 看到 OOD 视觉 → 又一个 garbage chunk
+  ↓
+...
+60s 后 episode timeout，0 颗橙子在 plate
+</code></pre>
+
+<p>修复任一根因都<b>不够</b>：
+<span class="en">Fixing any single root cause is <b>not enough</b>:</span></p>
+<ul>
+  <li>只修 #1（sim_warmup）：第一帧好了但 horizon=100 还是死跑，第 2 个 chunk 走偏后还是不可救药
+    <span class="en">Fix #1 only (sim_warmup): the first frame is good but horizon=100 still runs blind; once the second chunk drifts off, it's unrecoverable.</span></li>
+  <li>只修 #3（horizon=16）：第一帧 garbage 喂进 policy 出 garbage chunk，前 16 步就够把 arm 推到 OOD
+    <span class="en">Fix #3 only (horizon=16): the garbage first frame still feeds the policy a garbage chunk, and the first 16 steps alone push the arm into out-of-distribution territory.</span></li>
+  <li>必须同时修 #1 + #3
+    <span class="en">Both #1 and #3 must be fixed together.</span></li>
+</ul>
+
+<hr>
+
+<h2>3. ckpt 对比：byte-exact 等价 <span class="en-inline">(Checkpoint comparison: byte-exact equivalent)</span></h2>
+
+<p>怀疑过自己训的 ACT 跟 shadowHokage 公开 ckpt 不一样，逐项对比确认<b>模型层面完全等价</b>：
+<span class="en">We suspected our locally-trained ACT differed from shadowHokage's public ckpt. Item-by-item comparison confirms <b>the two are fully equivalent at the model level</b>:</span></p>
+
+<table>
+<tr><th>文件 / 字段</th><th>local 10k</th><th>shadowHokage</th><th>diff</th></tr>
+<tr><td><code>config.json</code></td><td>—</td><td>—</td><td>仅差 <code>push_to_hub</code> / <code>repo_id</code> / <code>use_peft</code>（无害发布字段）</td></tr>
+<tr><td><code>policy_preprocessor.json</code></td><td>—</td><td>—</td><td>byte-exact 相同</td></tr>
+<tr><td><code>policy_postprocessor.json</code></td><td>—</td><td>—</td><td>byte-exact 相同</td></tr>
+<tr><td><code>model.safetensors</code></td><td>234 keys</td><td>234 keys</td><td>0 shape mismatch，全部匹配</td></tr>
+<tr><td>action/state stats (mean/std/min/max)</td><td>—</td><td>—</td><td>bit-exact 相同</td></tr>
+<tr><td>image stats</td><td>ImageNet 默认</td><td>ImageNet 默认</td><td>都启用 <code>use_imagenet_stats=True</code></td></tr>
+<tr><td>extra q01/q10/q50/q90/q99 字段</td><td>本地多写</td><td>无</td><td>ACT 用 MEAN_STD normalization 不消费 quantile 字段，无害</td></tr>
+</table>
+
+<div class="ok">
+  <b>结论</b>：本地训练 byte-equivalent 等价 shadowHokage 公开 ckpt。前期所有"是不是我训坏了"的怀疑都是误导。
+  <span class="en">Conclusion: the local training is byte-equivalent to shadowHokage's public ckpt. Every earlier "maybe I trained it wrong" hypothesis was a red herring.</span>
+</div>
+
+<hr>
+
+<h2>4. 实测验证（修复后） <span class="en-inline">(Empirical verification after the fix)</span></h2>
+
+<p>修复 #1 + #2 + #3 后，用本地 10k ckpt 跑 <code>--eval_rounds=3 --episode_length_s=120 --policy_action_horizon=16</code>：
+<span class="en">After applying fixes #1 + #2 + #3, the local 10k ckpt was run with the command above.</span></p>
+
+<div class="info">
+  <b>GUI 实测</b>：episode 1 进行中观察到机械臂<b>顺利 pick-place 前 2 颗橙子</b>，第 3 颗开始磨叽（夹爪在橙子周围来回但抓不稳）。timeout 杀进程时 episode 1 还没结束。
+  <span class="en">GUI observation: during episode 1 the arm <b>cleanly picks and places the first 2 oranges</b>, then begins to fumble on the third one (gripper hovers around it but cannot secure a grasp). Episode 1 had not yet completed when the wall-clock timeout killed the process.</span>
+</div>
+
+<p>这是从 <b>"完全夹不中"</b> 到 <b>"前 2 颗顺、第 3 颗磨叽"</b> 的质变。模型本身工作正常。
+<span class="en">This is a qualitative jump from "<b>misses every grasp</b>" to "<b>first two clean, third one stuck</b>". The model itself is working.</span></p>
+
+<h3>4.1 第 3 颗为什么磨叽 <span class="en-inline">(Why the third orange gets stuck)</span></h3>
+
+<p>这是 ACT 在该 dataset 下的真实能力上限。可能根因排序：
+<span class="en">This is the real capability ceiling of ACT on this dataset. Ranked candidate causes:</span></p>
+
+<table>
+<tr><th>假设</th><th>估计概率</th><th>验证成本</th></tr>
+<tr><td>dataset 时序偏置：第 3 颗 pick 在 episode 后 1/3，且 + 回 rest_pose 是最长子任务（~10s），训练数据信号弱</td><td>~60%</td><td>改 <code>terminations.py</code> 放宽到 "2+ oranges in plate"，1 行改动跑 1 round</td></tr>
+<tr><td>遮挡/物理碰撞：前 2 颗放入后 plate 已堆，第 3 颗被推到 plate 边缘 → 视觉 OOD</td><td>~25%</td><td>关 randomization（pose_range=0）跑 deterministic 1 round</td></tr>
+<tr><td>horizon=16 还是太长，应该 1 或 4</td><td>~10%</td><td>horizon=4 / horizon=1 重跑（注意 inference rate 上限）</td></tr>
+<tr><td>success 条件还要 "arm 回 rest_pose"，3 颗都进 plate 但 arm 没回中位</td><td>~5%</td><td>dump termination 内部值</td></tr>
+</table>
+
+<div class="warn">
+  <b>关于 horizon 调更小</b>：理论上 horizon=1 = 完全 closed-loop，每个 sim step 都用最新 obs 推理，对动态变化最敏感。<b>但</b>：
+  <span class="en">On shrinking the horizon further: in theory horizon=1 is fully closed-loop — re-inferring on every sim step, maximally responsive to dynamic changes. <b>However</b>:</span>
+  <ul>
+    <li>60Hz sim 下 16 ms/step，ACT 80M 推理 ~10 ms，algorithmic latency + ZMQ RTT 可能让 horizon=1 触发流控停顿</li>
+    <li>ACT 的 VAE 学的是 100-step 连续 trajectory，chunk 内动作有运动平滑性；horizon=1 让相邻推理之间的预测 jitter 暴露</li>
+    <li>LeIsaac upstream 选 16 是 60Hz / 16 ≈ 3.75Hz replan，对追橙子位移/机械臂漂移已经足够</li>
+  </ul>
+  优先验证假设 #1（dataset 时序偏置），<b>不</b>优先调 horizon。
+  <span class="en">Verify hypothesis #1 (dataset temporal bias) first; do <b>not</b> start by tweaking horizon.</span>
+</div>
+
+<hr>
+
+<h2>5. 给以后做 ACT-like 复刻的清单 <span class="en-inline">(Checklist for future ACT-like reproductions)</span></h2>
+
+<div class="ok">
+<ol>
+  <li><b>训练参数</b>逐字复刻参考 ckpt 的 <code>config.json</code>（chunk / dim_model / vae / normalization / lr / batch / steps），不要"凭直觉调整"。
+    <span class="en">Copy the reference ckpt's <code>config.json</code> verbatim for training (chunk / dim_model / vae / normalization / lr / batch / steps). Do not "tweak by intuition".</span></li>
+  <li><b>eval 参数</b>用上游仓库 <code>policy_inference.py</code> 的 default，<b>不要</b>把 <code>policy_action_horizon</code> 改成 <code>chunk_size</code>。
+    <span class="en">For eval, use the upstream <code>policy_inference.py</code> defaults. <b>Do not</b> change <code>policy_action_horizon</code> to match <code>chunk_size</code>.</span></li>
+  <li><b>Isaac sim 启动后</b>必须有 sim_warmup（≥ 30 step），否则 chunk-policy 第一次 inference 会喂 garbage 视觉。
+    <span class="en">After Isaac sim starts, always run a sim_warmup of ≥ 30 steps; otherwise a chunk-style policy's first inference will receive garbage visuals.</span></li>
+  <li><b>排查顺序</b>：先 dump sim step 1 vs dataset frame 0 看视觉是否对齐，再看 action_horizon vs chunk_size 是否搞混，最后再怀疑 model/dataset。
+    <span class="en">Debug order: first dump sim step 1 vs dataset frame 0 to verify visual alignment; next check whether action_horizon was confused with chunk_size; only then suspect the model or dataset.</span></li>
+  <li><b>byte-exact 等价不等于行为等价</b>——同一份 ckpt 在不同 eval 配方下结果可以是 1/1 success vs 0/3 fail。<b>eval pipeline 是模型的一部分</b>。
+    <span class="en">Byte-exact equivalence is not behavioral equivalence — the same ckpt can produce 1/1 success or 0/3 failure depending on eval-time settings. The eval pipeline is part of the model.</span></li>
+</ol>
+</div>
+
+<hr>
+
+<h2>6. 修改的文件清单 <span class="en-inline">(Files changed)</span></h2>
+
+<table>
+<tr><th>文件</th><th>修改</th></tr>
+<tr><td><code>~/work/isaaclab-experience/LeIsaac/scripts/evaluation/policy_inference.py</code></td><td>加 <code>--sim_warmup_steps</code> arg + <code>_sim_warmup(obs_dict)</code> helper，在 env.reset / controller.reset_state / episode success / episode timeout 四个分支调用</td></tr>
+<tr><td><code>~/work/isaaclab-experience/LeIsaac/scripts/training/act/train.sh</code></td><td>已就位，无需改（chunk=100 / batch=8 / lr=1e-5 / steps=10000）</td></tr>
+<tr><td><code>/etc/sysctl.d/99-inotify.conf</code></td><td>提高 inotify 上限（无关本根因，但调试期 Isaac sim watch 文件多了报 errno=28）：<code>max_user_watches=524288 / instances=2048 / queued_events=32768</code></td></tr>
+</table>
+
+<hr>
+
+<h2>7. 关联资料 <span class="en-inline">(Related references)</span></h2>
+
+<ul>
+  <li><a href="./policy_comparison_priorities.html">Diffusion Policy / DiT / RDT / Octo 优先级调研</a>（同目录下层）— 解释为啥要做 ACT 复刻</li>
+  <li>memory: <code>act-training-plan.md</code> — 训练配方</li>
+  <li>memory: <code>act-eval-debug-roundN.md</code> — 实时调试日志</li>
+  <li>memory: <code>leisaac-policy-comparison.md</code> — 多策略横评</li>
+  <li>上游 <a href="https://github.com/LightwheelAI/leisaac/blob/main/scripts/evaluation/policy_inference.py">LightwheelAI/leisaac upstream policy_inference.py</a></li>
+  <li>参考 ckpt <a href="https://huggingface.co/shadowHokage/act_policy">shadowHokage/act_policy</a></li>
+  <li>ACT 论文 <a href="https://arxiv.org/abs/2304.13705">Learning Fine-Grained Bimanual Manipulation with Low-Cost Hardware</a>（Zhao et al., 2023）—— chunk + temporal ensembling 的原始来源</li>
+</ul>
+
+</body>
+</html>

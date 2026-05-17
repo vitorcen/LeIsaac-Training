@@ -11,7 +11,7 @@
 # to get a "schema-free" base for fine-tuning on a 2-camera SO-101 dataset.
 #
 # Usage:
-#   bash scripts/finetune/prepare_smolvla_base.sh
+#   bash scripts/finetune/smolvla/prepare_base.sh
 #   # → outputs/.bases/smolvla_base_no_features/   (input_features = {})
 #
 # Then pass it to lerobot_finetune.sh:
@@ -21,7 +21,7 @@
 
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 BASE_REPO="${BASE_REPO:-lerobot/smolvla_base}"
 OUT_DIR="${OUT_DIR:-${REPO_ROOT}/outputs/.bases/$(basename "${BASE_REPO}")_no_features}"
 CONDA_ENV="${CONDA_ENV:-lerobot}"
