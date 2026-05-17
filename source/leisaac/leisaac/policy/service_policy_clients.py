@@ -199,24 +199,40 @@ class LeRobotServicePolicyClient(Policy):
         pretrained_name_or_path: str = "checkpoints/last/pretrained_model",
         actions_per_chunk: int = 50,
         device: str = "cuda",
+        camera_feature_names: dict[str, str] | None = None,
+        empty_camera_feats: list[tuple[str, tuple[int, int, int]]] | None = None,
     ):
         """
         Args:
             host: Host of the policy server.
             port: Port of the policy server.
             timeout_ms: Timeout of the policy server.
-            camera_infos: List of camera information. {camera_key: (height, width)}
+            camera_infos: List of camera information. {sim_camera_key: (h, w)}
             task_type: Type of task.
             policy_type: Type of policy.
             pretrained_name_or_path: Path to the pretrained model in the remote policy server.
             actions_per_chunk: Number of actions per chunk.
             device: Device to use.
+            camera_feature_names: Optional {sim_camera_key: model_image_feature_key}
+                map. Use this when the remote policy expects image feature names
+                different from the default ``observation.images.<sim_key>`` pattern,
+                e.g. SmolVLA base expects ``observation.image`` / ``observation.image2``.
+                When provided, the client's ``lerobot_features`` and raw payload
+                will use the model-side names directly, bypassing
+                ``rename_observations_processor`` entirely.
         """
         super().__init__("service")
         service_address = f"{host}:{port}"
         self.timeout_ms = timeout_ms
         self.task_type = task_type
         self.actions_per_chunk = actions_per_chunk
+        self.camera_feature_names = camera_feature_names or {}
+        # Policy slots with no sim camera: client pads zero images so the
+        # server's input_features validation passes (model weights for those
+        # slots are unused/dead but the schema is enforced).
+        self.empty_camera_feats: list[tuple[str, tuple[int, int, int]]] = list(
+            empty_camera_feats or []
+        )
 
         lerobot_features = {}
         self.last_action = None
@@ -230,9 +246,20 @@ class LeRobotServicePolicyClient(Policy):
         # TODO: add bi-arm support
 
         for camera_key, camera_image_shape in camera_infos.items():
-            lerobot_features[f"observation.images.{camera_key}"] = {
+            feature_key = self.camera_feature_names.get(
+                camera_key, f"observation.images.{camera_key}"
+            )
+            lerobot_features[feature_key] = {
                 "dtype": "image",
                 "shape": (camera_image_shape[0], camera_image_shape[1], 3),
+                "names": ["height", "width", "channels"],
+            }
+        for feature_key, shape_chw in self.empty_camera_feats:
+            # shape stored CHW; lerobot_features uses HWC
+            c, h, w = shape_chw
+            lerobot_features[feature_key] = {
+                "dtype": "image",
+                "shape": (h, w, c),
                 "names": ["height", "width", "channels"],
             }
         self.camera_keys = list(camera_infos.keys())
@@ -268,10 +295,47 @@ class LeRobotServicePolicyClient(Policy):
             raise RuntimeError("Failed to connect to policy server")
 
     def _send_observation(self, observation_dict: dict):
-        raw_observation = {
-            f"{key}": observation_dict[key].cpu().numpy().astype(np.uint8)[0] for key in self.camera_keys
-        }
+        # build_dataset_frame inside the server strips ``observation.images.`` to
+        # find the raw key; if the model uses non-standard image keys (e.g. SmolVLA's
+        # ``observation.image``) we already declared them verbatim and must send the
+        # raw payload under those same keys (the strip is a no-op for them).
+        raw_observation = {}
+        for sim_key in self.camera_keys:
+            send_key = self.camera_feature_names.get(sim_key)
+            if send_key is None:
+                send_key = sim_key
+            elif send_key.startswith("observation.images."):
+                send_key = send_key.removeprefix("observation.images.")
+            raw_observation[send_key] = observation_dict[sim_key].cpu().numpy().astype(np.uint8)[0]
+        for feature_key, shape_chw in self.empty_camera_feats:
+            send_key = feature_key.removeprefix("observation.images.")
+            c, h, w = shape_chw
+            raw_observation[send_key] = np.zeros((h, w, c), dtype=np.uint8)
         raw_observation["task"] = observation_dict["task_description"]
+
+        # DEBUG: dump multiple sim observations so we can diff vs the training
+        # dataset's raw frames. We dump at a few timesteps to see if the visual
+        # gap is at first frame only (e.g. home pose mismatch / scene warmup)
+        # or persists throughout (e.g. camera config bug).
+        import os as _os
+        _dump_dir = _os.environ.get("LEISAAC_DUMP_FIRST_OBS")
+        if _dump_dir:
+            _dump_at = {1, 10, 50, 100}
+            _seen = getattr(self, "_dumped_steps", set())
+            if self.latest_action_step + 1 in _dump_at and (self.latest_action_step + 1) not in _seen:
+                try:
+                    _os.makedirs(_dump_dir, exist_ok=True)
+                    from PIL import Image as _Image
+                    _step = self.latest_action_step + 1
+                    for _k, _v in raw_observation.items():
+                        if isinstance(_v, np.ndarray) and _v.ndim == 3 and _v.shape[-1] == 3:
+                            _path = f"{_dump_dir}/sim_step{_step:03d}_{_k}.png"
+                            _Image.fromarray(_v.astype(np.uint8)).save(_path)
+                            print(f"[dump] saved {_path} shape={_v.shape}")
+                    _seen.add(_step)
+                    self._dumped_steps = _seen
+                except Exception as _e:
+                    print(f"[dump] failed: {_e}")
 
         if self.task_type == "so101leader":
             joint_pos = convert_leisaac_action_to_lerobot(observation_dict["joint_pos"])
@@ -294,10 +358,17 @@ class LeRobotServicePolicyClient(Policy):
             }
         """
         self.latest_action_step += 1
+        # must_go=True bypasses the server's "Observation too similar" dedup
+        # filter. Upstream lerobot's threaded RobotClient flips this on only
+        # when its local action queue drains; LeIsaac runs one obs per sim
+        # step synchronously and re-sends after each action chunk is
+        # consumed, so every observation is effectively "queue-empty" — set
+        # must_go always to avoid getting filtered into a deadlock.
         observation = TimedObservation(
             timestamp=time.time(),
             observation=raw_observation,
             timestep=self.latest_action_step,
+            must_go=True,
         )
 
         # send observation to policy server
@@ -310,27 +381,53 @@ class LeRobotServicePolicyClient(Policy):
         )
         _ = self.stub.SendObservations(observation_iterator)
 
-    def _receive_action(self) -> dict:
-        actions_chunk = self.stub.GetActions(services_pb2.Empty())
-        if len(actions_chunk.data) == 0:
-            print("Received `Empty` from policy server, waiting for next call")
-            return None
-        return pickle.loads(actions_chunk.data)
+    def _receive_action(
+        self,
+        max_retries: int = 8,
+        retry_sleep_s: float = 0.025,
+    ) -> dict:
+        # Upstream lerobot uses a dedicated thread polling GetActions in a
+        # `while running: ...` loop; LeIsaac runs this synchronously inside the
+        # sim step. SmolVLA's first inference takes >100ms which doesn't fit in
+        # one sim step, so a single GetActions call lands before the server is
+        # done -> data is empty -> robot freezes for action_horizon sim steps.
+        # Bounded retry masks the transient gap (8 * 25ms = 200ms cap).
+        for _ in range(max_retries):
+            actions_chunk = self.stub.GetActions(services_pb2.Empty())
+            if len(actions_chunk.data) > 0:
+                return pickle.loads(actions_chunk.data)
+            time.sleep(retry_sleep_s)
+        print(
+            f"[CLIENT] no actions after {max_retries} retries "
+            f"({max_retries * retry_sleep_s * 1000:.0f}ms); reusing last action"
+        )
+        return None
 
     def get_action(self, observation_dict: dict) -> torch.Tensor:
-        if not self.skip_send_observation:
-            self._send_observation(observation_dict)
+        # Always re-send the observation. The original `skip_send_observation`
+        # flag was meant to avoid duplicate sends within an action chunk
+        # window, but combined with the upstream server's must_go-aware dedup
+        # filter it deadlocks: a single retry failure would set the flag and
+        # the client would then poll GetActions forever without sending a new
+        # observation. Sending every step is harmless because (a) must_go=True
+        # bypasses the dedup filter and (b) the simulator advances physics
+        # before each get_action call so observations actually differ.
+        self._send_observation(observation_dict)
         action_chunk = self._receive_action()
         if action_chunk is None:
-            self.skip_send_observation = True
             return torch.from_numpy(self.last_action).repeat(self.actions_per_chunk, 1)[:, None, :]
 
         action_list = [action.get_action()[None, :] for action in action_chunk]
         concat_action = torch.cat(action_list, dim=0)
+        raw_concat = concat_action.cpu().numpy() if hasattr(concat_action, 'cpu') else concat_action
         concat_action = convert_lerobot_action_to_leisaac(concat_action)
 
+        if self.latest_action_step <= 2:
+            import numpy as _np
+            print(f"[ACTION DEBUG step={self.latest_action_step}] raw(SmolVLA motor-deg) shape={raw_concat.shape} sample[0]={raw_concat[0]} sample[-1]={raw_concat[-1]}", flush=True)
+            print(f"[ACTION DEBUG step={self.latest_action_step}] converted(isaac rad) sample[0]={concat_action[0]} sample[-1]={concat_action[-1]} range=({concat_action.min():.3f},{concat_action.max():.3f})", flush=True)
+
         self.last_action = concat_action[-1, :]
-        self.skip_send_observation = False
 
         return torch.from_numpy(concat_action[:, None, :])
 
@@ -397,3 +494,133 @@ class OpenPIServicePolicyClient(WebsocketServicePolicy):
         processed_action = convert_lerobot_action_to_leisaac(action_chunk)
 
         return torch.from_numpy(processed_action[:, None, :])
+
+
+class Pi05ServicePolicyClient(Policy):
+    """Service client for the standalone π0.5 inference server.
+
+    Speaks ZMQ REQ/REP with msgpack envelope
+        {"endpoint": "get_action", "data": obs_dict}
+    where each ndarray is encoded as
+        {"__ndarray__": True, "data": <np.save bytes>, "dtype": str, "shape": tuple}.
+    This is *not* GR00T's MsgSerializer schema, so it cannot ride the
+    `Gr00tServicePolicyClient` / `ZMQServicePolicy` plumbing — we speak
+    msgpack directly here. The same wire works for both the Mac MLX
+    server and the NVIDIA PyTorch server in pi05-mlx-experience.
+
+    Observation schema (single-arm SO-101):
+        video.front: (H, W, 3) uint8  — NO batch dim, server resizes to 224
+        video.wrist: (H, W, 3) uint8  — optional, server only reads `front`
+        state.single_arm: (5,) float32
+        state.gripper:    (1,) float32
+        annotation.human.task_description: [str]
+
+    Response action chunk (50-step):
+        action.single_arm: (50, 5) float32
+        action.gripper:    (50, 1) float32
+    """
+
+    def __init__(
+        self,
+        host: str = "localhost",
+        port: int = 5555,
+        timeout_ms: int = 30000,
+        camera_keys: list[str] = ["front", "wrist"],
+        first_call_timeout_ms: int = 120000,
+    ):
+        super().__init__(type="pi05")
+        # First inference is slow (MLX JIT-compiles; PyTorch kernels
+        # autotune). We use a generous RCVTIMEO for the first
+        # get_action call, then drop to the steady-state timeout.
+        self._first_call = True
+        self._first_call_timeout_ms = first_call_timeout_ms
+        import io as _io
+        import msgpack as _msgpack
+        import zmq as _zmq
+
+        self._io = _io
+        self._msgpack = _msgpack
+        self.camera_keys = camera_keys
+        self.host = host
+        self.port = port
+        self.timeout_ms = timeout_ms
+
+        self.context = _zmq.Context()
+        self._zmq = _zmq
+        self._init_socket()
+
+        if not self._ping():
+            raise RuntimeError(f"π0.5 MLX server at tcp://{host}:{port} did not respond to ping")
+
+    def _init_socket(self):
+        self.socket = self.context.socket(self._zmq.REQ)
+        self.socket.connect(f"tcp://{self.host}:{self.port}")
+        rcv = self._first_call_timeout_ms if getattr(self, "_first_call", False) else self.timeout_ms
+        self.socket.setsockopt(self._zmq.RCVTIMEO, rcv)
+        self.socket.setsockopt(self._zmq.SNDTIMEO, self.timeout_ms)
+        self.socket.setsockopt(self._zmq.LINGER, 0)
+
+    def _arm_steady_state(self):
+        if self._first_call:
+            self._first_call = False
+            try:
+                self.socket.setsockopt(self._zmq.RCVTIMEO, self.timeout_ms)
+            except Exception:
+                pass
+
+    def _pack_ndarray(self, arr: np.ndarray) -> dict:
+        buf = self._io.BytesIO()
+        np.save(buf, arr, allow_pickle=False)
+        return {"__ndarray__": True, "data": buf.getvalue(), "dtype": str(arr.dtype), "shape": arr.shape}
+
+    def _unpack_ndarray(self, obj: dict) -> np.ndarray:
+        return np.load(self._io.BytesIO(obj["data"]), allow_pickle=False)
+
+    def _request(self, payload: dict) -> dict:
+        try:
+            self.socket.send(self._msgpack.packb(payload))
+            return self._msgpack.unpackb(self.socket.recv(), raw=False)
+        except self._zmq.error.ZMQError:
+            self.socket.close()
+            self._init_socket()
+            raise
+
+    def _ping(self) -> bool:
+        try:
+            resp = self._request({"endpoint": "ping"})
+            return isinstance(resp, dict) and resp.get("status") == "ok"
+        except Exception:
+            return False
+
+    def get_action(self, observation_dict: dict) -> torch.Tensor:
+        # Cameras: Isaac Sim renders (B, H, W, 3); server wants (H, W, 3).
+        obs = {}
+        for key in self.camera_keys:
+            if key not in observation_dict:
+                continue
+            img = observation_dict[key].cpu().numpy().astype(np.uint8)
+            if img.ndim == 4:
+                img = img[0]
+            obs[f"video.{key}"] = self._pack_ndarray(img)
+
+        joint_pos = convert_leisaac_action_to_lerobot(observation_dict["joint_pos"])
+        # joint_pos is (B, 6); server wants 1-D (5,) + (1,)
+        joint_pos_1d = np.asarray(joint_pos).reshape(-1)
+        if joint_pos_1d.shape[0] >= 6:
+            joint_pos_1d = joint_pos_1d[:6]
+        obs["state.single_arm"] = self._pack_ndarray(joint_pos_1d[:5].astype(np.float32))
+        obs["state.gripper"] = self._pack_ndarray(joint_pos_1d[5:6].astype(np.float32))
+
+        obs["annotation.human.task_description"] = [observation_dict["task_description"]]
+
+        resp = self._request({"endpoint": "get_action", "data": obs})
+        self._arm_steady_state()
+        if resp.get("status") != "ok":
+            raise RuntimeError(f"π0.5 server error: {resp.get('message')}")
+
+        data = resp["data"]
+        arm = self._unpack_ndarray(data["action.single_arm"])     # (50, 5)
+        grip = self._unpack_ndarray(data["action.gripper"])       # (50, 1)
+        chunk = np.concatenate([arm, grip], axis=1)               # (50, 6)
+        chunk = convert_lerobot_action_to_leisaac(chunk)
+        return torch.from_numpy(chunk[:, None, :])

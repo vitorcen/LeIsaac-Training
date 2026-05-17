@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="color-scheme" content="light only">
+<title>DP DDIM 加速 + eval wall-clock timeout 动态算法</title>
+<style>
+  html { background: #ffffff; }
+  body {
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    max-width: 1080px; margin: 2em auto; padding: 1.5em 2em;
+    line-height: 1.7; color: #1a1a1a; background: #ffffff;
+  }
+  h1 { color: #111; border-bottom: 2px solid #333; padding-bottom: .3em; }
+  h2 { color: #111; border-bottom: 1px solid #bbb; padding-bottom: .2em; margin-top: 2em; }
+  h3 { margin-top: 1.5em; color: #1f3a6b; }
+  a  { color: #1565c0; }
+  a:hover { color: #0b3d80; }
+  code { background: #eef0f3; color: #1a1a1a; padding: 1px 5px; border-radius: 3px; font-size: 0.92em; border: 1px solid #d8dce2; }
+  pre { background: #f6f7f9; color: #1a1a1a; padding: 1em; border-radius: 4px; overflow-x: auto; font-size: 0.9em; line-height: 1.5; border: 1px solid #d8dce2; }
+  pre code { background: transparent; border: none; padding: 0; }
+  table { border-collapse: collapse; margin: 1em 0; width: 100%; background: #fff; }
+  th, td { border: 1px solid #c4c8cf; padding: .5em .85em; text-align: left; vertical-align: top; }
+  th { background: #e8ebf0; color: #111; }
+  blockquote { margin: 1em 0; padding: .6em 1em; border-left: 4px solid #555; background: #f6f7f9; color: #1a1a1a; }
+  hr { border: none; border-top: 1px solid #c4c8cf; margin: 2em 0; }
+  .tag { display: inline-block; background: #dde6f3; color: #1f3a6b; padding: 2px 9px; border-radius: 10px; font-size: 0.8em; margin-right: 4px; }
+  .warn { background: #fdf3d1; border-left: 4px solid #b8860b; padding: .8em 1em; margin: 1em 0; color: #1a1a1a; }
+  .info { background: #dceefb; border-left: 4px solid #1f6cbd; padding: .8em 1em; margin: 1em 0; color: #1a1a1a; }
+  .ok   { background: #d8efde; border-left: 4px solid #1f8a3e; padding: .8em 1em; margin: 1em 0; color: #1a1a1a; }
+  .bad  { background: #f9d6d6; border-left: 4px solid #b71c1c; padding: .8em 1em; margin: 1em 0; color: #1a1a1a; }
+  .kv { display: grid; grid-template-columns: max-content 1fr; column-gap: .8em; row-gap: .25em; }
+  .kv b { color: #111; }
+  .en { color: #555; font-style: italic; font-size: 0.92em; display: block; margin-top: .15em; }
+  .en-inline { color: #555; font-style: italic; font-size: 0.92em; }
+  svg { display: block; margin: 1em auto; max-width: 100%; }
+</style>
+</head>
+<body>
+
+<h1>DP DDIM 加速 + eval wall-clock timeout 动态算法
+<span class="en">Speeding up DP inference with DDIM &amp; user-patience-based dynamic eval timeout</span></h1>
+
+<p>
+<span class="tag">DP</span>
+<span class="tag">DDIM</span>
+<span class="tag">eval-recipe</span>
+<span class="tag">wall-clock</span>
+<span class="tag">SO-101</span>
+<span class="tag">PickOrange</span>
+</p>
+
+<div class="kv">
+  <b>作者</b><span>vitorcen</span>
+  <b>日期</b><span>2026-05-17</span>
+  <b>背景</b><span>本地 DP 267M 在 100k step ckpt 上 eval，inference 393 ms / chunk 抢满 GPU SM，把 Isaac sim 渲染挤掉帧；shell <code>timeout=600s</code> 远不够 sim 跑完 120s × 3 round wall-clock，episode 在第一个 round 就被 SIGTERM。</span>
+  <b>结论</b><span>(1) DP 慢的根因不是模型大，是 DDPM 100-step 串行采样；DDIM scheduler 不需要重训直接换；(2) eval timeout 不能按 inference latency 放宽，应该按 user-patience 封顶 — 跑不完的模型该判别为"不适合实时部署"。</span>
+</div>
+
+<hr>
+
+<h2>0. TL;DR <span class="en-inline">(One-page summary)</span></h2>
+
+<div class="ok">
+  <b>两行 config 改动</b>：把 ckpt <code>config.json</code> 里 <code>noise_scheduler_type</code> 从 DDPM 改 DDIM、把 <code>num_inference_steps</code> 从 <code>null</code>（fallback 100）改成 GPU sweet spot（4090 上是 30–32）。重启 server load 一次，DP inference 从 393 ms → 147 ms。
+  <span class="en">Two-line config change: in the ckpt's <code>config.json</code>, switch <code>noise_scheduler_type</code> from DDPM to DDIM and set <code>num_inference_steps</code> from <code>null</code> (which falls back to 100) to a GPU-tuned sweet spot (30–32 on a 4090). Restart the policy server once, and DP inference drops from 393 ms to 147 ms per chunk.</span>
+</div>
+
+<div class="ok">
+  <b>动态 timeout 公式</b>：<code>total = startup + n_rounds × per_round_budget</code>。<code>per_round_budget</code> 按用户耐心定（GR00T baseline 30 s / round，给 3× 容差 = 90 s）。不要按 inference slowdown 放宽 — 那是给慢模型放水。
+  <span class="en">Dynamic timeout formula: <code>total = startup + n_rounds × per_round_budget</code>. Set <code>per_round_budget</code> by user patience (GR00T baseline ~30 s/round, ×3 tolerance = 90 s). Do <b>not</b> stretch the timeout to accommodate slow inference — that just lets bad models limp through.</span>
+</div>
+
+<hr>
+
+<h2>1. 起因：DP 把 GPU 3D 算力打满 <span class="en-inline">(Trigger: DP saturates the GPU and starves the renderer)</span></h2>
+
+<p>沿用上一篇 postmortem 修好的 eval 配方（<code>--policy_action_horizon=16 --sim_warmup_steps=30</code>），首跑 DP 100k ckpt 时观察到：
+<span class="en">Carrying forward the fixed eval recipe from the previous postmortem (<code>--policy_action_horizon=16 --sim_warmup_steps=30</code>), the first DP 100k-step ckpt run produced:</span></p>
+
+<ul>
+  <li>机械臂能放完前 2 颗橙子，第三颗后<b>界面完全定格不动</b>
+    <span class="en">The arm completes the first two oranges, then on the third the GUI <b>freezes solid</b>.</span></li>
+  <li>nvidia-smi 显示 GPU util 100%，但 Isaac sim 渲染明显掉帧、操作卡顿
+    <span class="en">nvidia-smi shows 100% GPU util, while Isaac sim's rendering visibly drops frames and the UI is laggy.</span></li>
+  <li>shell <code>timeout=600s</code> 设的，但 episode 1 都没跑完就被 kill
+    <span class="en">The shell <code>timeout=600s</code> killed the process before episode 1 even finished.</span></li>
+</ul>
+
+<h3>1.1 用 <code>nvidia-smi pmon</code> 拆 engine</h3>
+
+<table>
+<tr><th>进程</th><th>Compute SM%</th><th>Graphics SM%</th><th>说明</th></tr>
+<tr><td>lerobot policy_server (DP)</td><td><b>~97%</b></td><td>0</td><td>UNet 100-step diffusion 长时间占 CUDA SM</td></tr>
+<tr><td>Isaac sim (rendering)</td><td>0</td><td>~10%</td><td>RTX render head/wrist cameras，3D queue 排队等 SM 空闲</td></tr>
+<tr><td>gnome-shell / Xorg</td><td>0</td><td>~3%</td><td>桌面合成</td></tr>
+</table>
+
+<div class="info">
+  <b>洞察</b>：nvidia-smi 顶部一个综合 util %，分不开 Compute (C) 和 Graphics (G)。<code>pmon</code> 才能拆。DP 这种长 CUDA kernel 持续占 SM → 3D 渲染 queue 等 SM 空闲 → 用户看到的"GPU 3D 算力打满"<b>不是 leak，不是 spin-lock，是 Compute 抢占 Graphics</b>。
+  <span class="en">Insight: nvidia-smi's headline util% is a single combined number — it can't separate Compute (C) from Graphics (G). Only <code>pmon</code> breaks them out. A long-running CUDA kernel from DP keeps the SMs busy, so the 3D rendering queue has to wait. The "3D engine pegged at 100%" the user sees is <b>not a leak or spin-lock — it's Compute starving Graphics</b>.</span>
+</div>
+
+<hr>
+
+<h2>2. 根因 #1：DP 慢的物理本质是 DDPM 100-step <span class="en-inline">(Root cause #1: the real bottleneck is 100-step DDPM, not model size)</span></h2>
+
+<p>实测分解：</p>
+
+<table>
+<tr><th>指标</th><th>值</th></tr>
+<tr><td>DP 模型大小</td><td>1018 MB safetensors (267M params × fp32)</td></tr>
+<tr><td>单次 chunk 总 inference</td><td>393 ms</td></tr>
+<tr><td>diffusion 步数（DDPM training）</td><td>100</td></tr>
+<tr><td>每个 denoising step</td><td>393 / 100 = <b>3.93 ms</b></td></tr>
+<tr><td>UNet 单步算力需求</td><td>很轻（4090 上不到 4 ms）</td></tr>
+</table>
+
+<div class="bad">
+  <b>结论</b>：DP 在 4090 上慢，<b>不是因为模型太大</b>，是因为 DDPM scheduler 要求<b>串行跑完 100 个 denoising step 才能得到一次 action</b>。UNet 本身飞快，量化 / 8bit / fp16 加速 1.5–2x 是<b>错的优化方向</b>。
+  <span class="en">Conclusion: DP is slow on a 4090 <b>not because the model is large</b>, but because the DDPM scheduler requires running <b>all 100 denoising steps serially before producing one action chunk</b>. The UNet itself is fast — quantization / 8-bit / fp16 (1.5–2× speedup at best) is the <b>wrong optimization direction</b>.</span>
+</div>
+
+<h3>2.1 量化方向为啥不对 <span class="en-inline">(Why quantization is the wrong direction here)</span></h3>
+
+<table>
+<tr><th>方案</th><th>加速</th><th>重训</th><th>精度</th><th>工作量</th><th>是否真值得</th></tr>
+<tr><td><b>DDIM 10–30 step + fp16</b></td><td><b>4–10×</b></td><td>否</td><td>几乎无损</td><td>改 2 行 config</td><td>✅ 立刻试</td></tr>
+<tr><td>bitsandbytes int8</td><td>1.5–2×</td><td>否</td><td>小</td><td>仅 Linear 支持，DP UNet 多 Conv1d 收益小</td><td>❌</td></tr>
+<tr><td>torch dynamic int8</td><td>—</td><td>否</td><td>小</td><td><b>CPU only，GPU 无效</b></td><td>❌</td></tr>
+<tr><td>TensorRT static INT8 PTQ</td><td>3–4×</td><td>否（需 calibration）</td><td>中</td><td>ONNX export + engine 编译，1 天</td><td>仅在部署阶段考虑</td></tr>
+<tr><td>QAT</td><td>3–4×</td><td><b>是</b></td><td>极小</td><td>重训 100k step</td><td>❌ 投入太大</td></tr>
+</table>
+
+<div class="info">
+  <b>记住</b>：diffusion 类模型的第一优化永远是 <b>减少 sampling step</b>，不是量化权重。DDIM / DPM-Solver / consistency model 全都是这条路。SD 社区里 fp16 + 20-step DDIM 是部署标配，权重量化是边际优化。
+  <span class="en">Remember: for diffusion models the first optimization is always <b>fewer sampling steps</b>, not weight quantization. DDIM / DPM-Solver / consistency models all live on this path. In the SD community, fp16 + 20-step DDIM is the deployment default; weight quantization is a marginal add-on.</span>
+</div>
+
+<hr>
+
+<h2>3. 修复 #1：DDIM scheduler 不重训直接 swap <span class="en-inline">(Fix #1: hot-swap to DDIM scheduler without retraining)</span></h2>
+
+<p>LeRobot DP 实现里 <code>_make_noise_scheduler</code> 支持 DDPM 和 DDIM，且 <b>DDIM 是 DDPM 的确定性子集</b>，<b>同一份 DDPM-trained 权重直接用 DDIM scheduler 推理是 OK 的</b>（这是 Stable Diffusion 社区标准做法）。
+<span class="en">LeRobot DP's <code>_make_noise_scheduler</code> supports both DDPM and DDIM, and <b>DDIM is a deterministic subset of DDPM</b>. <b>The same DDPM-trained weights run correctly under a DDIM scheduler at inference time</b> — this is the standard Stable Diffusion community workflow.</span></p>
+
+<p>只需要改 <code>pretrained_model/config.json</code> 里 2 个字段：</p>
+
+<pre><code>{
+  "noise_scheduler_type": "DDIM",   // was: "DDPM"
+  "num_inference_steps": 32         // was: null → fallback 100
+}
+</code></pre>
+
+<p>然后重启 policy_server（让它重新 load model with new config）。客户端无需任何改动。
+<span class="en">Then restart the policy_server (it reloads the model under the new config). No client-side change is needed.</span></p>
+
+<hr>
+
+<h2>4. 根因 #2：DDIM 步数应该按 GPU 算力反推 <span class="en-inline">(Root cause #2: DDIM step count must be derived from GPU compute headroom)</span></h2>
+
+<p>从 0 步开始加 step，实测 DP inference 时间近似线性：
+<span class="en">Measuring inference time as we increase DDIM steps gives a near-linear curve:</span></p>
+
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 360" font-family="sans-serif" font-size="12">
+  <rect x="0" y="0" width="720" height="360" fill="#fff"/>
+  <!-- axes -->
+  <line x1="60" y1="320" x2="680" y2="320" stroke="#333" stroke-width="1.5"/>
+  <line x1="60" y1="320" x2="60" y2="30" stroke="#333" stroke-width="1.5"/>
+  <text x="370" y="350" text-anchor="middle">DDIM num_inference_steps</text>
+  <text x="20" y="180" text-anchor="middle" transform="rotate(-90 20 180)">inference_ms / chunk</text>
+  <!-- x ticks -->
+  <g fill="#333" text-anchor="middle">
+    <text x="120" y="335">10</text>
+    <text x="180" y="335">20</text>
+    <text x="240" y="335">30</text>
+    <text x="300" y="335">35</text>
+    <text x="420" y="335">50</text>
+    <text x="600" y="335">100 (DDPM)</text>
+  </g>
+  <!-- y ticks -->
+  <g fill="#333" text-anchor="end">
+    <text x="55" y="290">50</text>
+    <text x="55" y="240">100</text>
+    <text x="55" y="190">150</text>
+    <text x="55" y="140">200</text>
+    <text x="55" y="90">300</text>
+    <text x="55" y="40">400</text>
+  </g>
+  <line x1="60" y1="290" x2="680" y2="290" stroke="#eee"/>
+  <line x1="60" y1="240" x2="680" y2="240" stroke="#eee"/>
+  <line x1="60" y1="190" x2="680" y2="190" stroke="#eee"/>
+  <line x1="60" y1="140" x2="680" y2="140" stroke="#eee"/>
+  <line x1="60" y1="90" x2="680" y2="90" stroke="#eee"/>
+  <line x1="60" y1="40" x2="680" y2="40" stroke="#eee"/>
+  <!-- realtime threshold line (133ms) -->
+  <line x1="60" y1="207" x2="680" y2="207" stroke="#b71c1c" stroke-dasharray="6 4" stroke-width="1.5"/>
+  <text x="670" y="200" text-anchor="end" fill="#b71c1c" font-size="11">realtime threshold (133 ms / chunk @ 60Hz × 8 actions)</text>
+  <!-- data points -->
+  <circle cx="120" cy="270" r="5" fill="#1f8a3e"/>
+  <text x="120" y="260" text-anchor="middle" fill="#1f8a3e" font-size="11">60 ms</text>
+  <circle cx="180" cy="256" r="5" fill="#1f8a3e"/>
+  <text x="180" y="246" text-anchor="middle" fill="#1f8a3e" font-size="11">84 ms</text>
+  <circle cx="240" cy="221" r="5" fill="#1f8a3e"/>
+  <text x="240" y="211" text-anchor="middle" fill="#1f8a3e" font-size="11">~135 ms</text>
+  <circle cx="270" cy="214" r="5" fill="#1f8a3e"/>
+  <text x="270" y="223" text-anchor="middle" fill="#1f8a3e" font-size="11">147 ms (32)</text>
+  <circle cx="300" cy="207" r="5" fill="#b8860b"/>
+  <circle cx="420" cy="170" r="5" fill="#b71c1c"/>
+  <text x="420" y="160" text-anchor="middle" fill="#b71c1c" font-size="11">~200 ms 抢渲染</text>
+  <circle cx="600" cy="44" r="5" fill="#b71c1c"/>
+  <text x="600" y="34" text-anchor="middle" fill="#b71c1c" font-size="11">393 ms (DDPM)</text>
+  <!-- fitted line: y = 36 + 3.3 * step -->
+  <line x1="120" y1="278.5" x2="600" y2="44.5" stroke="#1565c0" stroke-dasharray="3 3"/>
+  <text x="500" y="120" fill="#1565c0" font-size="11" text-anchor="end">fit: ≈ 36 + 3.3 × step (ms)</text>
+</svg>
+
+<p><b>拟合公式</b>（4090 + Isaac sim 并行渲染场景）：
+<span class="en">Empirical fit (on a 4090 while Isaac sim is also rendering):</span></p>
+
+<pre><code>inference_ms ≈ overhead + step × per_step_ms
+              ≈ 36       + step × 3.3
+
+# overhead   ≈ ResNet18 image encode + preprocess + ZMQ RTT
+# per_step_ms ≈ UNet single denoising step on this GPU
+</code></pre>
+
+<h3>4.1 Sweet spot 反推公式 <span class="en-inline">(Closed-form for the sweet spot)</span></h3>
+
+<pre><code>target_inference_ms = effective_chunk × (1000 / step_hz) × safety
+                    = 8 × 16.67 × 0.85
+                    ≈ 113 ms          # 0.85 留 15% 给 Isaac sim 渲染
+
+max_steps           = (target_inference_ms − overhead) / per_step_ms
+                    = (113 − 36) / 3.3
+                    ≈ 23 step          # 安全档
+
+# 临界档 (safety=1.0, sim 渲染开始抢但还能跑)：
+target = 8 × 16.67 × 1.0 = 133 ms
+max_steps = (133 − 36) / 3.3 ≈ 29 step  # 等价实验里测出的 30
+</code></pre>
+
+<h3>4.2 不同卡的迁移 <span class="en-inline">(Transferring to other GPUs)</span></h3>
+
+<table>
+<tr><th>卡</th><th>预估 per_step_ms</th><th>safety 0.85 推荐 step</th><th>safety 1.0 临界 step</th></tr>
+<tr><td>RTX 4090 (24G, AD102)</td><td>~3.3</td><td>23</td><td>29</td></tr>
+<tr><td>RTX 3090 (24G, GA102)</td><td>~5</td><td>~15</td><td>~20</td></tr>
+<tr><td>RTX 4060 Ti (16G, AD106)</td><td>~7</td><td>~11</td><td>~14</td></tr>
+<tr><td>RTX 3060 (12G, GA106)</td><td>~10</td><td>~7</td><td>~10</td></tr>
+<tr><td>H100 (PCIe, GH100)</td><td>~1.5</td><td>~50</td><td>~64</td></tr>
+</table>
+
+<div class="warn">
+  <b>注意</b>：上表是估算。生产用法是 <b>启动前先 probe</b>（发 1 个 dummy obs 量真实 inference latency），然后按公式反推 step。这样不用维护硬编码表，跨 GPU 自适应。
+  <span class="en">Caveat: the table is an estimate. The production-grade approach is to <b>probe before launching</b> (send one dummy observation to the server to measure real inference latency), then derive the step count from the formula. That removes the hard-coded table and adapts across GPUs automatically.</span>
+</div>
+
+<hr>
+
+<h2>5. 实测调参曲线（4090） <span class="en-inline">(Measured calibration curve on a 4090)</span></h2>
+
+<table>
+<tr><th>DDIM step</th><th>inference</th><th>slowdown</th><th>GPU 流畅</th><th>episode 1 success</th><th>结论</th></tr>
+<tr><td>10</td><td>60 ms</td><td>0.45×</td><td>✅ 流畅</td><td>0 颗（夹住后抖）</td><td>太少，"放置"精度不够</td></tr>
+<tr><td>20</td><td>84 ms</td><td>0.63×</td><td>✅ 流畅</td><td>1 颗</td><td>第二颗夹住后抖</td></tr>
+<tr><td><b>30</b></td><td>~135 ms</td><td>1.01×</td><td>🟡 临界 (80% util)</td><td><b>2 颗</b></td><td>临界 sweet spot</td></tr>
+<tr><td><b>32</b></td><td><b>147.9 ms</b></td><td>1.11×</td><td>🟡 临界但 sim 还能跑</td><td><b>完成动作回 rest_pose</b>（一颗被推歪到 plate 外）</td><td><b>选定为本机 baseline</b></td></tr>
+<tr><td>33</td><td>~146 ms</td><td>1.10×</td><td>🟡</td><td>不行</td><td>跟 32 接近，但 task randomization noise 让单次 sample 看上去更差</td></tr>
+<tr><td>35</td><td>~150 ms</td><td>1.13×</td><td>🟡</td><td>不行</td><td>同上</td></tr>
+<tr><td>50</td><td>~200 ms</td><td>1.50×</td><td>❌ 爆 3D</td><td>—</td><td>GPU 被抢满，sim 渲染掉帧严重</td></tr>
+<tr><td>100 (DDPM)</td><td>393 ms</td><td>2.96×</td><td>❌ 严重</td><td>—</td><td>shell timeout 1700s 才能跑完，违反用户耐心</td></tr>
+</table>
+
+<div class="warn">
+  <b>关于 30 vs 33 vs 35 的差异</b>：每行只跑了 1 个 episode，<b>task 本身有 randomization noise</b>（橙子初始位姿随机化）。单次结果的 30→2颗 / 33→0颗 / 35→0颗 差异 <b>不能严肃归因于 DDIM step 数</b>，真严肃比较要每个 step 数跑 3+ round 取平均。这里只是定性确认"够 30 step 就能完成 ≥1 颗"，定量论断需要更多 sample。
+  <span class="en">On the 30 / 33 / 35 jitter: each row is a single episode and the <b>task itself has randomization noise</b> (orange initial poses are randomized). The single-shot 30→2 / 33→0 / 35→0 spread <b>cannot be confidently attributed to DDIM step count</b>. To make a rigorous comparison, each step setting needs 3+ rounds averaged. The qualitative finding here is just "≥30 steps suffices to complete ≥1 orange"; any quantitative claim needs more samples.</span>
+</div>
+
+<hr>
+
+<h2>6. 根因 #3：eval timeout 应按 user-patience，不按 inference latency 放宽 <span class="en-inline">(Root cause #3: eval timeout should be capped by user patience, not stretched for slow inference)</span></h2>
+
+<h3>6.1 错误的算法（之前我写的）<span class="en-inline">(Wrong algorithm — what I tried first)</span></h3>
+
+<pre><code># BAD — 给慢模型放水
+slowdown      = inference_ms / (effective_chunk × realtime_per_step_ms)
+total_timeout = startup + n_rounds × episode_s × slowdown × safety
+
+# DP DDPM 100-step: 60 + 3 × 120 × 2.96 × 1.5 = 1653 s ≈ 28 min
+</code></pre>
+
+<div class="bad">
+  <b>问题</b>：用户耐心 3–5 分钟。等 28 分钟跑完 3 round 没有意义。GR00T 30 s 完成一个 episode 就 success，那"能用"的标准就该是 30 s × 3 倍容差 = 90 s / round。<b>把 timeout 拉到 28 分钟，本质是在帮 deploy-不该 deploy 的模型争取时间</b>。
+  <span class="en">Problem: user patience is 3–5 minutes. Waiting 28 minutes for 3 rounds is pointless. GR00T finishes one episode in ~30 s — so the standard for "this model is deployable" should be 30 s × 3× tolerance = 90 s / round. <b>Stretching the timeout to 28 minutes essentially buys time for models that shouldn't be deployed in the first place.</b></span>
+</div>
+
+<h3>6.2 正确的算法 <span class="en-inline">(The right algorithm)</span></h3>
+
+<pre><code># GOOD — 按 user-patience 封顶
+STARTUP            = 60         # Isaac sim 冷启动 (s)
+TIMEOUT_PER_ROUND  = 90         # GR00T 30s baseline × 3 tolerance (s)
+total_timeout      = STARTUP + n_rounds × TIMEOUT_PER_ROUND
+                   = 60 + 3 × 90 = 330 s   # ≈ 5.5 min
+
+# 失败 mode: 模型跑不完 90s wall-clock 一个 round = 该模型不适合实时部署
+# Failure mode: a model that can't finish a round within 90s wall-clock = not deployable in real-time.
+</code></pre>
+
+<div class="ok">
+  <b>设计哲学</b>：timeout 是 <b>判别器</b>，不是 <b>包容器</b>。慢模型跑不到第 N 颗就被 kill，是正确的判决信号，应该报"DP DDPM 不适合实时部署"，而不是"再等 10 分钟试试"。
+  <span class="en">Design philosophy: timeout is a <b>discriminator</b>, not a <b>buffer</b>. A slow model getting killed before reaching the Nth orange is the correct verdict — it should be reported as "DP DDPM is not deployable in real-time," not "let's wait 10 more minutes."</span>
+</div>
+
+<h3>6.3 wrapper 脚本 <code>run_eval.sh</code> <span class="en-inline">(Wrapper script)</span></h3>
+
+<p>位置：<code>~/work/isaaclab-experience/LeIsaac/scripts/evaluation/run_eval.sh</code></p>
+
+<p>功能：</p>
+<ol>
+  <li>从 policy_server log 提取最近 50 次 inference 延迟平均值（informational only）
+    <span class="en">Read the avg of the last 50 inference latencies from the policy_server log (informational only).</span></li>
+  <li>从 ckpt <code>config.json</code> 自动读 <code>n_action_steps</code> 算 effective_chunk
+    <span class="en">Auto-read <code>n_action_steps</code> from the ckpt <code>config.json</code> to derive effective_chunk.</span></li>
+  <li>算 slowdown，<b>仅作为警告输出</b>（>2× 提示 "model too slow for 60Hz control"）
+    <span class="en">Compute slowdown but only emit it as a warning (>2× prints "model too slow for 60Hz control").</span></li>
+  <li>实际 timeout 用 <code>STARTUP + n_rounds × TIMEOUT_PER_ROUND</code> 固定公式
+    <span class="en">Actual timeout uses the fixed formula <code>STARTUP + n_rounds × TIMEOUT_PER_ROUND</code>.</span></li>
+  <li>支持 <code>--probe-only</code> dry-run 查看 timeout 不启动 sim
+    <span class="en">Supports <code>--probe-only</code> for a dry-run that prints the computed timeout without launching the sim.</span></li>
+</ol>
+
+<p>用法：</p>
+<pre><code>bash run_eval.sh -- \
+    --task=LeIsaac-SO101-PickOrange-v0 --eval_rounds=3 \
+    --episode_length_s=120 --step_hz=60 --sim_warmup_steps=30 \
+    --policy_type=lerobot-diffusion --policy_host=127.0.0.1 --policy_port=8080 \
+    --policy_checkpoint_path=&lt;ckpt&gt; \
+    --policy_action_horizon=16 --device=cuda --enable_cameras
+
+# 环境变量调节
+TIMEOUT_PER_ROUND=60 bash run_eval.sh -- ...   # 更严格：每 round 60 s
+TIMEOUT_STARTUP=30 bash run_eval.sh -- ...     # 更短启动 buffer
+</code></pre>
+
+<hr>
+
+<h2>7. 四个模型在 fair eval 配方下的对照（PickOrange） <span class="en-inline">(Four models under the fixed eval recipe)</span></h2>
+
+<table>
+<tr><th>模型</th><th>参数</th><th>inference / chunk</th><th>slowdown</th><th>第一颗</th><th>第二颗</th><th>第三颗</th><th>整体结论</th></tr>
+<tr><td>GR00T N1.5</td><td>3B</td><td>~50 ms</td><td>0.4×</td><td>✅</td><td>✅</td><td>✅</td><td><b>1/1 success, 30 s 完事</b></td></tr>
+<tr><td>ACT 80M</td><td>80M</td><td>~10 ms</td><td>&lt;0.1×</td><td>✅</td><td>✅（GUI 实测）</td><td>磨叽抓不稳</td><td>~2/3 oranges，瓶颈是 dataset 第三颗 OOD</td></tr>
+<tr><td>SmolVLA</td><td>450M</td><td>~22 ms</td><td>0.2×</td><td>难（VLM 没适配）</td><td>—</td><td>—</td><td>VLM 在 60 episode 上能力不足</td></tr>
+<tr><td>DP DDIM 32-step</td><td>267M</td><td>147 ms</td><td>1.1× (临界)</td><td>✅</td><td>✅（被推歪到 plate 外）</td><td>—</td><td>动作完成但物理判定 fail</td></tr>
+</table>
+
+<div class="info">
+  <b>洞察</b>：三个独立架构（ACT regression / SmolVLA VLM+action expert / DP diffusion）在<b>第三颗 / 第二颗后期</b>都失败 → 不是单一模型问题，是<b>共同的 dataset OOD bottleneck</b>：60 episode × 每集 1 次"放最后一颗"经验，覆盖不到 plate 上已堆 2 颗时的边缘 corner case。
+  <span class="en">Insight: three independent architectures (ACT regression / SmolVLA VLM+action expert / DP diffusion) all fail on the third or late-second orange → this is not a single-model issue, it's a <b>shared dataset OOD bottleneck</b>: 60 episodes × 1 "place last orange" demo per episode does not cover the edge cases that arise once two oranges are already crowding the plate.</span>
+</div>
+
+<hr>
+
+<h2>8. 给以后做 LeIsaac eval 的清单 <span class="en-inline">(Checklist for future LeIsaac evaluations)</span></h2>
+
+<div class="ok">
+<ol>
+  <li><b>启动 GPU 任务前</b>先 <code>nvidia-smi --query-gpu=memory.used,utilization.gpu</code> + <code>pgrep -af "policy_inference|isaac-sim"</code> 检查残留进程
+    <span class="en">Before any GPU job, run <code>nvidia-smi</code> + <code>pgrep</code> to check for leftover processes that hold VRAM or stale server state.</span></li>
+  <li><b>用 <code>run_eval.sh</code></b> 而不是直接 timeout × N，让 timeout 跟着用户耐心走
+    <span class="en">Use <code>run_eval.sh</code> instead of a hand-rolled <code>timeout N</code> command, so the timeout follows user patience rather than inference latency.</span></li>
+  <li><b>diffusion 类策略</b>先看 ckpt <code>config.json</code> 的 <code>noise_scheduler_type</code> 和 <code>num_inference_steps</code>。<code>DDPM + null</code> → fallback 100 步 → 一定卡。改 DDIM + GPU sweet spot
+    <span class="en">For diffusion-based policies, check the ckpt's <code>noise_scheduler_type</code> and <code>num_inference_steps</code> first. <code>DDPM + null</code> falls back to 100 steps and will choke. Switch to DDIM and pick a GPU-tuned step count.</span></li>
+  <li><b>用 <code>nvidia-smi pmon</code></b> 分 Compute (C) / Graphics (G) 看占用，单一 util% 数字会混淆 inference 和 rendering 的争抢
+    <span class="en">Use <code>nvidia-smi pmon</code> to separate Compute (C) and Graphics (G) utilization — the headline util% conflates inference vs. rendering contention.</span></li>
+  <li><b>多次实验取平均</b>。task 有 randomization noise，单 episode 数据不能严肃归因到 DDIM 步数 / lr / 任何超参
+    <span class="en">Average over multiple runs. The task has initialization randomness, and single-episode outcomes cannot be rigorously attributed to DDIM steps, learning rate, or any hyperparameter.</span></li>
+</ol>
+</div>
+
+<hr>
+
+<h2>9. 修改的文件清单 <span class="en-inline">(Files changed)</span></h2>
+
+<table>
+<tr><th>文件</th><th>修改</th></tr>
+<tr><td><code>~/work/LeIsaac/outputs/dp-leisaac-pick-orange-v2/checkpoints/last/pretrained_model/config.json</code></td><td><code>noise_scheduler_type: DDPM → DDIM</code><br><code>num_inference_steps: null → 32</code><br>原文件备份为 <code>.bak</code></td></tr>
+<tr><td><code>~/work/isaaclab-experience/LeIsaac/scripts/evaluation/run_eval.sh</code></td><td>新增 wrapper：probe inference latency + 自动读 ckpt n_action_steps + user-patience 公式算 timeout</td></tr>
+</table>
+
+<hr>
+
+<h2>10. 关联资料 <span class="en-inline">(Related references)</span></h2>
+
+<ul>
+  <li><a href="./act_eval_debug_postmortem.html">act_eval_debug_postmortem.html</a> — 上一轮 postmortem，三个根因（sim_warmup / step_hz / action_horizon）</li>
+  <li>memory: <code>leisaac-eval-timeout.md</code> — 本轮 dynamic timeout 记忆</li>
+  <li>memory: <code>feedback-pre-run-gpu-check.md</code> — 启动前 GPU 检查规矩</li>
+  <li>memory: <code>act-eval-debug-roundN.md</code> — 整体调试主线</li>
+  <li>LeRobot DP 实现：<a href="https://github.com/huggingface/lerobot/blob/main/src/lerobot/policies/diffusion/modeling_diffusion.py">modeling_diffusion.py</a> — <code>_make_noise_scheduler</code> 支持 DDIM/DDPM 切换</li>
+  <li>DDIM 论文：<a href="https://arxiv.org/abs/2010.02502">Denoising Diffusion Implicit Models</a> (Song et al., 2020) — 确定性 sampling 的原始来源</li>
+</ul>
+
+</body>
+</html>

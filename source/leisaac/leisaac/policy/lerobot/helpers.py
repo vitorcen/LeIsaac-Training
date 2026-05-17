@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 
 import torch
@@ -25,6 +25,9 @@ class RemotePolicyConfig:
     lerobot_features: dict[str, PolicyFeature]
     actions_per_chunk: int
     device: str = "cpu"
+    # Required by upstream lerobot >= the commit that added rename_observations_processor.
+    # Default empty dict keeps the old client behavior (no renaming).
+    rename_map: dict[str, str] = field(default_factory=dict)
 
 
 RawObservation = dict[str, torch.Tensor]
