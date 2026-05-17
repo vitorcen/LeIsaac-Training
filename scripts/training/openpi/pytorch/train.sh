@@ -5,8 +5,8 @@
 # pip install -e ~/work/isaaclab-experience/server.
 #
 # Usage:
-#   bash scripts/finetune/openpi/pytorch/train.sh                 # 3000-step smoke
-#   STEPS=10000 bash scripts/finetune/openpi/pytorch/train.sh     # full 10k
+#   bash scripts/training/openpi/pytorch/train.sh                 # 3000-step smoke
+#   STEPS=10000 bash scripts/training/openpi/pytorch/train.sh     # full 10k
 #
 # Knobs (env vars):
 #   CONDA_ENV        lerobot env                 (default: lerobot)

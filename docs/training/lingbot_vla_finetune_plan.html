@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>LingBot-VLA 微调可行性 — LeIsaac SO-101 PickOrange</title>
+<style>
+  :root {
+    --bg: #fafafa; --fg: #1a1a1a; --muted: #555;
+    --accent: #6f42c1; --warn: #d29922; --bad: #cf222e; --good: #1a7f37;
+    --code-bg: #f3f3f3; --border: #d0d7de;
+  }
+  body { font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+         background: var(--bg); color: var(--fg);
+         max-width: 980px; margin: 28px auto; padding: 0 22px; line-height: 1.6; }
+  h1 { border-bottom: 2px solid var(--fg); padding-bottom: 6px; }
+  h2 { margin-top: 36px; border-left: 4px solid var(--accent); padding-left: 10px; }
+  h3 { margin-top: 24px; color: var(--accent); }
+  .en { color: var(--muted); font-style: italic; font-size: 0.92em; }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0; }
+  th, td { border: 1px solid var(--border); padding: 6px 10px; text-align: left; vertical-align: top; }
+  th { background: #f0f3f6; }
+  code, pre { font-family: "JetBrains Mono", Menlo, Consolas, monospace; }
+  pre { background: var(--code-bg); padding: 12px; border-radius: 4px; overflow-x: auto; font-size: 0.88em; }
+  code { background: var(--code-bg); padding: 1px 5px; border-radius: 3px; }
+  .tag-good { color: var(--good); font-weight: 600; }
+  .tag-warn { color: var(--warn); font-weight: 600; }
+  .tag-bad  { color: var(--bad); font-weight: 600; }
+  .callout { border-left: 4px solid var(--warn); background: #fff8e6; padding: 10px 14px; margin: 14px 0; }
+  .callout.bad { border-color: var(--bad); background: #ffeef0; }
+  .callout.good { border-color: var(--good); background: #e6f4ea; }
+  svg { display: block; margin: 14px auto; }
+  ul { padding-left: 22px; }
+  li { margin: 4px 0; }
+  .meta { color: var(--muted); font-size: 0.9em; }
+</style>
+</head>
+<body>
+
+<h1>LingBot-VLA 微调可行性</h1>
+<p class="meta">蚂蚁 Robbyant 2026-01 开源 · SO-101 PickOrange 适配评估 · 2026-05-17</p>
+<p class="en">Feasibility study for adapting Robbyant LingBot-VLA (Ant Group, Jan 2026) to the LeIsaac SO-101 PickOrange single-arm task.</p>
+
+<h2>1. 什么是 LingBot-VLA · What is LingBot-VLA</h2>
+<p>蚂蚁集团旗下 Robbyant 在 <b>2026-01-28</b> 开源的 VLA foundation model。卖点：<b>"机器人通用大脑 / universal brain for robots"</b>，强调跨形态泛化和数据高效后训练。</p>
+<ul>
+<li>仓库：<a href="https://github.com/robbyant/lingbot-vla"><code>github.com/robbyant/lingbot-vla</code></a></li>
+<li>论文：<a href="https://arxiv.org/abs/2601.18692">arXiv 2601.18692</a></li>
+<li>License：<b>Apache-2.0</b></li>
+</ul>
+
+<h3>1.1 关键事实 · Key facts</h3>
+<table>
+<tr><th>项 / Item</th><th>值 / Value</th></tr>
+<tr><td>VL backbone</td><td><b>Qwen2.5-VL-3B-Instruct</b></td></tr>
+<tr><td>动作专家 / Action expert</td><td>Flow Matching 模块（与 π0.5 同制式）</td></tr>
+<tr><td>整体架构 / Overall</td><td>Mixture-of-Transformers (MoT, BAGEL-style) — VL 与 action 双路</td></tr>
+<tr><td>Action 输出</td><td><b>chunk 长度 T=50</b>, continuous</td></tr>
+<tr><td>预训练数据</td><td><b>20,000 小时</b>双臂遥操数据，<b>9 个双臂 embodiment</b></td></tr>
+<tr><td>Benchmark</td><td>GM-100 (real) + RoboTwin 2.0 (sim) — SOTA</td></tr>
+<tr><td>变体 / Variants</td><td>depth-free, depth-distilled</td></tr>
+<tr><td>训练吞吐</td><td>261 samples/sec/GPU on 8-GPU setup（FSDP）</td></tr>
+<tr><td>数据格式</td><td>LeRobot v3.0（含 v2.1 转换工具）</td></tr>
+<tr><td>数据高效</td><td>报告 80 demo/task 即可超过 baseline 130 demo</td></tr>
+</table>
+
+<h2>2. 系统架构图 · Architecture Diagram</h2>
+
+<svg width="900" height="320" viewBox="0 0 900 320" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="arrow2" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#6f42c1" />
+    </marker>
+  </defs>
+
+  <!-- VL pathway -->
+  <rect x="40" y="30" width="200" height="60" rx="8" fill="#eee6f7" stroke="#6f42c1" stroke-width="2"/>
+  <text x="140" y="55" text-anchor="middle" font-weight="bold">观测 · 多视角图像</text>
+  <text x="140" y="75" text-anchor="middle" font-size="12">cam_top + cam_wrist (480×640)</text>
+
+  <rect x="40" y="120" width="200" height="60" rx="8" fill="#eee6f7" stroke="#6f42c1" stroke-width="2"/>
+  <text x="140" y="145" text-anchor="middle" font-weight="bold">语言指令 · Language</text>
+  <text x="140" y="165" text-anchor="middle" font-size="12">"Pick up the orange..."</text>
+
+  <!-- Qwen2.5-VL-3B -->
+  <rect x="300" y="70" width="220" height="80" rx="8" fill="#fff8e6" stroke="#d29922" stroke-width="2"/>
+  <text x="410" y="100" text-anchor="middle" font-weight="bold">Qwen2.5-VL-3B-Instruct</text>
+  <text x="410" y="120" text-anchor="middle" font-size="12">VL backbone (frozen / LoRA)</text>
+  <text x="410" y="138" text-anchor="middle" font-size="12">→ multimodal embeddings</text>
+
+  <!-- Action expert -->
+  <rect x="580" y="70" width="240" height="80" rx="8" fill="#e6f4ea" stroke="#1a7f37" stroke-width="2"/>
+  <text x="700" y="100" text-anchor="middle" font-weight="bold">Action Expert (Flow Matching)</text>
+  <text x="700" y="120" text-anchor="middle" font-size="12">MoT-style 第二条 transformer</text>
+  <text x="700" y="138" text-anchor="middle" font-size="12">→ action chunk T=50</text>
+
+  <!-- Arrows -->
+  <line x1="240" y1="60" x2="298" y2="100" stroke="#6f42c1" stroke-width="2" marker-end="url(#arrow2)"/>
+  <line x1="240" y1="150" x2="298" y2="120" stroke="#6f42c1" stroke-width="2" marker-end="url(#arrow2)"/>
+  <line x1="520" y1="110" x2="578" y2="110" stroke="#6f42c1" stroke-width="2" marker-end="url(#arrow2)"/>
+
+  <!-- Output -->
+  <rect x="340" y="220" width="220" height="60" rx="8" fill="#ffeef0" stroke="#cf222e" stroke-width="2"/>
+  <text x="450" y="245" text-anchor="middle" font-weight="bold">⚠️ 双臂 14-DOF action</text>
+  <text x="450" y="265" text-anchor="middle" font-size="12">SO-101 是单臂 6-DOF — head mismatch</text>
+
+  <line x1="700" y1="150" x2="560" y2="220" stroke="#cf222e" stroke-width="2" stroke-dasharray="6,4" marker-end="url(#arrow2)"/>
+</svg>
+
+<h2>3. 致命问题：单臂不支持 · Critical Issue: Single-Arm NOT Supported</h2>
+
+<div class="callout bad">
+<b>风险等级：高 · Risk: HIGH。</b><br/>
+LingBot-VLA 论文原文："future research will focus on scaling the model versatility by <b>integrating single-arm and mobile robotic data</b>" — 即 <b>当前 ckpt 仅在双臂数据训练</b>，单臂支持是未来工作。<br/>
+我们的 <b>SO-101 是单臂 6-DOF</b>，与 LingBot 14-DOF（双臂 7+7）action head 维度不匹配。
+</div>
+
+<h3>3.1 适配 SO-101 的 3 条路径 · 3 paths to adapt</h3>
+
+<table>
+<tr><th>路径</th><th>做法</th><th>风险</th><th>评估</th></tr>
+<tr><td><b>A. Head 重训</b></td><td>砍掉双臂 action head，新增 6-DOF flow-matching head，从 scratch 训新 head + LoRA backbone</td><td>丢失 20k 小时双臂预训练优势；新 head 收敛速度 ≈ 从 zero 开始</td><td><span class="tag-warn">🟡 技术可行但成本高</span></td></tr>
+<tr><td><b>B. 假装双臂</b></td><td>把 SO-101 数据 pad 成双臂格式（第二臂置零或镜像）</td><td>数据分布严重 OOD，预训练学到的双臂协同先验反而干扰</td><td><span class="tag-bad">🔴 不推荐</span></td></tr>
+<tr><td><b>C. 等官方放单臂 ckpt</b></td><td>论文承诺将整合单臂数据 → 等</td><td>时间不可控（2026-Q2/Q3?）</td><td><span class="tag-warn">🟡 长期最优</span></td></tr>
+</table>
+
+<h2>4. 资源估算 · Resource Estimate</h2>
+<table>
+<tr><th>项</th><th>值</th></tr>
+<tr><td>Qwen2.5-VL-3B base size (bf16)</td><td>~6 GB</td></tr>
+<tr><td>Action expert size</td><td>未公开（估 0.5-1B）</td></tr>
+<tr><td>总参数估算</td><td>~3.5-4 B</td></tr>
+<tr><td>LoRA 训练 @ 4090, batch=4</td><td>估 ~16-20 GB ← <b>24GB 可容</b></td></tr>
+<tr><td>推理（chunk=50, flow-matching）</td><td>类比 π0.5（3.36B）单 chunk ~150-300 ms → <span class="tag-good">摊薄到每 sim step ~3-6 ms</span></td></tr>
+<tr><td>dataset</td><td>LeRobot v3.0 直接吃，60 ep ≈ 36k samples</td></tr>
+<tr><td>训练时长</td><td>估 8-15 h（类比 π0.5）</td></tr>
+</table>
+
+<div class="callout good">
+<b>对比 OpenVLA 优势 · Advantages over OpenVLA：</b>
+<ul>
+<li>✅ <b>参数更少（~3.5B vs 7B）</b>，LoRA 显存更宽裕</li>
+<li>✅ <b>chunk=50 摊薄推理</b>，30Hz sim 不会 timeout（vs OpenVLA 必 timeout）</li>
+<li>✅ Qwen2.5-VL backbone 比 OpenLlama-7B + DINOv2 + SigLIP 更新更强</li>
+<li>✅ LeRobot v3.0 原生支持</li>
+<li>✅ Apache-2.0 商用友好</li>
+</ul>
+</div>
+
+<h2>5. 实施路径（选路径 A：Head 重训）· Implementation Path A</h2>
+
+<h3>Phase 0 — 现实检查 (~0.5h)</h3>
+<ul>
+<li>确认 LingBot-VLA repo 提供的 fine-tune 脚本是否暴露 action_dim 参数</li>
+<li>查 <code>configs/</code> 是否允许 single-arm 配置（即便预训没训过）</li>
+<li>查 <code>action_expert</code> 是否模块化（能否 swap 6-DOF head）</li>
+</ul>
+
+<h3>Phase 1 — Action head 替换 (~3h)</h3>
+<ul>
+<li>找到原 action head：<code>action_expert/heads/dual_arm_head.py</code>（推测）</li>
+<li>新建 <code>single_arm_6dof_head.py</code>：flow-matching head, output dim=6</li>
+<li>config 加 <code>action_dim=6</code> 分支</li>
+</ul>
+
+<h3>Phase 2 — 数据接入 (~1h)</h3>
+<p>LeIsaac dataset 已是 LeRobot v3.0 — 直接喂。需要确认 LingBot 是否对 observation 命名有硬约束（dual-cam 命名 vs 我们的 <code>cam_top</code> / <code>cam_wrist</code>）。</p>
+
+<h3>Phase 3 — LoRA 微调 (~10h)</h3>
+<p>LoRA 配置（待 repo 内细节确认）：</p>
+<pre>--lora_rank=16 --lora_alpha=16
+--lora_targets q_proj,v_proj  # Qwen2.5-VL attention
+--freeze_action_expert=false  # head 必须训
+--batch=4 --lr=5e-5 --bf16
+--steps=10000 --grad_ckpt=true</pre>
+
+<h3>Phase 4 — Server + client (~2h)</h3>
+<ul>
+<li><code>server/lingbot_leisaac/server.py</code> — 类比 pi05 server</li>
+<li>client: <code>LingBotServicePolicyClient</code>，chunk=50 wire protocol</li>
+<li><code>policy_inference.py</code> 加 <code>--policy_type=lingbot</code></li>
+</ul>
+
+<h3>Phase 5 — Eval (~2h)</h3>
+<ul>
+<li>类比 π0.5 horizon sweep：从 chunk*0.5 = 25 起步</li>
+<li><b>预期 horizon trap 模式与 π0.5 类似</b>（同 chunk=50, 同 flow-matching）</li>
+</ul>
+
+<h2>6. 开源贡献机会 · Open-source Contribution Opportunity</h2>
+<p>论文明确把"单臂适配"列为 future work。如果我们做出 SO-101 single-arm fine-tune 工作流，可以：</p>
+<ul>
+<li>提 PR 到 <a href="https://github.com/robbyant/lingbot-vla"><code>robbyant/lingbot-vla</code></a> 加单臂支持模块</li>
+<li>发布 <code>wsagi/LingBot-VLA-PickOrange-SO101</code> 作为社区第一个单臂适配 ckpt</li>
+<li>HF 模型卡按惯例带 vitorcen 项目链接给自己引流（见 <code>feedback-hf-readme-project-links</code> 记忆）</li>
+</ul>
+
+<h2>7. 与 OpenVLA 的最终取舍 · Final Trade-off</h2>
+<table>
+<tr><th>维度</th><th>OpenVLA-7B</th><th>LingBot-VLA</th><th>胜者</th></tr>
+<tr><td>参数量</td><td>7B</td><td>~3.5B</td><td>LingBot</td></tr>
+<tr><td>单臂开箱即用</td><td><span class="tag-good">✅</span></td><td><span class="tag-bad">❌</span></td><td><b>OpenVLA</b></td></tr>
+<tr><td>实时性 @ 30Hz 4090</td><td><span class="tag-bad">🔴 480ms/action</span></td><td><span class="tag-good">🟢 chunk=50 摊薄</span></td><td><b>LingBot</b></td></tr>
+<tr><td>显存 LoRA</td><td>~25.6 GB 临界</td><td>~16-20 GB</td><td>LingBot</td></tr>
+<tr><td>数据格式</td><td>RLDS or LeRobot</td><td>LeRobot v3.0 原生</td><td>LingBot</td></tr>
+<tr><td>论文 / ckpt 成熟度</td><td>2024-06，下游丰富</td><td>2026-01，新</td><td>OpenVLA</td></tr>
+<tr><td>横评对照价值</td><td>高（7B 离散 token 档位空白）</td><td>高（VL backbone 新代）</td><td>平</td></tr>
+</table>
+
+<h3>建议执行顺序 · Recommended order</h3>
+<ol>
+<li><b>OpenVLA 先做</b>（已规划详见 <a href="openvla_finetune_plan.html">openvla_finetune_plan.html</a>）— 单臂直接可用，作为 7B VLA 基线</li>
+<li><b>LingBot-VLA 作为探索项</b>跟进 — 等 repo 看 head 模块化程度后决定走 path A 还是等 path C</li>
+<li>两者完成后，加上现有 4 个 baseline，构成 <b>6 模型横评矩阵</b></li>
+</ol>
+
+<h2>8. Open Questions · 待 verify</h2>
+<ol>
+<li>LingBot-VLA repo 的 <code>action_expert</code> 是否模块化，可否 swap 双臂 head 为单臂 head？</li>
+<li>LoRA fine-tune 在 24GB 4090 实际显存占用？官方未文档</li>
+<li>预训练 backbone 在双臂数据上学到的协同先验，对单臂 fine-tune 是助力还是干扰？</li>
+<li>官方何时放出单臂 ckpt？（论文说 future work，时间未定）</li>
+</ol>
+
+<h2>9. 关联文档 · Related docs</h2>
+<ul>
+<li><a href="openvla_finetune_plan.html"><code>openvla_finetune_plan.html</code></a> — OpenVLA-7B 微调计划（优先做）</li>
+<li><a href="policy_comparison_priorities.html"><code>policy_comparison_priorities.html</code></a> — 多策略横评主线</li>
+<li><a href="dp_inference_speedup_and_dynamic_timeout.html"><code>dp_inference_speedup_and_dynamic_timeout.html</code></a> — DP DDIM swap + dynamic timeout</li>
+<li><a href="act_eval_debug_postmortem.html"><code>act_eval_debug_postmortem.html</code></a> — ACT horizon trap 复盘</li>
+</ul>
+
+</body>
+</html>

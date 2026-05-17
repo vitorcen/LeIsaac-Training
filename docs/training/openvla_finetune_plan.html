@@ -1,0 +1,286 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>OpenVLA-7B LoRA 微调计划 — LeIsaac SO-101 PickOrange</title>
+<style>
+  :root {
+    --bg: #fafafa; --fg: #1a1a1a; --muted: #555;
+    --accent: #1f6feb; --warn: #d29922; --bad: #cf222e; --good: #1a7f37;
+    --code-bg: #f3f3f3; --border: #d0d7de;
+  }
+  body { font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+         background: var(--bg); color: var(--fg);
+         max-width: 980px; margin: 28px auto; padding: 0 22px; line-height: 1.6; }
+  h1 { border-bottom: 2px solid var(--fg); padding-bottom: 6px; }
+  h2 { margin-top: 36px; border-left: 4px solid var(--accent); padding-left: 10px; }
+  h3 { margin-top: 24px; color: var(--accent); }
+  .en { color: var(--muted); font-style: italic; font-size: 0.92em; }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0; }
+  th, td { border: 1px solid var(--border); padding: 6px 10px; text-align: left; vertical-align: top; }
+  th { background: #f0f3f6; }
+  code, pre { font-family: "JetBrains Mono", Menlo, Consolas, monospace; }
+  pre { background: var(--code-bg); padding: 12px; border-radius: 4px; overflow-x: auto; font-size: 0.88em; }
+  code { background: var(--code-bg); padding: 1px 5px; border-radius: 3px; }
+  .tag-good { color: var(--good); font-weight: 600; }
+  .tag-warn { color: var(--warn); font-weight: 600; }
+  .tag-bad  { color: var(--bad); font-weight: 600; }
+  .callout { border-left: 4px solid var(--warn); background: #fff8e6; padding: 10px 14px; margin: 14px 0; }
+  .callout.bad { border-color: var(--bad); background: #ffeef0; }
+  .callout.good { border-color: var(--good); background: #e6f4ea; }
+  svg { display: block; margin: 14px auto; }
+  ul { padding-left: 22px; }
+  li { margin: 4px 0; }
+  .meta { color: var(--muted); font-size: 0.9em; }
+</style>
+</head>
+<body>
+
+<h1>OpenVLA-7B LoRA 微调计划</h1>
+<p class="meta">SO-101 PickOrange · LeIsaac 多策略横评第 5 个 fine-tune · 2026-05-17</p>
+<p class="en">An action plan for fine-tuning OpenVLA-7B with LoRA on the LeIsaac SO-101 PickOrange task, to extend our 4-model baseline (ACT / DP / SmolVLA / π0.5).</p>
+
+<h2>1. 目标与背景 · Goal &amp; Context</h2>
+<p>把 <a href="https://huggingface.co/openvla/openvla-7b"><code>openvla/openvla-7b</code></a> 接入 LeIsaac 多策略横评，作为继 ACT (80M) / DP (267M) / SmolVLA (450M) / π0.5 (3.36B) 之后的 <b>第 5 个 fine-tune 实验</b>，覆盖 "7B 离散 token VLA" 这一档。</p>
+<p class="en">Add OpenVLA-7B as the 5th policy in our LeIsaac PickOrange benchmark, filling the "7B discrete-token VLA" slot.</p>
+
+<h3>1.1 当前 baseline 状态 · Current baselines</h3>
+<table>
+<tr><th>Policy</th><th>Params</th><th>Action 表示</th><th>结果 @ 正确 horizon</th></tr>
+<tr><td>ACT (<code>wsagi/ACT-PickOrange</code>)</td><td>80M</td><td>chunk=100, continuous</td><td><span class="tag-good">✅ 1/1 @ h=32</span></td></tr>
+<tr><td>DP (<code>wsagi/DiffusionPolicy-PickOrange</code>)</td><td>267M</td><td>chunk=8, continuous (DDIM 32-step)</td><td><span class="tag-warn">🟡 概率 0/3 ~ 3/3</span></td></tr>
+<tr><td>SmolVLA (本地)</td><td>450M</td><td>chunk=50, continuous</td><td><span class="tag-warn">🟡 2/5（60 ep 欠拟合）</span></td></tr>
+<tr><td>π0.5 v3 (本地)</td><td>3.36B base + 5M LoRA</td><td>chunk=50, flow-matching</td><td><span class="tag-warn">🟡 1 颗落盘 @ h=35</span></td></tr>
+</table>
+
+<h2>2. OpenVLA 关键事实 · Key Facts</h2>
+<table>
+<tr><th>项 / Item</th><th>值 / Value</th></tr>
+<tr><td>架构 / Architecture</td><td>OpenLlama-7B + DINOv2 + SigLIP（两个 vision encoder concat）</td></tr>
+<tr><td>预训练 / Pretrain</td><td>Open X-Embodiment（970k traj，22 个 robot platform）</td></tr>
+<tr><td>Action 输出 / Output</td><td><b>离散 token</b>（256 bins/DOF），逐 token 自回归，<b>无 chunk</b></td></tr>
+<tr><td>每次 forward 产出 / Per forward</td><td>1 个 action（6-DOF = 6 tokens 自回归）</td></tr>
+<tr><td>License</td><td>MIT（model）+ Apache-2.0（code）</td></tr>
+<tr><td>官方 repo</td><td><a href="https://github.com/openvla/openvla">github.com/openvla/openvla</a></td></tr>
+</table>
+
+<h3>2.1 与我们其他 4 个模型的关键差异 · Key differences</h3>
+<table>
+<tr><th>维度</th><th>ACT / DP / SmolVLA / π0.5</th><th>OpenVLA</th></tr>
+<tr><td>Action 输出</td><td>chunk (8 / 50 / 100 步)</td><td><b>每步 1 个 action</b></td></tr>
+<tr><td>Chunk-execution horizon trap</td><td>关键调参点</td><td><b>不适用</b>（horizon ≡ 1）</td></tr>
+<tr><td>Inference 频率</td><td>每 N 步 query 一次</td><td><b>每 1 步 query 一次</b></td></tr>
+<tr><td>Inference cost / sim step</td><td>chunk / N 摊薄</td><td><b>必须 &lt; 1/step_hz = 33ms @ 30Hz</b></td></tr>
+<tr><td>Action representation</td><td>continuous float</td><td>discrete token (256 bins / DOF)</td></tr>
+</table>
+
+<h2>3. 系统流程图 · Architecture Diagram</h2>
+
+<svg width="900" height="360" viewBox="0 0 900 360" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#1f6feb" />
+    </marker>
+  </defs>
+  <!-- Isaac Sim -->
+  <rect x="20" y="40" width="160" height="80" rx="8" fill="#e6f0ff" stroke="#1f6feb" stroke-width="2"/>
+  <text x="100" y="70" text-anchor="middle" font-weight="bold">Isaac Sim 5.1</text>
+  <text x="100" y="90" text-anchor="middle" font-size="12">LeIsaac SO-101</text>
+  <text x="100" y="106" text-anchor="middle" font-size="12">2 cam + 6 DOF state</text>
+
+  <!-- Client -->
+  <rect x="220" y="40" width="170" height="80" rx="8" fill="#e6f4ea" stroke="#1a7f37" stroke-width="2"/>
+  <text x="305" y="70" text-anchor="middle" font-weight="bold">OpenVLAServiceClient</text>
+  <text x="305" y="90" text-anchor="middle" font-size="12">n_action_steps=1</text>
+  <text x="305" y="106" text-anchor="middle" font-size="12">ZMQ + msgpack</text>
+
+  <!-- Server -->
+  <rect x="430" y="40" width="180" height="80" rx="8" fill="#fff8e6" stroke="#d29922" stroke-width="2"/>
+  <text x="520" y="70" text-anchor="middle" font-weight="bold">openvla_leisaac/server.py</text>
+  <text x="520" y="90" text-anchor="middle" font-size="12">HF AutoModelForVision2Seq</text>
+  <text x="520" y="106" text-anchor="middle" font-size="12">bf16 + (opt) bnb int4</text>
+
+  <!-- Model -->
+  <rect x="650" y="40" width="220" height="80" rx="8" fill="#ffeef0" stroke="#cf222e" stroke-width="2"/>
+  <text x="760" y="70" text-anchor="middle" font-weight="bold">OpenVLA-7B + LoRA</text>
+  <text x="760" y="90" text-anchor="middle" font-size="12">OpenLlama + DINOv2 + SigLIP</text>
+  <text x="760" y="106" text-anchor="middle" font-size="12">→ 6 离散 token / action</text>
+
+  <!-- Arrows -->
+  <line x1="180" y1="80" x2="218" y2="80" stroke="#1f6feb" stroke-width="2" marker-end="url(#arrow)"/>
+  <line x1="390" y1="80" x2="428" y2="80" stroke="#1f6feb" stroke-width="2" marker-end="url(#arrow)"/>
+  <line x1="610" y1="80" x2="648" y2="80" stroke="#1f6feb" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <!-- Return arrow -->
+  <path d="M 760 120 Q 760 200 100 200 Q 100 140 100 120" fill="none" stroke="#1a7f37" stroke-width="2" stroke-dasharray="6,4" marker-end="url(#arrow)"/>
+  <text x="450" y="215" text-anchor="middle" font-size="12" fill="#1a7f37">action (6,) → sim step</text>
+
+  <!-- Bottom: training pipeline -->
+  <rect x="20" y="260" width="180" height="70" rx="8" fill="#f0f3f6" stroke="#555" stroke-width="2"/>
+  <text x="110" y="288" text-anchor="middle" font-weight="bold">LeRobot v3.0 dataset</text>
+  <text x="110" y="306" text-anchor="middle" font-size="12">60 ep × 600 frame ≈ 36k</text>
+
+  <rect x="240" y="260" width="180" height="70" rx="8" fill="#f0f3f6" stroke="#555" stroke-width="2"/>
+  <text x="330" y="288" text-anchor="middle" font-weight="bold">LoRA train (4090, 24GB)</text>
+  <text x="330" y="306" text-anchor="middle" font-size="12">r=32, α=16, q+v_proj</text>
+
+  <rect x="460" y="260" width="180" height="70" rx="8" fill="#f0f3f6" stroke="#555" stroke-width="2"/>
+  <text x="550" y="288" text-anchor="middle" font-weight="bold">10k step / 8–12h</text>
+  <text x="550" y="306" text-anchor="middle" font-size="12">grad ckpt + batch=4</text>
+
+  <rect x="680" y="260" width="180" height="70" rx="8" fill="#f0f3f6" stroke="#555" stroke-width="2"/>
+  <text x="770" y="288" text-anchor="middle" font-weight="bold">LeIsaac eval</text>
+  <text x="770" y="306" text-anchor="middle" font-size="12">step_hz≤10 (实时性约束)</text>
+
+  <line x1="200" y1="295" x2="238" y2="295" stroke="#555" stroke-width="2" marker-end="url(#arrow)"/>
+  <line x1="420" y1="295" x2="458" y2="295" stroke="#555" stroke-width="2" marker-end="url(#arrow)"/>
+  <line x1="640" y1="295" x2="678" y2="295" stroke="#555" stroke-width="2" marker-end="url(#arrow)"/>
+</svg>
+
+<h2>4. 推理实时性：实测数据 · Inference Latency (measured)</h2>
+
+<div class="callout good">
+<b>已实测 · Measured on RTX 4090, bnb NF4 4-bit, no flash-attn：</b>
+<table>
+<tr><th>负载</th><th>Latency</th><th>GPU</th></tr>
+<tr><td>加载模型 (cold)</td><td>9-32 s</td><td>4.38 GB</td></tr>
+<tr><td>第 1 次 inference (cold, KV miss)</td><td>~440 ms</td><td>4.38 GB</td></tr>
+<tr><td><b>稳态 inference (warm)</b></td><td><b>233-242 ms / action</b></td><td>4.38 GB</td></tr>
+</table>
+原 480ms 估算过悲观（基于无 KV-cache 假设）。实测 240ms 是含 vision prefill 的 6-token AR decode 完整耗时。
+</div>
+
+<h3>4.1 30Hz 闭环可行性 · 30Hz feasibility</h3>
+<p>240 ms / action @ 30Hz (33ms/step) = <b>slowdown ~7×</b>。Isaac Sim 不能跟 30Hz 实时跑，但：</p>
+
+<table>
+<tr><th>#</th><th>方案</th><th>实际效果</th><th>成本</th></tr>
+<tr><td>1</td><td><b>step_hz 降到 5 Hz</b></td><td>每步 200 ms 推理窗口 ≈ 1× 实时；dataset 30Hz → distribution mismatch 待 fine-tune 救</td><td>低</td></tr>
+<tr><td>2</td><td>切到 OpenVLA-OFT (chunk + parallel decode)</td><td>论文报告 25× 加速；本质换 model 重训</td><td>高</td></tr>
+<tr><td>3</td><td>TensorRT-LLM 部署</td><td>~10ms/token = 60ms/action ≈ 2× slowdown</td><td>中</td></tr>
+</table>
+
+<div class="callout bad">
+<b>常见误区 · Common myth:</b> bnb int4 <b>不会加速</b> decode（实测中 4-bit 与 bf16 速度持平）；它只省显存。真正的加速需要 chunked / parallel decode 架构（OpenVLA-OFT, PD-VLA）或 TensorRT-LLM 引擎。<br/>
+<i>bnb int4 saves memory, NOT compute. For real speedup, use OFT-style chunked decode or TensorRT-LLM.</i>
+</div>
+
+<h2>5. 微调资源估算 · Training Resource (QLoRA)</h2>
+
+<div class="callout good">
+<b>必须用 QLoRA：</b> 普通 bf16 LoRA 24 GB 装不下（官方 README ~27 GB）。QLoRA = base 4-bit 冻结 + LoRA 适配层 bf16。
+</div>
+
+<table>
+<tr><th>项</th><th>bf16 LoRA (✗ OOM)</th><th><b>QLoRA NF4</b></th></tr>
+<tr><td>Base model (7B frozen)</td><td>~14 GB</td><td><b>~3.5 GB</b> ← key savings</td></tr>
+<tr><td>LoRA adapter (r=32 q+v_proj)</td><td>~0.4 GB</td><td>~0.4 GB</td></tr>
+<tr><td>Optimizer (AdamW fp32 only on adapter)</td><td>~0.8 GB</td><td>~0.8 GB</td></tr>
+<tr><td>Gradients</td><td>~0.4 GB</td><td>~0.4 GB</td></tr>
+<tr><td>Activations (grad_ckpt + batch=4 + 224 img)</td><td>~10-12 GB</td><td>~10-12 GB</td></tr>
+<tr><td><b>合计</b></td><td><b>~26-28 GB ❌ OOM</b></td><td><b>~15-17 GB ✅ 4090 OK</b></td></tr>
+</table>
+
+<table>
+<tr><th>项</th><th>值</th></tr>
+<tr><td>Dataset</td><td>60 ep × ~600 frame ≈ 36k samples</td></tr>
+<tr><td>预计训练时长 (batch=4, grad_accum=2, lr=5e-5)</td><td>10k step → <b>3-6 h on RTX 4090</b></td></tr>
+</table>
+
+<pre>BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_compute_dtype=torch.bfloat16,
+    bnb_4bit_use_double_quant=True,
+)</pre>
+
+<h2>6. 实施路径 · Implementation Phases</h2>
+
+<h3>Phase 1 — Inference server scaffold (~2h)</h3>
+<p>复用 <code>server/serve_pi05.sh</code> + <code>pi05_leisaac/server.py</code> 模板：</p>
+<ul>
+<li><code>server/serve_openvla.sh</code> — 启动脚本</li>
+<li><code>server/openvla_leisaac/server.py</code> — ZMQ + msgpack, wire-compatible with <code>Pi05ServicePolicyClient</code></li>
+<li><code>server/openvla_leisaac/__init__.py</code>, <code>pyproject.toml</code></li>
+</ul>
+<p><b>关键改动 vs π0.5 server：</b></p>
+<ul>
+<li>加载 <code>openvla/openvla-7b</code>（HF <code>AutoModelForVision2Seq</code>，<code>trust_remote_code=True</code>）</li>
+<li>每次 <code>get_action</code> 请求只返回 <b>1 个 action</b>（shape <code>(1, 6)</code>）</li>
+<li>config: <code>load_in_4bit=True</code> 默认开</li>
+</ul>
+
+<h3>Phase 2 — Client 端补丁 (~1h)</h3>
+<p>修改 <code>LeIsaac/source/leisaac/leisaac/policy/service_policy_clients.py</code>：</p>
+<ul>
+<li>新增 <code>OpenVLAServicePolicyClient</code>（参照 <code>Pi05ServicePolicyClient</code>）</li>
+<li><code>n_action_steps=1</code>（不是 chunk）</li>
+<li><code>policy_inference.py</code> 加 <code>--policy_type=openvla</code> 分支</li>
+<li>horizon 在 OpenVLA 永远 = 1，可忽略 / 抹平</li>
+</ul>
+
+<h3>Phase 3 — 数据转换 (~1h)</h3>
+<p>OpenVLA 官方训练用 RLDS / TFDS。我们的 LeIsaac dataset 是 LeRobot v3.0 (parquet)。两种选择：</p>
+<ul>
+<li><b>A: 用 LeRobot 包 OpenVLA（优先）</b> — 检查 LeRobot 是否已有 openvla policy 集成；若有，复用现有 <code>lerobot_finetune.sh</code></li>
+<li>B: convert LeRobot v3.0 → RLDS（耗时但可用 openvla 原生训练）</li>
+</ul>
+
+<h3>Phase 4 — LoRA 微调 (~12h，含反复跑)</h3>
+<p>新建 <code>scripts/training/openvla/train.sh</code>（类比 pi05 的 train.sh）：</p>
+<pre>--lora_rank=32 --lora_alpha=16 --lora_target_modules q_proj,v_proj
+--batch_size=4 --lr=5e-5 --grad_accum=2 --gradient_checkpointing=true
+--steps=10000 --save_freq=1000
+--bf16 --image_aug=true</pre>
+
+<h3>Phase 5 — Eval + benchmark (~2h)</h3>
+<p>接到 LeIsaac eval pipeline：</p>
+<ul>
+<li><b>step_hz 必须降到 5-10</b>（实时性约束）</li>
+<li>观察：实际推理延迟、success rate（单 round + 10-round 平均）</li>
+<li>跟其他 4 个 baseline 同条件对比</li>
+</ul>
+
+<h2>7. Open Questions（compact 后第一件事 verify）</h2>
+<ol>
+<li><b>LeRobot 现在有 openvla policy 集成吗？</b> 检查 <code>~/work/lerobot-experience/lerobot/src/lerobot/policies/</code></li>
+<li><b>OpenVLA HF 加载需要特殊 <code>trust_remote_code</code> 吗？</b> 看 model card</li>
+<li><b>4090 + LoRA 实际能跑 batch=多少？</b> 实测决定</li>
+<li><b>step_hz=10 时 dataset 30Hz 的 distribution mismatch 影响多大？</b> 经验 + eval 验证</li>
+</ol>
+
+<h2>8. 工作目录约定 · Paths</h2>
+<table>
+<tr><th>用途</th><th>路径</th></tr>
+<tr><td>训练脚本</td><td><code>LeIsaac/scripts/training/openvla/</code></td></tr>
+<tr><td>服务端</td><td><code>isaaclab-experience/server/openvla_leisaac/</code></td></tr>
+<tr><td>ckpt 输出</td><td><code>LeIsaac/outputs/openvla-leisaac-pick-orange/</code></td></tr>
+<tr><td>数据集</td><td><code>LeIsaac/datasets/raw/leisaac-pick-orange</code>（复用 v3.0）</td></tr>
+</table>
+
+<h2>9. 与 LingBot-VLA 的取舍 · vs LingBot-VLA</h2>
+<p>参见 <a href="lingbot_vla_finetune_plan.html"><code>lingbot_vla_finetune_plan.html</code></a> 详评。简表：</p>
+<table>
+<tr><th>对比项</th><th>OpenVLA</th><th>LingBot-VLA</th></tr>
+<tr><td>参数量</td><td>7B</td><td>~3B+（Qwen2.5-VL-3B + 动作专家）</td></tr>
+<tr><td>单臂支持 / Single-arm</td><td><span class="tag-good">✅ DROID 等已含单臂</span></td><td><span class="tag-bad">❌ 论文 future work</span></td></tr>
+<tr><td>实时性 @ 4090 30Hz</td><td><span class="tag-bad">🔴 480 ms / action</span></td><td><span class="tag-good">🟢 chunk=50 摊薄</span></td></tr>
+<tr><td>License</td><td>MIT + Apache-2.0</td><td>Apache-2.0</td></tr>
+<tr><td>横评对照丰富度</td><td>论文+下游 ckpt 多</td><td>较新（2026-01）</td></tr>
+</table>
+
+<p><b>结论 · Verdict：</b>OpenVLA 单臂直接可用但要硬扛实时性；LingBot-VLA 实时性好但**单臂 hack 风险高**。两条路径独立推进，OpenVLA 优先做完作为"第 5 个 baseline"，LingBot 作为"双臂技术栈下放到单臂"的探索项。</p>
+
+<h2>10. 关联记忆 · Linked memory</h2>
+<ul>
+<li><code>openvla-finetune-plan</code> — 本文档对应的项目记忆</li>
+<li><code>leisaac-policy-comparison</code> — 多策略横评主线</li>
+<li><code>pi05-repo-layout</code> — 服务端目录约定</li>
+<li><code>act-eval-debug-roundN</code> — horizon trap（OpenVLA 不适用但 step_hz 配置仍要对齐）</li>
+<li><code>leisaac-eval-timeout</code> — user-patience timeout 公式</li>
+<li><code>feedback-pre-run-gpu-check</code> — 启动前 nvidia-smi</li>
+<li><code>feedback-hf-readme-project-links</code> — 训完发 HF 时记得加项目链接</li>
+</ul>
+
+</body>
+</html>

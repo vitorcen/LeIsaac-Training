@@ -6,7 +6,7 @@
 
 ```bash
 # 1) 准备一个"剥光"的 base：清掉占位的 input_features，方便后续按数据集真实键名自动填
-bash scripts/finetune/smolvla/prepare_base.sh
+bash scripts/training/smolvla/prepare_base.sh
 # → outputs/.bases/smolvla_base_no_features/
 
 # 2) 走通用 launcher 训练
@@ -15,7 +15,7 @@ DATASET_REPO_ID=LightwheelAI/leisaac-pick-orange \
 OUTPUT_NAME=smolvla-leisaac-pick-orange \
 STEPS=30000 BATCH_SIZE=8 NUM_WORKERS=2 \
 EXTRA_ARGS='--dataset.video_backend=pyav' \
-bash scripts/finetune/lerobot_finetune.sh
+bash scripts/training/lerobot_finetune.sh
 ```
 
 ## 已知坑

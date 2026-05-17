@@ -20,6 +20,6 @@
 
 ## 计划
 
-- [ ] PyTorch 训练 pipeline（`scripts/finetune/openpi/pytorch/`）— 修掉 MLX recipe 的 6 个缺陷
+- [ ] PyTorch 训练 pipeline（`scripts/training/openpi/pytorch/`）— 修掉 MLX recipe 的 6 个缺陷
 - [ ] 全 lerobot processor pipeline（真 tokenizer / state input / AdamW / 多 camera）
 - [ ] 跑通后输出 thin wrapper 调用 `lerobot_finetune.sh`（如果适配 `--policy.path=lerobot/pi05_base` + LoRA hook 可行）

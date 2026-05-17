@@ -1,6 +1,6 @@
 # LeIsaac fine-tune datasets
 
-公开 LeRobot 数据集的本地下载脚手架。本目录为微调（`scripts/finetune/`）提供输入。
+公开 LeRobot 数据集的本地下载脚手架。本目录为微调（`scripts/training/`）提供输入。
 
 ## 目录
 

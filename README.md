@@ -3,7 +3,7 @@
 [LightwheelAI/leisaac](https://github.com/LightwheelAI/leisaac) (Apache-2.0) 的 fork。在 upstream 提供的 SO-101 遥操 + GR00T N1.5/N1.6 微调配方之上，扩展了**通用 LeRobot 微调脚手架**、**PickOrange 多策略横评**、以及一组让非平凡 VLA 能在 Isaac Sim 上跑通的 client 端补丁。
 _A fork of [LightwheelAI/leisaac](https://github.com/LightwheelAI/leisaac) (Apache-2.0). Extends the upstream SO-101 teleop + GR00T fine-tune recipes with a generic LeRobot fine-tune scaffold, a PickOrange multi-policy benchmark, and client-side fixes that make non-trivial VLAs evaluable in Isaac Sim._
 
-![ACT eval — SO-101 PickOrange](docs/assets/act-pick-orange.png)
+![ACT eval — SO-101 PickOrange](docs/assets/pick-orange.jpg)
 
 - **Upstream / 原仓库**: https://github.com/LightwheelAI/leisaac
 - **Upstream docs**: https://lightwheelai.github.io/leisaac/
@@ -27,17 +27,17 @@ _End-to-end, env-driven scripts for dataset pull → v2.1→v3.0 conversion → 
 | --- | --- |
 | [`datasets/download.sh`](datasets/download.sh) | `bash datasets/download.sh <ORG>/<DATASET>` — 拉任何 LeRobot dataset 到 `datasets/raw/<basename>/` |
 | [`datasets/convert_to_v30.sh`](datasets/convert_to_v30.sh) | v2.1 → v3.0 原地转换（lerobot ≥ 0.5.x 必须），幂等 |
-| [`scripts/finetune/lerobot_finetune.sh`](scripts/finetune/lerobot_finetune.sh) | 通用 `lerobot-train` wrapper，所有 knob 走 env vars（`BASE_MODEL` / `DATASET_REPO_ID` / `STEPS` / `BATCH_SIZE` / `RENAME_MAP` / `EXTRA_ARGS` / ...） |
-| [`scripts/finetune/smolvla/prepare_base.sh`](scripts/finetune/smolvla/prepare_base.sh) | SmolVLA 专用：clone `lerobot/smolvla_base` 后剥光 `input_features` + `empty_cameras` — 因为 draccus CLI override 是 dict-merge 不是 replace，原 base 自带的 `camera1/2/3 @ 256×256` 占位会污染微调路径 |
+| [`scripts/training/lerobot_finetune.sh`](scripts/training/lerobot_finetune.sh) | 通用 `lerobot-train` wrapper，所有 knob 走 env vars（`BASE_MODEL` / `DATASET_REPO_ID` / `STEPS` / `BATCH_SIZE` / `RENAME_MAP` / `EXTRA_ARGS` / ...） |
+| [`scripts/training/smolvla/prepare_base.sh`](scripts/training/smolvla/prepare_base.sh) | SmolVLA 专用：clone `lerobot/smolvla_base` 后剥光 `input_features` + `empty_cameras` — 因为 draccus CLI override 是 dict-merge 不是 replace，原 base 自带的 `camera1/2/3 @ 256×256` 占位会污染微调路径 |
 
 目录按语义分类（[[feedback-style]] 约定）：
 _Directory layout follows semantic split:_
-- `scripts/finetune/` = 从 pretrained base 微调 / fine-tune from a pretrained base
+- `scripts/training/` = 从 pretrained base 微调 / fine-tune from a pretrained base
 - `scripts/training/` = 从头训练 / train-from-scratch (ACT, Diffusion Policy, DiT)
 
 详细文档：
 - [`datasets/README.md`](datasets/README.md)
-- [`scripts/finetune/README.md`](scripts/finetune/README.md)
+- [`scripts/training/README.md`](scripts/training/README.md)
 - [`scripts/training/README.md`](scripts/training/README.md)
 
 ### 2. PickOrange 多策略横评
@@ -131,13 +131,13 @@ bash scripts/training/act/train.sh
 bash scripts/training/diffusion_policy/train.sh
 
 # 2c) 或：微调 SmolVLA / Or: fine-tune SmolVLA from base
-bash scripts/finetune/smolvla/prepare_base.sh
+bash scripts/training/smolvla/prepare_base.sh
 BASE_MODEL=$(pwd)/outputs/.bases/smolvla_base_no_features \
 DATASET_REPO_ID=LightwheelAI/leisaac-pick-orange \
 OUTPUT_NAME=smolvla-leisaac-pick-orange \
 STEPS=30000 BATCH_SIZE=8 NUM_WORKERS=2 SAVE_FREQ=5000 \
 EXTRA_ARGS='--dataset.video_backend=pyav' \
-bash scripts/finetune/lerobot_finetune.sh
+bash scripts/training/lerobot_finetune.sh
 
 # 3) 启 LeRobot async server / Start LeRobot async server
 bash ~/work/isaaclab-experience/scripts/policy_server.sh start lerobot

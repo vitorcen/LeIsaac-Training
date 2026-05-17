@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Diffusion Policy from-scratch training on LeRobot v3.0 datasets.
 #
-# Thin wrapper around scripts/finetune/lerobot_finetune.sh (the generic
+# Thin wrapper around scripts/training/lerobot_finetune.sh (the generic
 # LeRobot launcher) that pins Diffusion-Policy-specific defaults:
 #   - POLICY_TYPE=diffusion (no pretrained base)
 #   - resize_shape=240×320 (avoids OOM at native 480×640 on batch=32)
@@ -26,4 +26,4 @@ EXTRA_ARGS="${EXTRA_ARGS:---dataset.video_backend=pyav --policy.resize_shape=[24
 
 export POLICY_TYPE DATASET_REPO_ID OUTPUT_NAME STEPS BATCH_SIZE NUM_WORKERS SAVE_FREQ EXTRA_ARGS
 
-exec bash "${REPO_ROOT}/scripts/finetune/lerobot_finetune.sh"
+exec bash "${REPO_ROOT}/scripts/training/lerobot_finetune.sh"

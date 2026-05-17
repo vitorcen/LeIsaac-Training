@@ -1,0 +1,484 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>Fast-WAM QLoRA 微调计划 — LeIsaac SO-101 PickOrange</title>
+<style>
+  :root {
+    --bg: #fafafa; --fg: #1a1a1a; --muted: #555;
+    --accent: #d97706; --warn: #d29922; --bad: #cf222e; --good: #1a7f37;
+    --code-bg: #f3f3f3; --border: #d0d7de;
+  }
+  body { font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+         background: var(--bg); color: var(--fg);
+         max-width: 980px; margin: 28px auto; padding: 0 22px; line-height: 1.6; }
+  h1 { border-bottom: 2px solid var(--fg); padding-bottom: 6px; }
+  h2 { margin-top: 36px; border-left: 4px solid var(--accent); padding-left: 10px; }
+  h3 { margin-top: 24px; color: var(--accent); }
+  .en { color: var(--muted); font-style: italic; font-size: 0.92em; }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0; font-size: 0.93em; }
+  th, td { border: 1px solid var(--border); padding: 6px 9px; text-align: left; vertical-align: top; }
+  th { background: #f0f3f6; }
+  code, pre { font-family: "JetBrains Mono", Menlo, Consolas, monospace; }
+  pre { background: var(--code-bg); padding: 12px; border-radius: 4px; overflow-x: auto; font-size: 0.86em; }
+  code { background: var(--code-bg); padding: 1px 5px; border-radius: 3px; }
+  .tag-good { color: var(--good); font-weight: 600; }
+  .tag-warn { color: var(--warn); font-weight: 600; }
+  .tag-bad  { color: var(--bad); font-weight: 600; }
+  .callout { border-left: 4px solid var(--warn); background: #fff8e6; padding: 10px 14px; margin: 14px 0; }
+  .callout.bad { border-color: var(--bad); background: #ffeef0; }
+  .callout.good { border-color: var(--good); background: #e6f4ea; }
+  svg { display: block; margin: 14px auto; }
+  ul { padding-left: 22px; }
+  li { margin: 4px 0; }
+  .meta { color: var(--muted); font-size: 0.9em; }
+</style>
+</head>
+<body>
+
+<h1>Fast-WAM QLoRA 微调计划</h1>
+<p class="meta">SO-101 PickOrange · World Action Model 横评接入 · 2026-05-17</p>
+<p class="en">Plan for QLoRA fine-tuning Fast-WAM (Wan2.2-5B DiT + 1B action expert) on LeIsaac SO-101, as the 4090-tractable replacement for DreamZero (which is unviable on single 4090).</p>
+
+<h2>1. 为什么是 Fast-WAM 而不是 DreamZero · Why Fast-WAM, not DreamZero</h2>
+
+<table>
+<tr><th>维度</th><th>DreamZero (NVIDIA)</th><th>Fast-WAM</th></tr>
+<tr><td>Backbone</td><td>Wan2.1-I2V <b>14B</b> DiT</td><td>Wan2.2-TI2V <b>5B</b> DiT + 1B action expert</td></tr>
+<tr><td>Total params</td><td>14B</td><td>6B</td></tr>
+<tr><td>训练 GPU</td><td>多卡 H100/GB200</td><td>8 GPU (LIBERO) / 64 GPU (RoboTwin)</td></tr>
+<tr><td>论文报告 latency</td><td><b>3 s / chunk @ H100 8×TP</b></td><td><b>190 ms / chunk @ RTX 5090D V2 32GB</b></td></tr>
+<tr><td>4090 单卡 4-bit 推理估算</td><td><span class="tag-bad">🔴 25-30 s / chunk</span></td><td><span class="tag-good">🟢 ~220 ms / chunk</span></td></tr>
+<tr><td>核心架构差异</td><td>imagine-then-execute（生成视频后再出动作）</td><td>训练时 co-train video, <b>推理时 SKIP future imagination</b></td></tr>
+<tr><td>本地可行性</td><td>❌ 不可用</td><td>✅ 算力账过关</td></tr>
+</table>
+
+<div class="callout good">
+<b>关键洞察 · Key insight：</b>Fast-WAM 解决了 DreamZero 推理慢的根源 — 它在<b>推理时跳过 multi-step video denoise</b>，只保留 action prediction。论文证明"future imagination is NOT needed for strong action performance"。这让 video-world-model 类模型首次进入单卡消费 GPU 可推理范围。
+</div>
+
+<h2>2. 公开 ckpt 现状 · Available checkpoints</h2>
+
+<p>HuggingFace <a href="https://huggingface.co/yuanty/fastwam"><code>yuanty/fastwam</code></a>：</p>
+
+<table>
+<tr><th>Ckpt</th><th>Size</th><th>Action space</th><th>Embodiment</th></tr>
+<tr><td><code>libero_uncond_2cam224.pt</code></td><td>12 GB (bf16)</td><td>7-DoF Franka EEF</td><td>LIBERO sim, 单臂</td></tr>
+<tr><td><code>robotwin_uncond_3cam_384.pt</code></td><td>12 GB (bf16)</td><td>14-DoF (7+7)</td><td>RoboTwin sim, 双臂</td></tr>
+</table>
+
+<p><b>SO-101 ckpt？</b> ❌ 没有。两个都得 cosmetic remap 或 QLoRA fine-tune。</p>
+
+<h2>3. 4090 资源估算 · Resource budget</h2>
+
+<h3>3.1 推理 · Inference</h3>
+<table>
+<tr><th>组件</th><th>bf16</th><th>NF4 4-bit</th></tr>
+<tr><td>Wan2.2-TI2V-5B backbone</td><td>~10 GB</td><td>~2.5 GB</td></tr>
+<tr><td>Action expert (1B)</td><td>~2 GB</td><td>~0.5 GB</td></tr>
+<tr><td>UMT5 text encoder（按需 offload）</td><td>~5 GB</td><td>~1.5 GB</td></tr>
+<tr><td>WanVAE</td><td>~0.4 GB</td><td>fp16 (VAE 别量化)</td></tr>
+<tr><td>Activations (chunk=24, 224×224, 2 cam)</td><td>~3 GB</td><td>~3 GB</td></tr>
+<tr><td><b>总计</b></td><td><b>~20 GB</b></td><td><b>~8 GB</b></td></tr>
+</table>
+
+<p>bf16 推理已经 4090 可塞下；4-bit 量化大量余量给 Isaac Sim 共存。</p>
+
+<h3>3.2 QLoRA 训练 · Training</h3>
+
+<table>
+<tr><th>项</th><th>值</th></tr>
+<tr><td>Base (4-bit frozen)</td><td>~3 GB</td></tr>
+<tr><td>LoRA r=16 α=16 on q/k/v/o (Wan22 DiT + Action expert)</td><td>~50 M trainable ≈ 0.2 GB</td></tr>
+<tr><td>Optimizer (AdamW fp32)</td><td>~0.4 GB</td></tr>
+<tr><td>Gradients</td><td>~0.2 GB</td></tr>
+<tr><td>Activations (batch=1 + grad_ckpt + 2cam 224)</td><td>~8-10 GB</td></tr>
+<tr><td><b>总计</b></td><td><b>~13-15 GB ✅ 4090 OK</b></td></tr>
+</table>
+
+<div class="callout">
+<b>训练时长估算 · Training time：</b>
+<ul>
+<li>Vizuara DreamZero-SO101 (LoRA r=4 α=4): <b>72k step</b> 收敛（loss 0.249 → 0.0015）</li>
+<li>Fast-WAM 没有 future imagination 训练（co-train video 但跳推理） → 训练 step 时间可能比 DreamZero 短 30-50%</li>
+<li>4090 单卡 batch=1 估 <b>2-4 s / step</b> with grad ckpt</li>
+<li>10k step 5-10 h, 72k step ≈ 1-3 天</li>
+</ul>
+</div>
+
+<h2>4. 系统流程图 · Architecture</h2>
+
+<svg width="980" height="380" viewBox="0 0 980 380" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="ar" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L9,3 z" fill="#d97706"/>
+    </marker>
+  </defs>
+
+  <!-- Input -->
+  <rect x="20" y="40" width="170" height="80" rx="8" fill="#fff8e6" stroke="#d29922" stroke-width="2"/>
+  <text x="105" y="68" text-anchor="middle" font-weight="bold">观测输入</text>
+  <text x="105" y="88" text-anchor="middle" font-size="12">2 cam 224×224 RGB</text>
+  <text x="105" y="106" text-anchor="middle" font-size="12">+ proprio + language</text>
+
+  <!-- Tokenize -->
+  <rect x="220" y="40" width="170" height="80" rx="8" fill="#eee6f7" stroke="#6f42c1" stroke-width="2"/>
+  <text x="305" y="68" text-anchor="middle" font-weight="bold">编码</text>
+  <text x="305" y="88" text-anchor="middle" font-size="12">VAE (1 step) + UMT5</text>
+  <text x="305" y="106" text-anchor="middle" font-size="12">→ video tokens + text emb</text>
+
+  <!-- Wan2.2 DiT -->
+  <rect x="420" y="40" width="200" height="80" rx="8" fill="#e6f0ff" stroke="#1f6feb" stroke-width="2"/>
+  <text x="520" y="65" text-anchor="middle" font-weight="bold">Wan2.2-TI2V-5B DiT</text>
+  <text x="520" y="85" text-anchor="middle" font-size="12">video latent prediction</text>
+  <text x="520" y="103" text-anchor="middle" font-size="12">⚠ 训练时跑 / <b>推理时 SKIP</b></text>
+
+  <!-- Action expert -->
+  <rect x="650" y="40" width="200" height="80" rx="8" fill="#e6f4ea" stroke="#1a7f37" stroke-width="2"/>
+  <text x="750" y="65" text-anchor="middle" font-weight="bold">Action Expert (1B)</text>
+  <text x="750" y="85" text-anchor="middle" font-size="12">flow matching</text>
+  <text x="750" y="103" text-anchor="middle" font-size="12">→ chunk_size 24, 7-DoF</text>
+
+  <!-- Arrows -->
+  <line x1="190" y1="80" x2="218" y2="80" stroke="#d97706" stroke-width="2" marker-end="url(#ar)"/>
+  <line x1="390" y1="80" x2="418" y2="80" stroke="#d97706" stroke-width="2" marker-end="url(#ar)"/>
+  <line x1="620" y1="80" x2="648" y2="80" stroke="#d97706" stroke-width="2" marker-end="url(#ar)"/>
+
+  <!-- Skip path arrow -->
+  <path d="M 390 80 Q 520 20 650 80" fill="none" stroke="#1a7f37" stroke-width="2" stroke-dasharray="6,4" marker-end="url(#ar)"/>
+  <text x="520" y="30" text-anchor="middle" font-size="11" fill="#1a7f37">推理快路径 · Inference shortcut</text>
+
+  <!-- Pipeline below -->
+  <rect x="20" y="180" width="170" height="70" rx="8" fill="#f0f3f6" stroke="#555" stroke-width="2"/>
+  <text x="105" y="208" text-anchor="middle" font-weight="bold">LeIsaac v3.0 dataset</text>
+  <text x="105" y="226" text-anchor="middle" font-size="12">60 ep × 600 frame</text>
+
+  <rect x="220" y="180" width="170" height="70" rx="8" fill="#f0f3f6" stroke="#555" stroke-width="2"/>
+  <text x="305" y="208" text-anchor="middle" font-weight="bold">→ Fast-WAM 格式</text>
+  <text x="305" y="226" text-anchor="middle" font-size="12">参照 LIBERO 格式</text>
+
+  <rect x="420" y="180" width="200" height="70" rx="8" fill="#f0f3f6" stroke="#555" stroke-width="2"/>
+  <text x="520" y="208" text-anchor="middle" font-weight="bold">QLoRA 训练</text>
+  <text x="520" y="226" text-anchor="middle" font-size="12">r=16 α=16, batch=1, grad_ckpt</text>
+
+  <rect x="650" y="180" width="200" height="70" rx="8" fill="#f0f3f6" stroke="#555" stroke-width="2"/>
+  <text x="750" y="208" text-anchor="middle" font-weight="bold">10k step / 5-10 h</text>
+  <text x="750" y="226" text-anchor="middle" font-size="12">save_freq=2000</text>
+
+  <line x1="190" y1="215" x2="218" y2="215" stroke="#555" stroke-width="2" marker-end="url(#ar)"/>
+  <line x1="390" y1="215" x2="418" y2="215" stroke="#555" stroke-width="2" marker-end="url(#ar)"/>
+  <line x1="620" y1="215" x2="648" y2="215" stroke="#555" stroke-width="2" marker-end="url(#ar)"/>
+
+  <!-- Eval row -->
+  <rect x="220" y="300" width="200" height="50" rx="8" fill="#e6f0ff" stroke="#1f6feb" stroke-width="2"/>
+  <text x="320" y="320" text-anchor="middle" font-weight="bold">LeIsaac eval</text>
+  <text x="320" y="338" text-anchor="middle" font-size="11">step_hz=30, h=24</text>
+
+  <rect x="450" y="300" width="200" height="50" rx="8" fill="#e6f4ea" stroke="#1a7f37" stroke-width="2"/>
+  <text x="550" y="320" text-anchor="middle" font-weight="bold">实测 ckpt</text>
+  <text x="550" y="338" text-anchor="middle" font-size="11">~220ms / chunk = 7s 动作</text>
+</svg>
+
+<h2>5. 实施路径 · Implementation</h2>
+
+<h3>Phase 0 — 资源准备（已部分完成）· Asset prep</h3>
+<table>
+<tr><th>资源</th><th>状态</th></tr>
+<tr><td><code>yuanty/fastwam</code> (24 GB ckpt)</td><td>🟡 6/24 GB 下载中</td></tr>
+<tr><td><code>Wan-AI/Wan2.2-TI2V-5B</code> base (~10 GB)</td><td>🟡 启动中</td></tr>
+<tr><td><code>Wan-AI/Wan2.1-T2V-1.3B</code> tokenizer (~3 GB)</td><td>🟡 启动中</td></tr>
+<tr><td>conda env <code>fastwam</code> (py 3.10)</td><td>✅ 创建好</td></tr>
+<tr><td>github.com/yuantianyuan01/FastWAM clone</td><td>✅ 在 <code>~/work/fastwam-repo</code></td></tr>
+</table>
+
+<h3>Phase 1 — Env 装配（~30 min, 可能踩 flash-attn 坑）</h3>
+<pre>conda activate fastwam
+cd ~/work/fastwam-repo
+pip install -e .  # torch 2.7.1+cu128 + 全部依赖
+
+# flash-attn 2.8.3 (LingBot 装过同一个版本，nvcc + glibc 2.34 冲突)
+# 解法: 用 prebuilt wheel
+pip install flash-attn==2.8.3 --no-build-isolation \
+  --find-links https://github.com/Dao-AILab/flash-attention/releases</pre>
+
+<h3>Phase 2 — ActionDiT backbone 预处理（~30 min）</h3>
+<pre>cd ~/work/fastwam-repo
+export DIFFSYNTH_MODEL_BASE_PATH="$(pwd)/checkpoints"
+mkdir -p checkpoints
+
+# Wan2.2 模型放到 cache 后,这一步把 Wan22 DiT 插值成 ActionDiT
+python scripts/preprocess_action_dit_backbone.py \
+  --model-config configs/model/fastwam.yaml \
+  --output checkpoints/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt \
+  --device cuda \
+  --dtype bfloat16</pre>
+
+<h3>Phase 3 — Smoke test（单帧推理）· Smoke test</h3>
+
+<p>Fast-WAM 默认只暴露 LIBERO benchmark 入口（<code>experiments/libero/run_libero_manager.py</code>），没有简单的 <code>predict(image, state, prompt) → action</code> 函数。需要自己写。</p>
+
+<p>路径：照 <code>src/fastwam/runtime.py</code> 的 <code>create_fastwam</code> 装配模型，绕过 LIBERO env：</p>
+
+<pre><code>from fastwam.runtime import create_fastwam
+from omegaconf import OmegaConf
+
+cfg = OmegaConf.load("configs/model/fastwam.yaml")
+model = create_fastwam(**cfg, ckpt="./checkpoints/fastwam_release/libero_uncond_2cam224.pt")
+model.cuda().eval()
+
+# 单帧 inference (待自己 reverse-engineer 出 API)
+with torch.no_grad():
+    actions = model.predict_action(
+        images={"cam0": img0, "cam1": img1},  # 2x (1, 224, 224, 3)
+        proprio=state,                          # (1, 7)
+        text="pick up the orange and place on plate",
+    )  # → (1, 24, 7)
+</code></pre>
+
+<div class="callout">
+预计要 1-2 h reverse-engineer <code>src/fastwam/runtime.py</code> + <code>action_dit.py</code> 才能拿到单帧 API。
+</div>
+
+<h3>Phase 4 — Server + Isaac Sim demo（~2h）</h3>
+<p>复用 <code>server/openvla_leisaac/</code> 的 ZMQ + msgpack 套路写 <code>server/fastwam_leisaac/server.py</code>。
+关键差异 vs OpenVLA：</p>
+<ul>
+<li>chunk_size 24（一次 query 出 24 个 actions，client horizon ≤ 24）</li>
+<li>2 个摄像头输入（LeIsaac 是 front+wrist，FastWAM LIBERO 是 agentview+eye_in_hand → 对得上）</li>
+<li>action 是 LIBERO 7-DoF Franka EEF cartesian，<b>对 SO-101 6-DoF joint 必须 cosmetic remap</b>（同 OpenVLA hack）</li>
+</ul>
+
+<h3>Phase 5 — QLoRA Fine-tune（~5-10 h）</h3>
+
+<p>新建 <code>LeIsaac/scripts/training/fastwam/train.sh</code>，配置：</p>
+
+<table>
+<tr><th>参数</th><th>值</th><th>注释</th></tr>
+<tr><td>base ckpt</td><td><code>libero_uncond_2cam224.pt</code></td><td>LIBERO 单臂作为 init</td></tr>
+<tr><td>LoRA rank</td><td>16</td><td>Vizuara 用 r=4 ↓ low rank 收敛慢；r=16 更激进</td></tr>
+<tr><td>LoRA alpha</td><td>16</td><td>= rank</td></tr>
+<tr><td>LoRA targets</td><td>q/k/v/o on Wan22 DiT + action_dit</td><td>覆盖 attention 全层</td></tr>
+<tr><td>batch</td><td>1 + grad_accum=4</td><td>4090 显存约束</td></tr>
+<tr><td>grad_ckpt</td><td>true</td><td>必开</td></tr>
+<tr><td>lr</td><td>5e-5</td><td>类比 OpenVLA / π0.5</td></tr>
+<tr><td>steps</td><td>10k → 30k 视 loss</td><td>72k 是上限</td></tr>
+<tr><td>quantization</td><td>bnb NF4 base + LoRA bf16</td><td>自己加（FastWAM 原生不支持） |</td></tr>
+<tr><td>dataset</td><td>LeIsaac v3.0 (60 ep)</td><td>需要写 FastWAM ↔ LeRobot v3.0 adapter</td></tr>
+<tr><td>预计时长</td><td>5-10 h on 4090</td><td>10k step @ 2-4s/step</td></tr>
+</table>
+
+<h3>Phase 6 — 接 LeIsaac eval（已有 pi05 wire 协议复用）· Eval integration</h3>
+<p>训完 LoRA ckpt → load with merged base → <code>server/fastwam_leisaac/server.py</code> 直接服务 → <code>POLICY_PORT=5558 ACTION_HORIZON=24 EVAL_ROUNDS=10 bash server/eval_pi05.sh</code></p>
+
+<h2>6. 风险点 · Risks</h2>
+
+<ol>
+<li><b>flash-attn 编译坑</b>：已知 nvcc 12.6 + glibc 2.34 冲突（LingBot 已踩）；解法用 prebuilt wheel</li>
+<li><b>单 GPU benchmark hack</b>：LIBERO eval 默认 8 GPU；我们绕过 benchmark 直接调 model.predict_action，所以无所谓。但训练默认 deepspeed zero1 也是 8 GPU，需要降到 batch=1+grad_accum 单 GPU</li>
+<li><b>Wan2.2 量化兼容</b>：DiT 不是标准 HF AutoModel，bnb 4-bit 加载需要侵入 <code>fastwam.models.wan22.helpers.loader.load_wan22_ti2v_5b_components</code> — 1-2 天工作</li>
+<li><b>没有 SO-101 base ckpt</b>：LIBERO ckpt 是 Franka EEF + LIBERO 视觉分布。LeIsaac 与 LIBERO 视觉差异大（Isaac Sim vs MuJoCo）+ action 不同 — fine-tune 后可能仍然差</li>
+<li><b>训练 step 时长不确定</b>：估 2-4 s/step 是基于 DiT 经验，没实测。可能 5-10 s/step（DiT heavy）→ 10k step 跑 1-3 天</li>
+</ol>
+
+<h2>7. 时间表 · Timeline</h2>
+
+<table>
+<tr><th>阶段</th><th>预计时长</th><th>累计</th></tr>
+<tr><td>下载 ckpt + Wan22 base + tokenizer (37 GB)</td><td>30 min</td><td>30 min</td></tr>
+<tr><td>env 装配 (含 flash-attn 修)</td><td>30-60 min</td><td>1-1.5 h</td></tr>
+<tr><td>ActionDiT preprocess</td><td>30 min</td><td>1.5-2 h</td></tr>
+<tr><td>reverse-engineer + 写 smoke test</td><td>1-2 h</td><td>2.5-4 h</td></tr>
+<tr><td>写 server.py + 4-bit 量化集成</td><td>1-2 天</td><td>+1-2 天</td></tr>
+<tr><td>跑 zero-shot Isaac Sim demo（cosmetic remap）</td><td>1 h</td><td></td></tr>
+<tr><td>LeRobot v3.0 → FastWAM 数据 adapter</td><td>4-6 h</td><td></td></tr>
+<tr><td>QLoRA 10k step 训练</td><td>5-10 h</td><td></td></tr>
+<tr><td>fine-tuned 单/多 round eval</td><td>2 h</td><td></td></tr>
+</table>
+
+<p><b>合计：</b>从零到 fine-tuned Fast-WAM SO-101 demo 大约 <b>3-5 天</b>。</p>
+
+<h2>8. 与其他横评模型对照 · Position in benchmark</h2>
+
+<table>
+<tr><th>模型</th><th>Params</th><th>4090 4-bit 推理</th><th>横评位置</th></tr>
+<tr><td>ACT</td><td>80M</td><td>&lt;100 ms</td><td>chunk transformer baseline</td></tr>
+<tr><td>DP</td><td>267M</td><td>147 ms (DDIM)</td><td>chunk diffusion baseline</td></tr>
+<tr><td>SmolVLA</td><td>450M</td><td>~150 ms</td><td>VLA tiny</td></tr>
+<tr><td>π0.5</td><td>3.36B</td><td>~250 ms</td><td>VLA flow medium</td></tr>
+<tr><td>OpenVLA</td><td>7B</td><td>240 ms (实测)</td><td>VLA discrete-token AR</td></tr>
+<tr><td><b>Fast-WAM</b></td><td><b>6B</b></td><td><b>~220 ms (估)</b></td><td><b>Video-WAM (skip-imagination)</b> ← 新档位</td></tr>
+<tr><td>DreamZero</td><td>14B</td><td><span class="tag-bad">25-30 s</span></td><td>本地不可行</td></tr>
+</table>
+
+<p>Fast-WAM 填的是 "video-world-model 类" 这个横评空白，跟 OpenVLA 同档参数量但思路不同：</p>
+<ul>
+<li>OpenVLA = VLM-based autoregressive token VLA</li>
+<li>Fast-WAM = video-diffusion-based action prediction (skip video at test time)</li>
+</ul>
+
+<h2>9. 三个 HF ckpt 怎么协同 · Three-checkpoint cooperation</h2>
+
+<p>三个仓库一起塞进同一个 <code>FastWAM</code> 实例，角色完全不同：</p>
+
+<table>
+<tr><th>HF repo</th><th>大小 (disk)</th><th>角色</th><th>在 FastWAM 内的用途</th></tr>
+<tr><td><code>Wan-AI/Wan2.2-TI2V-5B</code></td><td>25 GB</td><td><b>Video DiT 主干</b></td><td>① preprocess 阶段：5B DiT 权重 1-D 线性插值 → ActionDiT init（hidden 3072→1024）；② 推理：Video DiT 跑 <b>1 次 prefill</b> 把 frame-1 latent 编进 KV cache（<b>不</b>跑 video denoise）</td></tr>
+<tr><td><code>Wan-AI/Wan2.1-T2V-1.3B</code></td><td>17 GB</td><td><b>公共组件源</b></td><td>提供 UMT5 tokenizer / text encoder + WanVAE（<code>redirect_common_files=true</code>，Wan2.2 借用 Wan2.1 的这几个共用文件）</td></tr>
+<tr><td><code>yuanty/fastwam</code></td><td>23 GB</td><td><b>训练 ckpt</b></td><td><code>libero_uncond_2cam224.pt</code> (12 GB) + <code>robotwin_uncond_3cam_384.pt</code> (12 GB)：load_checkpoint 时覆盖 ActionDiT + 微调 Video DiT 权重（LIBERO 7-DoF Franka EEF 训练产物）</td></tr>
+</table>
+
+<div class="callout good">
+<b>关键洞察 · Key insight：</b>Fast-WAM 的&ldquo;Skip imagination&rdquo;指的是<b>推理时跳过 video 去噪</b>，但 Video DiT 本身仍然在场 — 它的 KV cache 是 Action Expert 的视觉条件源。不是&ldquo;丢掉 video pipeline&rdquo;，而是&ldquo;video 跑 1 step（编码）+ action 跑 20 step（去噪）&rdquo;。
+<br><i>Skip-imagination ≠ drop the video DiT. The Video DiT still runs 1 prefill pass to seed the KV cache that the Action Expert attends to. The skip is on video <b>denoising</b>, not on video <b>encoding</b>.</i>
+</div>
+
+<svg width="980" height="540" viewBox="0 0 980 540" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="ar2" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L9,3 z" fill="#d97706"/>
+    </marker>
+    <marker id="ar2g" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L9,3 z" fill="#1a7f37"/>
+    </marker>
+  </defs>
+
+  <!-- Title row: 3 HF repos -->
+  <text x="490" y="22" text-anchor="middle" font-weight="bold" font-size="14">3 个 HF ckpt 协同加载 · Three HF checkpoints fused into one FastWAM</text>
+
+  <!-- Wan2.2 box -->
+  <rect x="20" y="40" width="220" height="100" rx="8" fill="#e6f0ff" stroke="#1f6feb" stroke-width="2"/>
+  <text x="130" y="62" text-anchor="middle" font-weight="bold" font-size="13">Wan-AI/Wan2.2-TI2V-5B</text>
+  <text x="130" y="80" text-anchor="middle" font-size="11">25 GB · 5B DiT</text>
+  <text x="130" y="100" text-anchor="middle" font-size="11">→ Video DiT backbone</text>
+  <text x="130" y="118" text-anchor="middle" font-size="11">→ ActionDiT init 源 (插值)</text>
+  <text x="130" y="134" text-anchor="middle" font-size="10" fill="#555">video latent prediction</text>
+
+  <!-- Wan2.1 box -->
+  <rect x="380" y="40" width="220" height="100" rx="8" fill="#eee6f7" stroke="#6f42c1" stroke-width="2"/>
+  <text x="490" y="62" text-anchor="middle" font-weight="bold" font-size="13">Wan-AI/Wan2.1-T2V-1.3B</text>
+  <text x="490" y="80" text-anchor="middle" font-size="11">17 GB · 公共组件源</text>
+  <text x="490" y="100" text-anchor="middle" font-size="11">→ UMT5 tokenizer + text enc</text>
+  <text x="490" y="118" text-anchor="middle" font-size="11">→ WanVAE</text>
+  <text x="490" y="134" text-anchor="middle" font-size="10" fill="#555">redirect_common_files=true</text>
+
+  <!-- yuanty/fastwam box -->
+  <rect x="740" y="40" width="220" height="100" rx="8" fill="#e6f4ea" stroke="#1a7f37" stroke-width="2"/>
+  <text x="850" y="62" text-anchor="middle" font-weight="bold" font-size="13">yuanty/fastwam</text>
+  <text x="850" y="80" text-anchor="middle" font-size="11">23 GB · 2 个训好 ckpt</text>
+  <text x="850" y="100" text-anchor="middle" font-size="11">libero_uncond_2cam224.pt (12G)</text>
+  <text x="850" y="118" text-anchor="middle" font-size="11">robotwin_uncond_3cam_384.pt (12G)</text>
+  <text x="850" y="134" text-anchor="middle" font-size="10" fill="#555">action expert finetune</text>
+
+  <!-- Fused FastWAM instance -->
+  <rect x="100" y="200" width="780" height="140" rx="12" fill="#fff8e6" stroke="#d97706" stroke-width="3"/>
+  <text x="490" y="222" text-anchor="middle" font-weight="bold" font-size="14">FastWAM 实例 · Fused FastWAM instance (one Python object, one GPU)</text>
+
+  <!-- Subcomponents -->
+  <rect x="125" y="240" width="170" height="80" rx="6" fill="#e6f0ff" stroke="#1f6feb"/>
+  <text x="210" y="260" text-anchor="middle" font-weight="bold" font-size="12">Video DiT (5B)</text>
+  <text x="210" y="278" text-anchor="middle" font-size="10">Wan2.2 weights</text>
+  <text x="210" y="294" text-anchor="middle" font-size="10">+ yuanty 微调权重</text>
+  <text x="210" y="312" text-anchor="middle" font-size="10" fill="#1a7f37"><b>infer: 1× prefill only</b></text>
+
+  <rect x="315" y="240" width="160" height="80" rx="6" fill="#eee6f7" stroke="#6f42c1"/>
+  <text x="395" y="260" text-anchor="middle" font-weight="bold" font-size="12">UMT5 text enc</text>
+  <text x="395" y="278" text-anchor="middle" font-size="10">Wan2.1 weights</text>
+  <text x="395" y="294" text-anchor="middle" font-size="10">prompt → context</text>
+  <text x="395" y="312" text-anchor="middle" font-size="10" fill="#555">may offload to CPU</text>
+
+  <rect x="495" y="240" width="140" height="80" rx="6" fill="#eee6f7" stroke="#6f42c1"/>
+  <text x="565" y="260" text-anchor="middle" font-weight="bold" font-size="12">WanVAE</text>
+  <text x="565" y="278" text-anchor="middle" font-size="10">Wan2.1 weights</text>
+  <text x="565" y="294" text-anchor="middle" font-size="10">img → latent</text>
+  <text x="565" y="312" text-anchor="middle" font-size="10" fill="#555">fp16, no quant</text>
+
+  <rect x="655" y="240" width="200" height="80" rx="6" fill="#e6f4ea" stroke="#1a7f37"/>
+  <text x="755" y="260" text-anchor="middle" font-weight="bold" font-size="12">Action Expert (1B)</text>
+  <text x="755" y="278" text-anchor="middle" font-size="10">yuanty/fastwam ckpt</text>
+  <text x="755" y="294" text-anchor="middle" font-size="10">flow matching head</text>
+  <text x="755" y="312" text-anchor="middle" font-size="10" fill="#1a7f37"><b>infer: 20× denoise</b></text>
+
+  <!-- Arrows from sources to fused -->
+  <line x1="130" y1="140" x2="200" y2="200" stroke="#1f6feb" stroke-width="2" marker-end="url(#ar2)"/>
+  <line x1="490" y1="140" x2="430" y2="200" stroke="#6f42c1" stroke-width="2" marker-end="url(#ar2)"/>
+  <line x1="490" y1="140" x2="565" y2="200" stroke="#6f42c1" stroke-width="2" marker-end="url(#ar2)"/>
+  <line x1="850" y1="140" x2="755" y2="200" stroke="#1a7f37" stroke-width="2" marker-end="url(#ar2g)"/>
+  <line x1="850" y1="140" x2="210" y2="200" stroke="#1a7f37" stroke-width="2" stroke-dasharray="4,3" marker-end="url(#ar2g)"/>
+  <text x="600" y="180" font-size="10" fill="#1a7f37" font-style="italic">yuanty 同时改写 ActionDiT 和 Video DiT 微调权重</text>
+
+  <!-- Inference flow -->
+  <rect x="50" y="380" width="170" height="120" rx="6" fill="#f0f3f6" stroke="#555"/>
+  <text x="135" y="400" text-anchor="middle" font-weight="bold" font-size="12">输入 · Input</text>
+  <text x="135" y="418" text-anchor="middle" font-size="10">2 cam front+wrist</text>
+  <text x="135" y="434" text-anchor="middle" font-size="10">→ 横拼 224×448</text>
+  <text x="135" y="450" text-anchor="middle" font-size="10">+ 8-D proprio</text>
+  <text x="135" y="466" text-anchor="middle" font-size="10">+ prompt 文本</text>
+
+  <rect x="250" y="380" width="170" height="120" rx="6" fill="#e6f0ff" stroke="#1f6feb"/>
+  <text x="335" y="400" text-anchor="middle" font-weight="bold" font-size="12">编码 · Encode (once)</text>
+  <text x="335" y="420" text-anchor="middle" font-size="10">UMT5 → text context</text>
+  <text x="335" y="436" text-anchor="middle" font-size="10">WanVAE → frame latent</text>
+  <text x="335" y="454" text-anchor="middle" font-size="10">Video DiT prefill</text>
+  <text x="335" y="470" text-anchor="middle" font-size="10" fill="#1a7f37">→ KV cache (frozen)</text>
+
+  <rect x="450" y="380" width="200" height="120" rx="6" fill="#e6f4ea" stroke="#1a7f37"/>
+  <text x="550" y="400" text-anchor="middle" font-weight="bold" font-size="12">去噪 · Denoise (20 step)</text>
+  <text x="550" y="420" text-anchor="middle" font-size="10">Action Expert flow-match</text>
+  <text x="550" y="438" text-anchor="middle" font-size="10">attends KV cache + ctx</text>
+  <text x="550" y="456" text-anchor="middle" font-size="10">无 video denoise step</text>
+  <text x="550" y="474" text-anchor="middle" font-size="10" fill="#1a7f37"><b>~190ms 总耗时</b></text>
+
+  <rect x="680" y="380" width="250" height="120" rx="6" fill="#fff8e6" stroke="#d29922"/>
+  <text x="805" y="400" text-anchor="middle" font-weight="bold" font-size="12">输出 · Output</text>
+  <text x="805" y="420" text-anchor="middle" font-size="10">action chunk [24, 7]</text>
+  <text x="805" y="436" text-anchor="middle" font-size="10">7-D = EEF Δxyz3 + axisang3 + grip1</text>
+  <text x="805" y="456" text-anchor="middle" font-size="10" fill="#cf222e">⚠ SO-101 需 6-DoF joint</text>
+  <text x="805" y="474" text-anchor="middle" font-size="10">→ cosmetic remap × Δscale</text>
+
+  <line x1="220" y1="440" x2="248" y2="440" stroke="#555" stroke-width="2" marker-end="url(#ar2)"/>
+  <line x1="420" y1="440" x2="448" y2="440" stroke="#555" stroke-width="2" marker-end="url(#ar2)"/>
+  <line x1="650" y1="440" x2="678" y2="440" stroke="#555" stroke-width="2" marker-end="url(#ar2)"/>
+</svg>
+
+<h3>9.1 加载顺序（代码层）· Load order in code</h3>
+
+<pre><code># 1. preprocess（一次性 setup，~10min）— 把 Wan2.2 5B 权重压成 1B ActionDiT init
+python scripts/preprocess_action_dit_backbone.py \
+  --model-config configs/model/fastwam.yaml \
+  --output checkpoints/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt
+
+# 2. runtime（每次推理服务启动）— 三个仓库塞同一个 FastWAM 实例
+model = create_fastwam(
+    model_id="Wan-AI/Wan2.2-TI2V-5B",          # → Video DiT (5B)
+    tokenizer_model_id="Wan-AI/Wan2.1-T2V-1.3B",  # → UMT5 + WanVAE (redirect_common_files=true)
+    action_dit_pretrained_path="checkpoints/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt",
+    load_text_encoder=True,                     # 显存紧张时改 False，prompt context 预计算
+    ...
+)
+model.load_checkpoint("./yuanty_fastwam/libero_uncond_2cam224.pt")
+# ↑ 这一步会覆盖 ActionDiT + 微调 Video DiT 的部分权重
+</code></pre>
+
+<h3>9.2 显存账（bf16, RTX 4090 24GB）· VRAM budget</h3>
+<table>
+<tr><th>组件</th><th>权重来源</th><th>bf16 size</th><th>NF4 size</th></tr>
+<tr><td>Video DiT (5B)</td><td>Wan2.2 + yuanty 微调</td><td>~10 GB</td><td>~2.5 GB</td></tr>
+<tr><td>Action Expert (1B)</td><td>yuanty (ActionDiT init → finetune)</td><td>~2 GB</td><td>~0.5 GB</td></tr>
+<tr><td>UMT5 text enc</td><td>Wan2.1 (redirect)</td><td>~5 GB</td><td>~1.5 GB（或 CPU offload）</td></tr>
+<tr><td>WanVAE</td><td>Wan2.1 (redirect)</td><td>~0.4 GB</td><td>fp16 (VAE 不量化)</td></tr>
+<tr><td>Activations (2-cam 224×448 + chunk24)</td><td>—</td><td>~3 GB</td><td>~3 GB</td></tr>
+<tr><td><b>合计</b></td><td>—</td><td><b>~20 GB</b></td><td><b>~8 GB</b></td></tr>
+</table>
+
+<p>bf16 推理已能在 4090 24GB 跑（不能再开 Isaac Sim 同卡）；要和 Isaac Sim 共卡必须走 NF4 量化或 UMT5 CPU offload。</p>
+
+<h2>10. 关联 · Related</h2>
+<ul>
+<li><a href="openvla_finetune_plan.html">OpenVLA-7B QLoRA 微调计划</a></li>
+<li><a href="training_roadmap.html">多策略训练路线图</a></li>
+<li><a href="lingbot_vla_finetune_plan.html">LingBot-VLA 可行性</a>（双臂限制）</li>
+<li>外部：<a href="https://yuantianyuan01.github.io/FastWAM/">Fast-WAM 项目主页</a> / <a href="https://arxiv.org/abs/2603.16666">arXiv 2603.16666</a></li>
+</ul>
+
+</body>
+</html>

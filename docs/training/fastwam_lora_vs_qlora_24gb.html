@@ -1,0 +1,260 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>Fast-WAM 24GB 显存账：bf16 LoRA vs NF4 QLoRA — RTX 4090</title>
+<style>
+  :root {
+    --bg: #fafafa; --fg: #1a1a1a; --muted: #555;
+    --accent: #d97706; --warn: #d29922; --bad: #cf222e; --good: #1a7f37;
+    --code-bg: #f3f3f3; --border: #d0d7de;
+  }
+  body { font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+         background: var(--bg); color: var(--fg);
+         max-width: 1020px; margin: 28px auto; padding: 0 22px; line-height: 1.65; }
+  h1 { border-bottom: 2px solid var(--fg); padding-bottom: 6px; }
+  h2 { margin-top: 32px; border-left: 4px solid var(--accent); padding-left: 10px; }
+  h3 { margin-top: 22px; color: var(--accent); }
+  .en { color: var(--muted); font-style: italic; font-size: 0.92em; }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0; font-size: 0.93em; }
+  th, td { border: 1px solid var(--border); padding: 6px 9px; text-align: left; vertical-align: top; }
+  th { background: #f0f3f6; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  td.good { background: #e6f4ea; font-weight: 600; }
+  td.bad  { background: #ffeef0; font-weight: 600; }
+  td.warn { background: #fff8e6; font-weight: 600; }
+  code, pre { font-family: "JetBrains Mono", Menlo, Consolas, monospace; }
+  pre { background: var(--code-bg); padding: 12px; border-radius: 4px; overflow-x: auto; font-size: 0.86em; }
+  code { background: var(--code-bg); padding: 1px 5px; border-radius: 3px; }
+  .tl-dr { background: #fff8e6; border-left: 5px solid var(--accent); padding: 12px 16px; margin: 16px 0; font-size: 1.0em; }
+  .callout { border-left: 4px solid var(--warn); background: #fff8e6; padding: 10px 14px; margin: 14px 0; }
+  .callout.bad { border-color: var(--bad); background: #ffeef0; }
+  .callout.good { border-color: var(--good); background: #e6f4ea; }
+  svg { display: block; margin: 14px auto; }
+  ul { padding-left: 22px; }
+  li { margin: 4px 0; }
+  .meta { color: var(--muted); font-size: 0.9em; }
+</style>
+</head>
+<body>
+
+<h1>Fast-WAM 24GB 显存账：bf16 LoRA vs NF4 QLoRA</h1>
+<p class="meta">RTX 4090 24GB 单卡 · LeIsaac SO-101 PickOrange · 2026-05-17</p>
+<p class="en">VRAM accounting for fine-tuning Fast-WAM (Wan2.2-5B Video DiT + 1B Action Expert) on a single RTX 4090. Compares plain bf16 LoRA against NF4 QLoRA.</p>
+
+<div class="tl-dr">
+<b>TL;DR</b><br>
+bf16 LoRA 理论 19-21 GB，<b>4090 24GB 紧但能压进去</b>（前提：UMT5 CPU offload + batch=1 + grad_ckpt + 别开 Isaac Sim 共卡）；
+任何一项松了就 OOM。NF4 QLoRA 10-11 GB，舒服很多，能容忍 Isaac Sim 共卡 demo。
+<br><b>结论：</b><span style="color: var(--good); font-weight: 700;">能纯 LoRA，但 QLoRA 是工程上更稳的默认</span>。
+<br><i>bf16 LoRA technically fits 24GB but only with UMT5-CPU-offload + batch=1 + grad_ckpt and no Isaac Sim co-load — any slack causes OOM. NF4 QLoRA leaves ~13GB headroom. <b>Pure LoRA is feasible; QLoRA is the safer default.</b></i>
+</div>
+
+<h2>1. 模型参数账 · Model parameter breakdown</h2>
+
+<table>
+<tr><th>组件 / Component</th><th>params</th><th>bf16</th><th>fp32</th><th>NF4 (≈0.5 byte/p)</th></tr>
+<tr><td>Video DiT (Wan2.2-TI2V-5B core)</td><td class="num">~5.0 B</td><td class="num">10.0 GB</td><td class="num">20.0 GB</td><td class="num">~2.5 GB</td></tr>
+<tr><td>Action Expert (ActionDiT, hidden 1024)</td><td class="num">~1.0 B</td><td class="num">2.0 GB</td><td class="num">4.0 GB</td><td class="num">~0.5 GB</td></tr>
+<tr><td>UMT5-xxl text encoder</td><td class="num">~5.0 B</td><td class="num">5.0 GB*</td><td class="num">—</td><td class="num">~1.5 GB</td></tr>
+<tr><td>WanVAE 2.2 (4× spatial / 4× temporal)</td><td class="num">~0.2 B</td><td class="num">0.4 GB</td><td class="num">—</td><td class="num">fp16 (不量化)</td></tr>
+<tr><td colspan="2"><b>合计 (UMT5 留 GPU)</b></td><td class="num"><b>17.4 GB</b></td><td>—</td><td class="num"><b>~4.5 GB</b></td></tr>
+<tr><td colspan="2"><b>合计 (UMT5 CPU offload, prompt 预算一次)</b></td><td class="num"><b>12.4 GB</b></td><td>—</td><td class="num"><b>~3.0 GB</b></td></tr>
+</table>
+
+<p>*UMT5 bf16 实测约 5GB（safetensors 文件 11GB 是 fp32 起步）。<br>
+<i>*UMT5 bf16 ≈ 5GB on-device (safetensors file ships fp32 at 11GB).</i></p>
+
+<h2>2. LoRA 可训练参数 · LoRA trainable budget</h2>
+
+<p>r=16 α=16 on q/k/v/o，覆盖 Video DiT + Action Expert 所有 attention 层：</p>
+
+<table>
+<tr><th>模块</th><th>层数</th><th>hidden_dim</th><th>每矩阵 LoRA 参数 (2·r·d)</th><th>每层 q/k/v/o ×4</th><th>合计</th></tr>
+<tr><td>Video DiT</td><td class="num">30</td><td class="num">3072</td><td class="num">2×16×3072 = 98 K</td><td class="num">393 K</td><td class="num">~11.8 M</td></tr>
+<tr><td>Action Expert</td><td class="num">30</td><td class="num">1024</td><td class="num">2×16×1024 = 33 K</td><td class="num">131 K</td><td class="num">~3.9 M</td></tr>
+<tr><td colspan="5"><b>合计 trainable</b></td><td class="num"><b>~15.7 M (≈0.26%)</b></td></tr>
+</table>
+
+<p>15.7M trainable param 在 bf16 占 ~32 MB；AdamW state (fp32 m+v) 占 8 byte/param ≈ <b>126 MB</b>；gradients ≈ 32 MB。总训练态 buffer <b>~190 MB</b>，几乎可以忽略。
+<i>Trainable optimizer/grad buffer is &lt;200 MB regardless of quant level — the dominant cost is base weights + activations.</i></p>
+
+<h2>3. Activations 估算 · Activation memory (forward + backward)</h2>
+
+<p>batch=1, video_size=224×448 (2-cam concat), num_frames=33, action_horizon=32：</p>
+
+<table>
+<tr><th>关键张量</th><th>形状</th><th>fp32</th><th>bf16 + grad_ckpt</th></tr>
+<tr><td>Video DiT input latents</td><td>[1, 48, 9, 14, 28] (post-VAE)</td><td class="num">7 MB</td><td class="num">3 MB</td></tr>
+<tr><td>Video token seq</td><td>[1, 3528, 3072]</td><td class="num">43 MB</td><td class="num">22 MB</td></tr>
+<tr><td>Attention scores (per layer)</td><td>[1, 24, 3528, 3528]</td><td class="num">1.2 GB</td><td class="num">~0 (flash-attn)</td></tr>
+<tr><td>Per-layer hidden states stored</td><td>30 × [1, 3528, 3072] bf16</td><td>—</td><td class="num">650 MB</td></tr>
+<tr><td>Grad-ckpt: 仅 √N 层存</td><td>~6 × 22 MB</td><td>—</td><td class="num">~130 MB</td></tr>
+<tr><td>Action expert seq</td><td>[1, 32, 1024]</td><td class="num">0.5 MB</td><td class="num">0.25 MB</td></tr>
+<tr><td>flash-attn workspace</td><td>per-layer scratch</td><td>—</td><td class="num">~200 MB</td></tr>
+<tr><td>VAE encode activations (peak)</td><td>[1, 3, 33, 224, 448]</td><td class="num">~400 MB</td><td class="num">~200 MB</td></tr>
+<tr><td>Backward 中间梯度 (LoRA only)</td><td>—</td><td>—</td><td class="num">~200 MB</td></tr>
+<tr><td colspan="3"><b>合计 activations (bf16 + flash-attn + grad_ckpt)</b></td><td class="num"><b>~3-5 GB</b></td></tr>
+</table>
+
+<div class="callout">
+<b>关键假设 · Assumptions：</b>必须启用 <code>use_gradient_checkpointing=true</code>（fastwam.yaml 已默认开）+ flash-attn 2.8.3 内核（避免 attention score 物化）+ batch=1 + UMT5 prompt 预算缓存。一旦 batch=2 或者关 grad_ckpt，activations 会跳到 ~12 GB 直接 OOM。
+<br><i>Requires grad_ckpt ON + flash-attn ON + batch=1 + UMT5-prompt cached. Any relaxation → OOM.</i>
+</div>
+
+<h2>4. 两种方案总账 · Two scenarios side-by-side</h2>
+
+<table>
+<tr><th>项 / Item</th><th>bf16 LoRA</th><th>NF4 QLoRA</th></tr>
+<tr><td>Video DiT (5B)</td><td class="num">10.0 GB</td><td class="num">2.5 GB</td></tr>
+<tr><td>Action Expert (1B)</td><td class="num">2.0 GB</td><td class="num">0.5 GB</td></tr>
+<tr><td>UMT5 text enc (CPU offload)</td><td class="num">0 GB (CPU)</td><td class="num">0 GB (CPU)</td></tr>
+<tr><td>WanVAE</td><td class="num">0.4 GB</td><td class="num">0.4 GB</td></tr>
+<tr><td>LoRA trainable (bf16)</td><td class="num">0.03 GB</td><td class="num">0.03 GB</td></tr>
+<tr><td>Gradients (LoRA, bf16)</td><td class="num">0.03 GB</td><td class="num">0.03 GB</td></tr>
+<tr><td>AdamW optimizer state (fp32)</td><td class="num">0.13 GB</td><td class="num">0.13 GB</td></tr>
+<tr><td>Activations (grad_ckpt + flash-attn)</td><td class="num">4.0 GB</td><td class="num">4.0 GB</td></tr>
+<tr><td>CUDA driver + allocator overhead</td><td class="num">1.5 GB</td><td class="num">1.5 GB</td></tr>
+<tr><td>碎片化 buffer (经验值 +15%)</td><td class="num">2.5 GB</td><td class="num">1.0 GB</td></tr>
+<tr><td><b>合计 / Total</b></td><td class="num warn"><b>~20.6 GB</b></td><td class="num good"><b>~10.1 GB</b></td></tr>
+<tr><td>4090 24GB headroom (24 - total)</td><td class="num warn"><b>3.4 GB（紧）</b></td><td class="num good"><b>13.9 GB（充裕）</b></td></tr>
+<tr><td>能否同卡跑 Isaac Sim demo？</td><td class="num bad">❌ 不行（Sim 要 6-8GB）</td><td class="num good">✅ 可以</td></tr>
+<tr><td>能否 batch=2 加速？</td><td class="num bad">❌ OOM</td><td class="num good">✅ batch=2 仍 ~15 GB</td></tr>
+<tr><td>工程复杂度</td><td class="num good">低（直接 PEFT）</td><td class="num warn">中（需手注 bnb.Linear4bit）</td></tr>
+</table>
+
+<h2>5. SVG 可视化 · Visual comparison</h2>
+
+<svg width="980" height="380" viewBox="0 0 980 380" xmlns="http://www.w3.org/2000/svg">
+  <!-- Background grid -->
+  <line x1="60" y1="320" x2="940" y2="320" stroke="#333" stroke-width="1"/>
+  <text x="50" y="325" text-anchor="end" font-size="11">0</text>
+  <line x1="60" y1="240" x2="940" y2="240" stroke="#ccc" stroke-dasharray="3,3"/>
+  <text x="50" y="245" text-anchor="end" font-size="11">6</text>
+  <line x1="60" y1="160" x2="940" y2="160" stroke="#ccc" stroke-dasharray="3,3"/>
+  <text x="50" y="165" text-anchor="end" font-size="11">12</text>
+  <line x1="60" y1="80" x2="940" y2="80" stroke="#cf222e" stroke-width="1.5" stroke-dasharray="6,4"/>
+  <text x="50" y="85" text-anchor="end" font-size="11" fill="#cf222e">24 GB (4090 cap)</text>
+  <text x="950" y="85" text-anchor="start" font-size="11" fill="#cf222e">OOM line</text>
+
+  <!-- bf16 LoRA bar -->
+  <g transform="translate(170, 0)">
+    <text x="100" y="50" text-anchor="middle" font-weight="bold" font-size="13">bf16 LoRA</text>
+    <text x="100" y="68" text-anchor="middle" font-size="11" fill="#d29922">~20.6 GB / 24 GB</text>
+    <!-- Stack: bottom up -->
+    <!-- 1.5 = driver -->
+    <rect x="40" y="300" width="120" height="20" fill="#aaa"/>
+    <text x="100" y="314" text-anchor="middle" font-size="10" fill="#fff">driver/alloc 1.5</text>
+    <!-- 2.5 = frag -->
+    <rect x="40" y="267" width="120" height="33" fill="#d29922"/>
+    <text x="100" y="287" text-anchor="middle" font-size="10" fill="#fff">frag 2.5</text>
+    <!-- 4.0 = activations -->
+    <rect x="40" y="213" width="120" height="54" fill="#f0883e"/>
+    <text x="100" y="244" text-anchor="middle" font-size="10" fill="#fff">activations 4.0</text>
+    <!-- 0.2 = lora + opt -->
+    <rect x="40" y="211" width="120" height="2" fill="#1a7f37"/>
+    <!-- 0.4 vae -->
+    <rect x="40" y="206" width="120" height="5" fill="#6f42c1"/>
+    <!-- 2.0 action expert -->
+    <rect x="40" y="179" width="120" height="27" fill="#1f6feb"/>
+    <text x="100" y="195" text-anchor="middle" font-size="10" fill="#fff">action 2.0</text>
+    <!-- 10.0 video dit -->
+    <rect x="40" y="46" width="120" height="133" fill="#0969da"/>
+    <text x="100" y="120" text-anchor="middle" font-size="11" fill="#fff" font-weight="bold">Video DiT bf16</text>
+    <text x="100" y="135" text-anchor="middle" font-size="10" fill="#fff">10.0 GB</text>
+  </g>
+
+  <!-- NF4 QLoRA bar -->
+  <g transform="translate(580, 0)">
+    <text x="100" y="50" text-anchor="middle" font-weight="bold" font-size="13">NF4 QLoRA</text>
+    <text x="100" y="68" text-anchor="middle" font-size="11" fill="#1a7f37">~10.1 GB / 24 GB</text>
+    <!-- 1.5 driver -->
+    <rect x="40" y="300" width="120" height="20" fill="#aaa"/>
+    <text x="100" y="314" text-anchor="middle" font-size="10" fill="#fff">driver/alloc 1.5</text>
+    <!-- 1.0 frag -->
+    <rect x="40" y="287" width="120" height="13" fill="#d29922"/>
+    <text x="100" y="297" text-anchor="middle" font-size="9" fill="#fff">frag 1.0</text>
+    <!-- 4.0 activations -->
+    <rect x="40" y="233" width="120" height="54" fill="#f0883e"/>
+    <text x="100" y="264" text-anchor="middle" font-size="10" fill="#fff">activations 4.0</text>
+    <!-- 0.2 lora -->
+    <rect x="40" y="231" width="120" height="2" fill="#1a7f37"/>
+    <!-- 0.4 vae -->
+    <rect x="40" y="226" width="120" height="5" fill="#6f42c1"/>
+    <!-- 0.5 action NF4 -->
+    <rect x="40" y="219" width="120" height="7" fill="#1f6feb"/>
+    <text x="100" y="225" text-anchor="middle" font-size="9" fill="#fff">act 0.5</text>
+    <!-- 2.5 video DiT NF4 -->
+    <rect x="40" y="186" width="120" height="33" fill="#0969da"/>
+    <text x="100" y="206" text-anchor="middle" font-size="10" fill="#fff">Video DiT NF4 2.5</text>
+    <!-- Free headroom box -->
+    <rect x="40" y="80" width="120" height="106" fill="#e6f4ea" stroke="#1a7f37" stroke-dasharray="3,3"/>
+    <text x="100" y="130" text-anchor="middle" font-size="11" fill="#1a7f37" font-weight="bold">free</text>
+    <text x="100" y="148" text-anchor="middle" font-size="10" fill="#1a7f37">13.9 GB</text>
+    <text x="100" y="164" text-anchor="middle" font-size="10" fill="#1a7f37">(可同卡跑 Sim)</text>
+  </g>
+
+  <!-- Legend -->
+  <g transform="translate(60, 340)">
+    <rect x="0" y="0" width="14" height="14" fill="#0969da"/><text x="20" y="11" font-size="11">Video DiT</text>
+    <rect x="100" y="0" width="14" height="14" fill="#1f6feb"/><text x="120" y="11" font-size="11">Action Expert</text>
+    <rect x="220" y="0" width="14" height="14" fill="#6f42c1"/><text x="240" y="11" font-size="11">VAE</text>
+    <rect x="290" y="0" width="14" height="14" fill="#1a7f37"/><text x="310" y="11" font-size="11">LoRA+opt</text>
+    <rect x="390" y="0" width="14" height="14" fill="#f0883e"/><text x="410" y="11" font-size="11">activations</text>
+    <rect x="490" y="0" width="14" height="14" fill="#d29922"/><text x="510" y="11" font-size="11">frag</text>
+    <rect x="555" y="0" width="14" height="14" fill="#aaa"/><text x="575" y="11" font-size="11">driver</text>
+  </g>
+</svg>
+
+<h2>6. 工程实现差异 · Engineering cost difference</h2>
+
+<table>
+<tr><th>项</th><th>bf16 LoRA</th><th>NF4 QLoRA</th></tr>
+<tr><td>装包</td><td>peft, transformers</td><td>+ bitsandbytes ≥0.43</td></tr>
+<tr><td>权重加载</td><td>直接 <code>create_fastwam(model_dtype=torch.bfloat16)</code></td><td>需 <b>侵入</b> <code>load_wan22_ti2v_5b_components</code>，把 nn.Linear 包成 <code>bnb.nn.Linear4bit</code></td></tr>
+<tr><td>BNB 兼容性</td><td>—</td><td>WanVideoDiT / ActionDiT 是 DiffSynth 标准 nn.Linear，可直接换；VAE 别动</td></tr>
+<tr><td>反向传播</td><td>正常 autograd</td><td>需 <code>prepare_model_for_kbit_training</code> 注入 grad_input hooks</td></tr>
+<tr><td>实现工时</td><td>0.5-1 天</td><td>1-2 天（含 hook + smoke）</td></tr>
+<tr><td>训练速度 vs bf16</td><td>baseline</td><td>~0.85x（NF4 dequant 开销）</td></tr>
+</table>
+
+<h2>7. 决策建议 · Recommendation</h2>
+
+<div class="callout good">
+<b>分阶段走 · Phased path：</b>
+<ol>
+<li><b>Phase A — bf16 LoRA 跑通 smoke train</b>（0.5 天）：先证训练 pipeline 通，UMT5 必须 CPU offload，batch=1，跑 100 step loss 看趋势。<br><i>Verify training pipeline first with bf16 LoRA (cheap to set up), UMT5 CPU offload + batch=1.</i></li>
+<li><b>Phase B — 升级到 NF4 QLoRA 跑正式 10k step</b>（1-2 天）：拿到稳态后切 NF4，腾出 13GB 给 batch=2 加速、给同卡 Isaac Sim eval。<br><i>Upgrade to NF4 QLoRA for the real 10k-step run — free 13GB for batch=2 speedup and same-GPU Isaac Sim eval.</i></li>
+</ol>
+</div>
+
+<h3>红线 / Hard constraints</h3>
+<ul>
+<li><b>UMT5 必须 CPU offload</b>。否则 +5GB 直接 OOM (无论 LoRA 还是 QLoRA + Sim 共卡)。FastWAM 训练时 prompt 不变，预计算一次 context_emb 缓存即可。<br><i>UMT5 must be CPU-offloaded (or precomputed once into a context cache). +5GB overhead otherwise OOMs.</i></li>
+<li><b>flash-attn 必须开</b>（2.8.3 已装）。否则 attention score 物化 +1.2GB/layer × 30 layer = 直接爆炸。</li>
+<li><b>batch=1 + grad_accum=4</b>。如果想 batch=2，必须 NF4。</li>
+<li><b>同卡 Sim eval</b>（demo 用）：bf16 不行，必须 NF4。</li>
+</ul>
+
+<h2>8. 与其他 VLA 横评对照 · Position vs other VLAs on 4090</h2>
+
+<table>
+<tr><th>模型</th><th>params</th><th>bf16 LoRA 24GB ok？</th><th>NF4 QLoRA 24GB ok？</th><th>实测路径</th></tr>
+<tr><td>ACT</td><td class="num">80 M</td><td class="good">✅ 极轻</td><td>—</td><td>train from scratch</td></tr>
+<tr><td>DP</td><td class="num">267 M</td><td class="good">✅ 极轻</td><td>—</td><td>train from scratch</td></tr>
+<tr><td>SmolVLA</td><td class="num">450 M</td><td class="good">✅ 全参数 finetune</td><td>—</td><td>LeRobot finetune</td></tr>
+<tr><td>π0.5</td><td class="num">3.36 B</td><td class="good">✅ LoRA ~14GB</td><td class="good">✅ ~5GB</td><td>OpenPI PyTorch LoRA</td></tr>
+<tr><td>OpenVLA</td><td class="num">7 B</td><td class="warn">⚠ 紧 ~20GB</td><td class="good">✅ ~6GB</td><td>OpenVLA PEFT</td></tr>
+<tr><td><b>Fast-WAM</b></td><td class="num">~6 B</td><td class="warn"><b>⚠ 紧 ~21GB</b></td><td class="good"><b>✅ ~10GB</b></td><td><b>自己写 4-bit 注入</b></td></tr>
+<tr><td>DreamZero</td><td class="num">14 B</td><td class="bad">❌</td><td class="warn">⚠ ~13GB 但推理 25s</td><td>本地不可行</td></tr>
+</table>
+
+<h2>9. 关联文档 · Related</h2>
+<ul>
+<li><a href="fastwam_finetune_plan.html">Fast-WAM QLoRA 微调计划（完整版）</a> — 章节 3 有更早期的估算，本文是精算版</li>
+<li><a href="openvla_finetune_plan.html">OpenVLA QLoRA 计划</a> — 同样的 7B 量级 + 4-bit 路线</li>
+<li><a href="training_roadmap.html">多策略训练路线图</a></li>
+</ul>
+
+</body>
+</html>

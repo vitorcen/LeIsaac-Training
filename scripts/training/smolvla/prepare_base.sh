@@ -11,13 +11,13 @@
 # to get a "schema-free" base for fine-tuning on a 2-camera SO-101 dataset.
 #
 # Usage:
-#   bash scripts/finetune/smolvla/prepare_base.sh
+#   bash scripts/training/smolvla/prepare_base.sh
 #   # → outputs/.bases/smolvla_base_no_features/   (input_features = {})
 #
 # Then pass it to lerobot_finetune.sh:
 #   BASE_MODEL=$REPO/outputs/.bases/smolvla_base_no_features  \
 #   DATASET_REPO_ID=... \
-#   bash scripts/finetune/lerobot_finetune.sh
+#   bash scripts/training/lerobot_finetune.sh
 
 set -euo pipefail
 

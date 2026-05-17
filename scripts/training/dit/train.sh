@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # DiT Policy from-scratch training (multi_task_dit policy type).
 #
-# Thin wrapper around scripts/finetune/lerobot_finetune.sh.
+# Thin wrapper around scripts/training/lerobot_finetune.sh.
 
 set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
@@ -16,4 +16,4 @@ EXTRA_ARGS="${EXTRA_ARGS:---dataset.video_backend=pyav}"
 
 export POLICY_TYPE DATASET_REPO_ID OUTPUT_NAME STEPS BATCH_SIZE SAVE_FREQ EXTRA_ARGS
 
-exec bash "${REPO_ROOT}/scripts/finetune/lerobot_finetune.sh"
+exec bash "${REPO_ROOT}/scripts/training/lerobot_finetune.sh"

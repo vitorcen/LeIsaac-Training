@@ -12,7 +12,7 @@
 #   DATASET_REPO_ID=LightwheelAI/leisaac-pick-orange \
 #   OUTPUT_NAME=smolvla2-leisaac-pick-orange \
 #   STEPS=20000 BATCH_SIZE=64 \
-#   bash scripts/finetune/lerobot_finetune.sh
+#   bash scripts/training/lerobot_finetune.sh
 #
 # Usage B — from-scratch training (Diffusion Policy / DiT / ACT / ...):
 #
@@ -20,7 +20,7 @@
 #   DATASET_REPO_ID=LightwheelAI/leisaac-pick-orange \
 #   OUTPUT_NAME=dp-leisaac-pick-orange \
 #   STEPS=100000 BATCH_SIZE=64 \
-#   bash scripts/finetune/lerobot_finetune.sh
+#   bash scripts/training/lerobot_finetune.sh
 #
 # Common knobs:
 #   BASE_MODEL          HF repo / local dir for `--policy.path`     (mutually exclusive w/ POLICY_TYPE)

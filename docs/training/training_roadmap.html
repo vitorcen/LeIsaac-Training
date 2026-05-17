@@ -1,0 +1,333 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>LeIsaac 多策略训练路线图 · Training Roadmap</title>
+<style>
+  :root {
+    --bg: #fafafa; --fg: #1a1a1a; --muted: #555;
+    --accent: #1f6feb; --warn: #d29922; --bad: #cf222e; --good: #1a7f37;
+    --done: #57606a;
+    --code-bg: #f3f3f3; --border: #d0d7de;
+    --tier-s: #ffd700; --tier-a: #90ee90; --tier-b: #87ceeb; --tier-skip: #d3d3d3;
+  }
+  body { font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+         background: var(--bg); color: var(--fg);
+         max-width: 1080px; margin: 28px auto; padding: 0 22px; line-height: 1.6; }
+  h1 { border-bottom: 2px solid var(--fg); padding-bottom: 6px; }
+  h2 { margin-top: 36px; border-left: 4px solid var(--accent); padding-left: 10px; }
+  h3 { margin-top: 24px; color: var(--accent); }
+  .en { color: var(--muted); font-style: italic; font-size: 0.92em; }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0; font-size: 0.93em; }
+  th, td { border: 1px solid var(--border); padding: 6px 9px; text-align: left; vertical-align: top; }
+  th { background: #f0f3f6; }
+  code, pre { font-family: "JetBrains Mono", Menlo, Consolas, monospace; }
+  pre { background: var(--code-bg); padding: 12px; border-radius: 4px; overflow-x: auto; font-size: 0.86em; }
+  code { background: var(--code-bg); padding: 1px 5px; border-radius: 3px; }
+  .tier { display: inline-block; padding: 1px 8px; border-radius: 10px; font-weight: 700; font-size: 0.85em; }
+  .tier-S { background: var(--tier-s); }
+  .tier-A { background: var(--tier-a); }
+  .tier-B { background: var(--tier-b); }
+  .tier-skip { background: var(--tier-skip); color: #444; }
+  .done { color: var(--done); text-decoration: line-through; }
+  .tag-good { color: var(--good); font-weight: 600; }
+  .tag-warn { color: var(--warn); font-weight: 600; }
+  .tag-bad  { color: var(--bad); font-weight: 600; }
+  .callout { border-left: 4px solid var(--warn); background: #fff8e6; padding: 10px 14px; margin: 14px 0; }
+  .callout.good { border-color: var(--good); background: #e6f4ea; }
+  .callout.bad { border-color: var(--bad); background: #ffeef0; }
+  svg { display: block; margin: 14px auto; }
+  ul { padding-left: 22px; }
+  li { margin: 4px 0; }
+  .meta { color: var(--muted); font-size: 0.9em; }
+</style>
+</head>
+<body>
+
+<h1>LeIsaac 多策略训练路线图</h1>
+<p class="meta">SO-101 PickOrange 横评 · 2026-05-17 更新</p>
+<p class="en">Roadmap for LeIsaac SO-101 PickOrange policy benchmark — current baselines + next candidates from LeRobot ≥0.5 + external VLAs.</p>
+
+<h2>1. 已完成 baseline · Current baselines (4)</h2>
+
+<table>
+<tr><th>Policy</th><th>Params</th><th>类型</th><th>HF 发布</th><th>结果 @ horizon</th></tr>
+<tr><td>ACT</td><td>80M</td><td>chunk transformer (continuous)</td><td><code>wsagi/ACT-PickOrange</code></td><td><span class="tag-good">✅ 1/1 @ h=32</span></td></tr>
+<tr><td>Diffusion Policy</td><td>267M</td><td>UNet1D + DDIM 32-step</td><td><code>wsagi/DiffusionPolicy-PickOrange</code></td><td><span class="tag-warn">🟡 概率 0/3 ~ 3/3 @ h=16</span></td></tr>
+<tr><td>SmolVLA (本地)</td><td>450M</td><td>VLM (SmolLM2) + chunk</td><td>未发</td><td><span class="tag-warn">🟡 2/5 (60 ep 欠拟合)</span></td></tr>
+<tr><td>π0.5 v3 (本地)</td><td>3.36B base + 5M LoRA</td><td>PaliGemma + flow-matching</td><td>未发</td><td><span class="tag-warn">🟡 1 颗落盘 @ h=35</span></td></tr>
+</table>
+
+<h2>2. LeRobot ≥0.5 policy 全清单 · Full inventory</h2>
+
+<p>截至 2026-05-17，<code>lerobot/policies/</code> 下共 15 个目录 / 文件。按用途分类：</p>
+
+<svg width="1000" height="280" viewBox="0 0 1000 280" xmlns="http://www.w3.org/2000/svg">
+  <!-- BC policies -->
+  <rect x="20" y="20" width="620" height="240" fill="#e6f4ea" stroke="#1a7f37" stroke-width="2" rx="6"/>
+  <text x="330" y="42" text-anchor="middle" font-weight="bold" font-size="14">Behavior Cloning (适合 LeIsaac demo dataset)</text>
+
+  <!-- Done -->
+  <rect x="40" y="60" width="280" height="80" fill="#fff" stroke="#57606a" stroke-width="1" rx="4"/>
+  <text x="180" y="80" text-anchor="middle" font-weight="bold">✅ Already trained (4)</text>
+  <text x="180" y="100" text-anchor="middle" font-size="12">act · diffusion · smolvla · pi05</text>
+  <text x="180" y="118" text-anchor="middle" font-size="12">groot 用过社区 ckpt 但未自训</text>
+
+  <!-- Todo BC -->
+  <rect x="340" y="60" width="280" height="80" fill="#fff" stroke="#1f6feb" stroke-width="1" rx="4"/>
+  <text x="480" y="80" text-anchor="middle" font-weight="bold">🆕 Candidates (6 BC)</text>
+  <text x="480" y="100" text-anchor="middle" font-size="12">vqbet · multi_task_dit · pi0 · pi0_fast</text>
+  <text x="480" y="118" text-anchor="middle" font-size="12">wall_x · xvla</text>
+
+  <!-- External VLA -->
+  <rect x="40" y="160" width="580" height="80" fill="#fff" stroke="#d29922" stroke-width="1" rx="4"/>
+  <text x="330" y="180" text-anchor="middle" font-weight="bold">🌐 External VLA (非 LeRobot)</text>
+  <text x="330" y="200" text-anchor="middle" font-size="12">openvla-7b · lingbot-vla</text>
+  <text x="330" y="218" text-anchor="middle" font-size="12">DreamZero (14B, 已评估为不可行)</text>
+
+  <!-- Not BC -->
+  <rect x="660" y="20" width="320" height="240" fill="#ffeef0" stroke="#cf222e" stroke-width="2" rx="6"/>
+  <text x="820" y="42" text-anchor="middle" font-weight="bold" font-size="14">不在路线图 · Out of scope</text>
+
+  <rect x="680" y="60" width="280" height="60" fill="#fff" stroke="#cf222e" stroke-width="1" rx="4"/>
+  <text x="820" y="78" text-anchor="middle" font-weight="bold">RL（不适合纯 demo）</text>
+  <text x="820" y="98" text-anchor="middle" font-size="12">sac · tdmpc</text>
+
+  <rect x="680" y="140" width="280" height="60" fill="#fff" stroke="#57606a" stroke-width="1" rx="4"/>
+  <text x="820" y="158" text-anchor="middle" font-weight="bold">辅助模块（不是 policy）</text>
+  <text x="820" y="178" text-anchor="middle" font-size="12">sarm · rtc · pi_gemma.py</text>
+</svg>
+
+<h3>2.1 详细对照表 · Detailed inventory</h3>
+
+<table>
+<tr><th>Policy</th><th>类型 / Origin</th><th>Backbone / Arch</th><th>Action</th><th>状态</th></tr>
+<tr><td>act</td><td>ALOHA, 2023</td><td>ResNet18 + Transformer enc/dec</td><td>chunk continuous</td><td><span class="done">✅ 已训</span></td></tr>
+<tr><td>diffusion</td><td>Chi et al. 2023</td><td>ResNet18 + UNet1D / DDIM</td><td>chunk continuous</td><td><span class="done">✅ 已训</span></td></tr>
+<tr><td>groot</td><td>NVIDIA, 2024</td><td>Eagle VLM + DiT flow</td><td>chunk continuous</td><td><span class="done">✅ 社区 ckpt</span></td></tr>
+<tr><td>multi_task_dit</td><td>LeRobot 原生</td><td>DiT (Diffusion Transformer)</td><td>chunk continuous</td><td>🆕 未训</td></tr>
+<tr><td>pi0</td><td>Physical Intelligence, 2024</td><td>PaliGemma + flow</td><td>chunk continuous</td><td>🆕 未训</td></tr>
+<tr><td>pi05</td><td>Physical Intelligence, 2025</td><td>PaliGemma + flow（v2）</td><td>chunk continuous</td><td><span class="done">✅ 已训</span></td></tr>
+<tr><td>pi0_fast</td><td>Physical Intelligence, 2025</td><td>PaliGemma + FAST 离散 token</td><td>autoregressive token</td><td>🆕 未训</td></tr>
+<tr><td>pi_gemma</td><td>—</td><td><em>π0/π0.5 内部 backbone 实现</em></td><td>—</td><td>❌ 非独立 policy</td></tr>
+<tr><td>rtc</td><td>LeRobot 2025</td><td><em>Real-Time Chunking 推理 wrapper</em></td><td>—</td><td>❌ 非独立 policy（可作 wrapper 用）</td></tr>
+<tr><td>sac</td><td>Soft Actor Critic</td><td>RL 算法</td><td>continuous</td><td>❌ 需 env reward，不适合纯 demo</td></tr>
+<tr><td>sarm</td><td>Stanford, 2025</td><td><em>Stage-Aware Reward Modeling（给 RL 当 reward）</em></td><td>—</td><td>❌ 不是 policy</td></tr>
+<tr><td>smolvla</td><td>HuggingFace, 2025</td><td>SmolLM2 VLM + flow</td><td>chunk continuous</td><td><span class="done">✅ 已训</span></td></tr>
+<tr><td>tdmpc</td><td>Temporal Difference MPC</td><td>RL</td><td>continuous</td><td>❌ 需 world model + reward</td></tr>
+<tr><td>vqbet</td><td>NYU + Stanford, 2024</td><td>ResNet + VQ-VAE + GPT2</td><td>discrete code → action</td><td>🆕 未训 ⭐</td></tr>
+<tr><td>wall_x</td><td>2025</td><td><b>Qwen2.5-VL + flow matching</b></td><td>chunk continuous</td><td>🆕 未训 ⭐⭐</td></tr>
+<tr><td>xvla</td><td>2toINF, 2025</td><td><b>Florence2 + soft transformer</b></td><td>chunk continuous</td><td>🆕 未训</td></tr>
+</table>
+
+<h2>3. 候选模型分级与推荐 · Candidate prioritization</h2>
+
+<p>按"上手成本 × 横评价值"分 3 个梯队：</p>
+
+<h3><span class="tier tier-S">Tier S</span> — 立即可做，价值最高</h3>
+
+<table>
+<tr><th>#</th><th>模型</th><th>为什么值得 · Why</th><th>预计耗时</th><th>风险</th></tr>
+<tr><td>1</td><td><b>openvla-7b</b>（外部）</td>
+    <td>7B 离散 token VLA 档位空白；单臂 DROID 直接可用；MIT license；详见 <a href="openvla_finetune_plan.html">openvla_finetune_plan.html</a></td>
+    <td>2-3 天（含 RLDS 转换 + 训练 + eval）</td>
+    <td>实时性 480ms/action — 需 int4 量化或 step_hz=10</td></tr>
+<tr><td>2</td><td><b>vqbet</b>（LeRobot 原生）</td>
+    <td>离散动作表示这一档完全空白；ResNet + GPT-2 backbone 小（&lt;200M）；4090 训练快；与 ACT/DP 完美互补</td>
+    <td>4-6 小时</td>
+    <td>低</td></tr>
+<tr><td>3</td><td><b>pi0</b>（LeRobot 原生）</td>
+    <td>跟我们 π0.5 同家，但更"古典" — 对照 π0 vs π0.5 看 v1→v2 升级是否帮助 LeIsaac；同 LoRA 配方可复用</td>
+    <td>8-12 小时</td>
+    <td>低（与 π0.5 流程对齐）</td></tr>
+</table>
+
+<h3><span class="tier tier-A">Tier A</span> — 中等改造，对横评有价值</h3>
+
+<table>
+<tr><th>#</th><th>模型</th><th>为什么值得 · Why</th><th>预计耗时</th><th>风险</th></tr>
+<tr><td>4</td><td><b>pi0_fast</b></td>
+    <td>FAST 离散 token 表示（vs π0.5 连续 flow）— 测试 "同 backbone 不同 action head" 影响；与 OpenVLA 都是离散 token VLA 同档对比</td>
+    <td>10-15 小时</td>
+    <td>中（FAST tokenizer 配置坑）</td></tr>
+<tr><td>5</td><td><b>wall_x</b></td>
+    <td>Qwen2.5-VL backbone（同 LingBot-VLA），新一代 VL；4090 应能塞下；走通可作为"LingBot 的开源替代"</td>
+    <td>1-2 天</td>
+    <td>中（新 policy，没社区参考 recipe）</td></tr>
+<tr><td>6</td><td><b>multi_task_dit</b></td>
+    <td>DiT 架构（vs UNet1D），填上 "Transformer-based diffusion" 这一档；用同样 dataset 跟 DP 直接对比</td>
+    <td>6-8 小时</td>
+    <td>低</td></tr>
+<tr><td>7</td><td><b>Fast-WAM</b>（外部）</td>
+    <td><b>新增 ⭐⭐</b>：填 "Video World-Action Model" 横评空白；6B Wan2.2-DiT + 1B action expert；190ms latency on RTX 5090D 实测，4090 估 ~220ms；ckpt 公开；详见 <a href="fastwam_finetune_plan.html">fastwam_finetune_plan.html</a></td>
+    <td>3-5 天（含 QLoRA fine-tune）</td>
+    <td>中（reverse-engineer 单帧 API + bnb 4-bit 集成）</td></tr>
+</table>
+
+<h3><span class="tier tier-B">Tier B</span> — 探索性，需深度改造</h3>
+
+<table>
+<tr><th>#</th><th>模型</th><th>为什么值得 · Why</th><th>预计耗时</th><th>风险</th></tr>
+<tr><td>7</td><td><b>xvla</b></td>
+    <td>Florence2 backbone（Microsoft，多任务 vision-language），独特 VL 路线；扩展横评 "different VL pretrain" 维度</td>
+    <td>1-2 天</td>
+    <td>中</td></tr>
+<tr><td>8</td><td><b>lingbot-vla</b>（外部）</td>
+    <td>2026-01 蚂蚁开源，Qwen2.5-VL-3B + flow；<b>但仅训过双臂</b>，单臂需 swap action head；详见 <a href="lingbot_vla_finetune_plan.html">lingbot_vla_finetune_plan.html</a></td>
+    <td>2-4 天</td>
+    <td><span class="tag-bad">高</span>（单臂 head 重训 / 等官方）</td></tr>
+<tr><td>9</td><td><b>groot 自训</b></td>
+    <td>之前用的是 LightwheelAI 社区 ckpt；自己用 NVIDIA Isaac-GR00T 训练框架走一遍闭环，得到 fully-controlled baseline</td>
+    <td>2-3 天</td>
+    <td>中（GR00T 训练流程复杂）</td></tr>
+</table>
+
+<h3><span class="tier tier-skip">Tier Skip</span> — 不做</h3>
+
+<ul>
+<li><b>sac / tdmpc</b>：纯 RL，需要 reward function + env 闭环，与我们 demo-only dataset 不匹配</li>
+<li><b>sarm</b>：是 reward model 不是 policy；如果未来要做 RL 微调 BC 模型可作辅助</li>
+<li><b>rtc</b>：是推理 wrapper（实时 chunking），所有 chunk-based policy 都可套用 — 单独不构成 baseline，但可作为 "ACT/DP/π0.5 加速包装" 单独评测一次</li>
+<li><b>pi_gemma.py</b>：π0 系列内部组件，非独立 policy</li>
+<li><b>DreamZero (NVIDIA)</b>：14B Wan2.1 backbone，<b>4090 推理估 25-30 s/chunk 不可用</b>；QLoRA 训练 4-13 天非停机；Vizuara SO-101 LoRA 的所谓 patches repo 是 paper 网站无 code</li>
+</ul>
+
+<div class="callout good">
+<b>2026-05-17 更新</b>：Fast-WAM (6B Wan2.2-DiT) 跑通 DreamZero 想做但 4090 做不到的 "video-world-model 横评条目"。
+本质差异：DreamZero <b>imagine-then-execute</b>（推理时多步去噪生成视频）= 慢；Fast-WAM <b>训练时 co-train video，推理时 SKIP imagination</b> = 快。
+</div>
+
+<h2>4. 执行顺序建议 · Recommended order</h2>
+
+<svg width="980" height="160" viewBox="0 0 980 160" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="ar3" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L9,3 z" fill="#1f6feb"/>
+    </marker>
+  </defs>
+  <!-- timeline -->
+  <line x1="40" y1="80" x2="940" y2="80" stroke="#1f6feb" stroke-width="2" marker-end="url(#ar3)"/>
+
+  <!-- nodes -->
+  <circle cx="80" cy="80" r="22" fill="#ffd700" stroke="#000"/>
+  <text x="80" y="85" text-anchor="middle" font-weight="bold" font-size="13">1</text>
+  <text x="80" y="120" text-anchor="middle" font-size="11">OpenVLA</text>
+  <text x="80" y="135" text-anchor="middle" font-size="10">7B 离散</text>
+
+  <circle cx="200" cy="80" r="22" fill="#ffd700" stroke="#000"/>
+  <text x="200" y="85" text-anchor="middle" font-weight="bold" font-size="13">2</text>
+  <text x="200" y="120" text-anchor="middle" font-size="11">VQ-BeT</text>
+  <text x="200" y="135" text-anchor="middle" font-size="10">小模型快测</text>
+
+  <circle cx="320" cy="80" r="22" fill="#ffd700" stroke="#000"/>
+  <text x="320" y="85" text-anchor="middle" font-weight="bold" font-size="13">3</text>
+  <text x="320" y="120" text-anchor="middle" font-size="11">π0</text>
+  <text x="320" y="135" text-anchor="middle" font-size="10">v1 对照</text>
+
+  <circle cx="440" cy="80" r="22" fill="#90ee90" stroke="#000"/>
+  <text x="440" y="85" text-anchor="middle" font-weight="bold" font-size="13">4</text>
+  <text x="440" y="120" text-anchor="middle" font-size="11">π0-FAST</text>
+  <text x="440" y="135" text-anchor="middle" font-size="10">离散 vs 连续</text>
+
+  <circle cx="560" cy="80" r="22" fill="#90ee90" stroke="#000"/>
+  <text x="560" y="85" text-anchor="middle" font-weight="bold" font-size="13">5</text>
+  <text x="560" y="120" text-anchor="middle" font-size="11">Wall-X</text>
+  <text x="560" y="135" text-anchor="middle" font-size="10">Qwen2.5-VL</text>
+
+  <circle cx="680" cy="80" r="22" fill="#90ee90" stroke="#000"/>
+  <text x="680" y="85" text-anchor="middle" font-weight="bold" font-size="13">6</text>
+  <text x="680" y="120" text-anchor="middle" font-size="11">multi_task_dit</text>
+  <text x="680" y="135" text-anchor="middle" font-size="10">DiT</text>
+
+  <circle cx="800" cy="80" r="22" fill="#87ceeb" stroke="#000"/>
+  <text x="800" y="85" text-anchor="middle" font-weight="bold" font-size="13">7</text>
+  <text x="800" y="120" text-anchor="middle" font-size="11">xvla</text>
+  <text x="800" y="135" text-anchor="middle" font-size="10">Florence2</text>
+
+  <circle cx="920" cy="80" r="22" fill="#87ceeb" stroke="#000"/>
+  <text x="920" y="85" text-anchor="middle" font-weight="bold" font-size="13">8+</text>
+  <text x="920" y="120" text-anchor="middle" font-size="11">LingBot</text>
+  <text x="920" y="135" text-anchor="middle" font-size="10">单臂改造</text>
+
+  <text x="80" y="35" text-anchor="middle" font-size="11" fill="#1a7f37">当前</text>
+  <text x="500" y="35" text-anchor="middle" font-size="11" fill="#555">Tier S 完成后矩阵 7 模型</text>
+  <text x="920" y="35" text-anchor="middle" font-size="11" fill="#555">长尾</text>
+</svg>
+
+<p><b>关键节点 · Key milestones：</b></p>
+<ol>
+<li><b>完成 Tier S 后</b>（当前 +3 模型）：横评矩阵达 <b>7 个 policy</b>，覆盖 chunk continuous / discrete token / RL-style coding 三大动作表示</li>
+<li><b>完成 Tier A 后</b>（再 +3）：横评矩阵 10 模型，<b>同 backbone × 不同 action head（π0 vs π0.5 vs π0-FAST）</b> 三角对照成立</li>
+<li><b>Tier B 看情况</b>：xvla / LingBot 是"探索向"，决定取决于 Tier S/A 跑完后我们想验证的具体 hypothesis</li>
+</ol>
+
+<h2>5. 与 横评设计文档的关联 · Cross-references</h2>
+
+<ul>
+<li><a href="openvla_finetune_plan.html"><code>openvla_finetune_plan.html</code></a> — OpenVLA-7B 详细计划（Tier S 第 1 个）</li>
+<li><a href="lingbot_vla_finetune_plan.html"><code>lingbot_vla_finetune_plan.html</code></a> — LingBot-VLA 可行性（Tier B）</li>
+<li><a href="policy_comparison_priorities.html"><code>policy_comparison_priorities.html</code></a> — 横评主线优先级</li>
+<li><a href="dp_inference_speedup_and_dynamic_timeout.html"><code>dp_inference_speedup_and_dynamic_timeout.html</code></a> — DP DDIM swap + dynamic timeout</li>
+<li><a href="act_eval_debug_postmortem.html"><code>act_eval_debug_postmortem.html</code></a> — ACT horizon trap 复盘</li>
+</ul>
+
+<h2>6. 横评维度矩阵 · Benchmark dimension matrix</h2>
+
+<p>把所有已训 + 计划的 policy 放进维度矩阵，方便看哪些 cell 还空着：</p>
+
+<table>
+<tr><th>维度 / 模型</th><th>Tiny<br/>(&lt;200M)</th><th>Small<br/>(200-500M)</th><th>Medium<br/>(500M-3B)</th><th>Large<br/>(3B+)</th></tr>
+<tr><th>Chunk continuous regression</th>
+    <td>ACT ✅</td>
+    <td>DP ✅</td>
+    <td>multi_task_dit 🆕</td>
+    <td>groot ✅(社区)</td></tr>
+<tr><th>Chunk flow-matching (VLA)</th>
+    <td>—</td>
+    <td>SmolVLA ✅</td>
+    <td>wall_x 🆕 / xvla 🆕</td>
+    <td>pi0 🆕 / pi05 ✅</td></tr>
+<tr><th>Discrete <b>action code</b> (VQ codebook)</th>
+    <td>VQ-BeT 🆕 ⭐</td>
+    <td>—</td>
+    <td>—</td>
+    <td>—</td></tr>
+<tr><th>Discrete <b>VLA token</b> (LLM AR)</th>
+    <td>—</td>
+    <td>—</td>
+    <td>pi0_fast 🆕</td>
+    <td>OpenVLA 🆕 ⭐</td></tr>
+<tr><th>Video World-Action Model</th>
+    <td>—</td>
+    <td>—</td>
+    <td>—</td>
+    <td>Fast-WAM 🆕 ⭐ (6B)</td></tr>
+<tr><th>Latent predictive (JEPA-style)</th>
+    <td>—</td>
+    <td>—</td>
+    <td>VLA-JEPA 🆕 (~3B)</td>
+    <td>—</td></tr>
+<tr><th>Dual-arm only（需改造）</th>
+    <td>—</td>
+    <td>—</td>
+    <td>LingBot-VLA 🆕</td>
+    <td>—</td></tr>
+</table>
+
+<div class="callout good">
+<b>洞察 · Insight（codex review 修正）：</b>VQ-BeT 跟 OpenVLA <b>不是同一档</b>：
+<ul>
+<li>VQ-BeT: 离散 <b>action code</b>（VQ-VAE codebook quantization on actions）</li>
+<li>OpenVLA: 离散 <b>VLA token</b>（LLM autoregressive over 256-bin action bins）</li>
+</ul>
+两者机制不同，应作为<b>独立横评维度</b>。
+<br/><br/>
+<b>新增维度</b>（2026-05-17）：
+<ul>
+<li>"Video World-Action Model"（Fast-WAM）— 此前一直空白，DreamZero 14B 不可行后 Fast-WAM 6B 填上</li>
+<li>"Latent predictive (JEPA-style)"（VLA-JEPA）— 另一条非生成式 world model 路线</li>
+</ul>
+</div>
+
+</body>
+</html>
