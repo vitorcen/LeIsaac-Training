@@ -152,6 +152,146 @@
   </ul>
 </div>
 
+<h3>4.1 模型内部结构（实际代码逐行确认）</h3>
+
+<p>SmolVLA 是 <b>HuggingFace SmolVLM2 (500M VLM) + 自研 Action Expert (flow matching transformer)</b> 的拼装，VLM 与 expert 通过 <b>cross-attention</b> 耦合。</p>
+
+<table>
+<tr><th>组件</th><th>来源</th><th>实现</th><th>参数估算</th></tr>
+<tr><td><b>SmolVLM2 VLM</b></td><td>HuggingFaceTB（<code>configuration_smolvla.py:84</code> <code>vlm_model_name="HuggingFaceTB/SmolVLM2-500M-Video-Instruct"</code>）</td><td>SigLIP vision encoder + Llama-style text decoder；SmolVLA 中默认 <b>vision encoder frozen</b>（<code>freeze_vision_encoder=True</code>），text 部分用作 prefix encoder</td><td>~500M</td></tr>
+<tr><td><b>Action Expert</b></td><td>SmolVLA 自研（<code>smolvlm_with_expert.py:72</code>）</td><td>小型 transformer，与 VLM 共享每层 KV cache 但有独立 Q/MLP；通过 <code>cross_attn</code> 读 VLM features；输出 flow-matching velocity</td><td>~50M (trainable，默认 <code>train_expert_only=True</code>)</td></tr>
+<tr><td><b>State / Action projector</b></td><td>SmolVLA 自研</td><td>state 32D → hidden；action 32D → hidden；time step embedding</td><td>~1M</td></tr>
+<tr><td><b>合计</b></td><td>—</td><td>—</td><td><b>~550M</b>（其中 trainable ~50M）</td></tr>
+</table>
+
+<svg width="980" height="540" viewBox="0 0 980 540" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="sm-ai" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#1f6feb" />
+    </marker>
+    <marker id="sm-ai2" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#cf222e" />
+    </marker>
+  </defs>
+
+  <text x="490" y="25" font-weight="bold" font-size="14" text-anchor="middle">SmolVLA 内部数据流（训练 forward + flow-matching）</text>
+
+  <!-- ============= LAYER 1: INPUTS ============= -->
+  <rect x="10" y="50" width="200" height="40" rx="6" fill="#e6f0ff" stroke="#1f6feb" stroke-width="2"/>
+  <text x="110" y="68" text-anchor="middle" font-size="11" font-weight="bold">pixel_values (B, V, 3, 512, 512)</text>
+  <text x="110" y="84" text-anchor="middle" font-size="10">front + wrist, padded 512²</text>
+
+  <rect x="10" y="100" width="200" height="40" rx="6" fill="#e6f0ff" stroke="#1f6feb" stroke-width="2"/>
+  <text x="110" y="118" text-anchor="middle" font-size="11" font-weight="bold">input_ids (B, ≤48)</text>
+  <text x="110" y="134" text-anchor="middle" font-size="10">task description tokens</text>
+
+  <rect x="10" y="150" width="200" height="40" rx="6" fill="#e6f0ff" stroke="#1f6feb" stroke-width="2"/>
+  <text x="110" y="168" text-anchor="middle" font-size="11" font-weight="bold">state (B, 32)</text>
+  <text x="110" y="184" text-anchor="middle" font-size="10">SO-101 6D + pad → 32</text>
+
+  <rect x="10" y="200" width="200" height="40" rx="6" fill="#ffeef0" stroke="#cf222e" stroke-width="2"/>
+  <text x="110" y="218" text-anchor="middle" font-size="11" font-weight="bold">action_clean (B, 50, 32)</text>
+  <text x="110" y="234" text-anchor="middle" font-size="10">GT chunk (target)</text>
+
+  <rect x="10" y="255" width="200" height="55" rx="6" fill="#fff8e6" stroke="#d29922" stroke-width="2"/>
+  <text x="110" y="273" text-anchor="middle" font-size="11" font-weight="bold">采样 t ~ U(0,1)</text>
+  <text x="110" y="289" text-anchor="middle" font-size="10">action_noisy = ε*t + a*(1-t)</text>
+  <text x="110" y="304" text-anchor="middle" font-size="10">→ (B, 50, 32)</text>
+
+  <!-- ============= LAYER 2: SmolVLM2 ============= -->
+  <rect x="240" y="50" width="220" height="220" rx="8" fill="#fff8e6" stroke="#d29922" stroke-width="3"/>
+  <text x="350" y="75" text-anchor="middle" font-size="13" font-weight="bold">SmolVLM2-500M VLM</text>
+  <text x="350" y="92" text-anchor="middle" font-size="10" fill="#555">HuggingFaceTB, ~500M</text>
+
+  <rect x="255" y="105" width="190" height="40" rx="4" fill="#fffaf0" stroke="#d29922" stroke-width="1"/>
+  <text x="350" y="123" text-anchor="middle" font-size="10" font-weight="bold">SigLIP vision encoder</text>
+  <text x="350" y="138" text-anchor="middle" font-size="9">frozen (freeze_vision_encoder=True)</text>
+
+  <rect x="255" y="150" width="190" height="40" rx="4" fill="#fffaf0" stroke="#d29922" stroke-width="1"/>
+  <text x="350" y="168" text-anchor="middle" font-size="10" font-weight="bold">Image → text token projector</text>
+  <text x="350" y="183" text-anchor="middle" font-size="9">vision → llama embedding</text>
+
+  <rect x="255" y="195" width="190" height="65" rx="4" fill="#fffaf0" stroke="#d29922" stroke-width="1"/>
+  <text x="350" y="212" text-anchor="middle" font-size="10" font-weight="bold">Llama-style text decoder</text>
+  <text x="350" y="228" text-anchor="middle" font-size="9">N transformer layers</text>
+  <text x="350" y="243" text-anchor="middle" font-size="9">cache per-layer KV</text>
+  <text x="350" y="256" text-anchor="middle" font-size="9" fill="#555">通常 frozen，仅留 expert 训</text>
+
+  <!-- ============= LAYER 3: Action Expert ============= -->
+  <rect x="490" y="50" width="290" height="430" rx="8" fill="#e6f4ea" stroke="#1a7f37" stroke-width="3"/>
+  <text x="635" y="75" text-anchor="middle" font-size="13" font-weight="bold">VLAFlowMatching action expert</text>
+  <text x="635" y="92" text-anchor="middle" font-size="10" fill="#555">~50M trainable</text>
+
+  <!-- State proj -->
+  <rect x="505" y="110" width="260" height="45" rx="4" fill="#f0f7f3" stroke="#1a7f37" stroke-width="1"/>
+  <text x="635" y="128" text-anchor="middle" font-size="11" font-weight="bold">state_proj (Linear)</text>
+  <text x="635" y="143" text-anchor="middle" font-size="9">(B, 32) → (B, 1, hidden)</text>
+
+  <!-- Action proj -->
+  <rect x="505" y="163" width="260" height="45" rx="4" fill="#f0f7f3" stroke="#1a7f37" stroke-width="1"/>
+  <text x="635" y="181" text-anchor="middle" font-size="11" font-weight="bold">action_proj (Linear) + time_emb</text>
+  <text x="635" y="196" text-anchor="middle" font-size="9">cat(action_noisy, t_emb) → (B, 50, hidden)</text>
+
+  <!-- Cross-attention layers (key innovation) -->
+  <rect x="505" y="218" width="260" height="180" rx="4" fill="#d4e9d9" stroke="#1a7f37" stroke-width="1"/>
+  <text x="635" y="238" text-anchor="middle" font-size="12" font-weight="bold">× N expert layers</text>
+  <text x="635" y="256" text-anchor="middle" font-size="10">每层做两件事：</text>
+  <text x="515" y="276" font-size="10">  ① <b>cross-attn(action_tok, VLM features)</b></text>
+  <text x="515" y="290" font-size="9" fill="#555">    （从 VLM 拿视觉/语言条件）</text>
+  <text x="515" y="310" font-size="10">  ② self-attn(action tokens)</text>
+  <text x="515" y="324" font-size="9" fill="#555">    bidirectional 全注意力</text>
+  <text x="515" y="344" font-size="10">  ③ MLP</text>
+  <text x="635" y="368" text-anchor="middle" font-size="10" fill="#555">attention_mode="cross_attn"</text>
+  <text x="635" y="385" text-anchor="middle" font-size="10" fill="#555">VLM weights 复用，expert 独立 Q/MLP</text>
+
+  <!-- Action decoder -->
+  <rect x="505" y="408" width="260" height="50" rx="4" fill="#f0f7f3" stroke="#1a7f37" stroke-width="1"/>
+  <text x="635" y="426" text-anchor="middle" font-size="11" font-weight="bold">action_decoder (Linear)</text>
+  <text x="635" y="441" text-anchor="middle" font-size="9">→ (B, 50, 32) velocity</text>
+  <text x="635" y="455" text-anchor="middle" font-size="9">取前 6 维 = SO-101 6D 输出</text>
+
+  <!-- ============= LAYER 4: OUTPUT ============= -->
+  <rect x="810" y="220" width="160" height="60" rx="6" fill="#ffeef0" stroke="#cf222e" stroke-width="2"/>
+  <text x="890" y="242" text-anchor="middle" font-size="11" font-weight="bold">Flow-matching loss</text>
+  <text x="890" y="258" text-anchor="middle" font-size="10">L = ||v_pred − (ε−a_clean)||</text>
+  <text x="890" y="272" text-anchor="middle" font-size="10">+ optional state_proj L</text>
+
+  <!-- Arrows -->
+  <line x1="210" y1="70" x2="238" y2="120" stroke="#1f6feb" stroke-width="1.5" marker-end="url(#sm-ai)"/>
+  <line x1="210" y1="120" x2="238" y2="170" stroke="#1f6feb" stroke-width="1.5" marker-end="url(#sm-ai)"/>
+
+  <line x1="460" y1="225" x2="503" y2="280" stroke="#1f6feb" stroke-width="2" marker-end="url(#sm-ai)"/>
+  <text x="478" y="218" font-size="9" fill="#555">VLM features (KV)</text>
+
+  <path d="M 210 170 Q 350 320 503 132" fill="none" stroke="#1f6feb" stroke-width="1.5" stroke-dasharray="3,2" marker-end="url(#sm-ai)"/>
+  <path d="M 210 280 Q 350 400 503 185" fill="none" stroke="#cf222e" stroke-width="1.5" stroke-dasharray="3,2" marker-end="url(#sm-ai2)"/>
+
+  <line x1="635" y1="155" x2="635" y2="161" stroke="#1a7f37" stroke-width="1.5" marker-end="url(#sm-ai)"/>
+  <line x1="635" y1="208" x2="635" y2="216" stroke="#1a7f37" stroke-width="1.5" marker-end="url(#sm-ai)"/>
+  <line x1="635" y1="398" x2="635" y2="406" stroke="#1a7f37" stroke-width="2" marker-end="url(#sm-ai)"/>
+
+  <line x1="765" y1="433" x2="850" y2="270" stroke="#cf222e" stroke-width="2" marker-end="url(#sm-ai2)"/>
+
+  <!-- Inference loop note -->
+  <rect x="10" y="380" width="200" height="120" rx="6" fill="#f8f8f8" stroke="#999" stroke-width="1"/>
+  <text x="110" y="400" text-anchor="middle" font-size="11" font-weight="bold">推理 (inference) loop</text>
+  <text x="20" y="420" font-size="10">• 从 x_t = N(0, 1) 起步</text>
+  <text x="20" y="436" font-size="10">• for i in range(10, 0, -1):</text>
+  <text x="20" y="450" font-size="10">　 t = i/10</text>
+  <text x="20" y="464" font-size="10">　 forward → x_(t-1)</text>
+  <text x="20" y="480" font-size="10">• 共 <b>10 次 forward / chunk</b></text>
+  <text x="20" y="494" font-size="10" fill="#cf222e">→ latency × 10</text>
+</svg>
+
+<p><b>读图要点</b>：</p>
+<ul>
+<li>SmolVLM2 是 <b>外购 HuggingFace VLM</b>，SmolVLA 把它当 frozen 视觉/语言条件编码器</li>
+<li>真正的 SmolVLA 创新在 <b>action expert</b> 通过 <b>cross-attention</b> 复用 VLM 每层 KV，但有独立的 Q/MLP/action proj</li>
+<li>训练 / 推理都是 <b>flow matching 风格</b>（同 π0.5 / X-VLA），<code>num_steps=10</code> 个去噪迭代</li>
+<li>chunk_size=50 默认（比 X-VLA 32 / OFT 8 都长），需考虑 30Hz 下 1.67s open-loop 问题</li>
+<li>默认 <code>train_expert_only=True</code>：VLM 完全冻结，只训 ~50M expert + state proj</li>
+</ul>
+
 <h2>5. 训练计划</h2>
 
 <h3>5.1 命令模板（推荐用 LeIsaac 仓的 scaffold）</h3>

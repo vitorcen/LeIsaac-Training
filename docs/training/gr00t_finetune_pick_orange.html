@@ -1,0 +1,365 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>GR00T N1.5 / N1.6 微调计划 — LeIsaac SO-101 PickOrange</title>
+<style>
+  :root {
+    --bg: #fafafa; --fg: #1a1a1a; --muted: #555;
+    --accent: #1f6feb; --warn: #d29922; --bad: #cf222e; --good: #1a7f37;
+    --code-bg: #f3f3f3; --border: #d0d7de;
+  }
+  body { font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+         background: var(--bg); color: var(--fg);
+         max-width: 1000px; margin: 28px auto; padding: 0 22px; line-height: 1.6; }
+  h1 { border-bottom: 2px solid var(--fg); padding-bottom: 6px; }
+  h2 { margin-top: 36px; border-left: 4px solid var(--accent); padding-left: 10px; }
+  h3 { margin-top: 24px; color: var(--accent); }
+  .en { color: var(--muted); font-style: italic; font-size: 0.92em; }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0; font-size: 0.94em; }
+  th, td { border: 1px solid var(--border); padding: 6px 10px; text-align: left; vertical-align: top; }
+  th { background: #f0f3f6; }
+  code, pre { font-family: "JetBrains Mono", Menlo, Consolas, monospace; }
+  pre { background: var(--code-bg); padding: 12px; border-radius: 4px; overflow-x: auto; font-size: 0.88em; }
+  code { background: var(--code-bg); padding: 1px 5px; border-radius: 3px; }
+  .tag-good { color: var(--good); font-weight: 600; }
+  .tag-warn { color: var(--warn); font-weight: 600; }
+  .tag-bad  { color: var(--bad); font-weight: 600; }
+  .callout { border-left: 4px solid var(--warn); background: #fff8e6; padding: 10px 14px; margin: 14px 0; }
+  .callout.bad { border-color: var(--bad); background: #ffeef0; }
+  .callout.good { border-color: var(--good); background: #e6f4ea; }
+  svg { display: block; margin: 14px auto; }
+  ul { padding-left: 22px; }
+  li { margin: 4px 0; }
+  .meta { color: var(--muted); font-size: 0.9em; }
+</style>
+</head>
+<body>
+
+<h1>GR00T N1.5 / N1.6 微调计划</h1>
+<p class="meta">SO-101 PickOrange · LeIsaac benchmark champion (N1.6 🥇 2/3) · 2026-05-18</p>
+<p class="en">NVIDIA Isaac GR00T N1.5/N1.6 — Eagle2 VLM + multi-embodiment flow-matching DiT action head, ~3B params.
+Already top of the leaderboard via the LightwheelAI public ckpt; the next obvious lever is in-house LoRA / QLoRA finetune to push from 6/9 to 8/9 oranges.</p>
+
+<h2>0. TL;DR</h2>
+<div class="callout good">
+<b>GR00T-N1.6 是当前 leaderboard 🥇</b>（LightwheelAI ckpt 实测 2/3 strict round, 6/9 oranges, 96s avg, 17.3 GB VRAM）。
+架构：<b>Eagle2-VLM (~2.4B, frozen) + Flow-matching Action DiT (~600M, trainable)</b>，3B 总参数。
+N1.5 是上一代（0/3, 4/9，但已 commit 落盘 8 颗其中 4 strict）；N1.6 用更新的 Eagle2.5 backbone + 优化 action head。
+<br/><br/>
+<b>下一步</b>：自己跑 LoRA / QLoRA 微调（lerobot config 原生支持 <code>lora_rank</code>），从 <code>nvidia/GR00T-N1.6-3B</code> base 出发，预期能从 2/3 → 3/3。
+</div>
+
+<h2>1. 架构核心</h2>
+
+<table>
+<tr><th>组件</th><th>来源</th><th>实现</th><th>参数估算</th></tr>
+<tr><td><b>Eagle2 VLM backbone</b></td><td>NVIDIA Eagle 2 (2024)</td><td>SigLIP-style vision encoder + Llama 3-class decoder，N1.5 用 Eagle2，N1.6 升级到 Eagle 2.5（<code>eagle2_hg_model/modeling_eagle2_5_vl.py</code>）；默认 <code>tune_llm=False, tune_visual=False</code> 全 frozen</td><td>~2.4B</td></tr>
+<tr><td><b>Visual / state projector</b></td><td>GR00T 自研</td><td>把 VLM features + state 投到 action DiT 输入维；默认 <code>tune_projector=True</code> 可训</td><td>~10M</td></tr>
+<tr><td><b>MultiEmbodimentActionEncoder</b></td><td>GR00T 自研（<code>flow_matching_action_head.py:67</code>）</td><td><code>CategorySpecificLinear/MLP</code>：每个 embodiment 有独立的 fc 权重（同 X-VLA DomainAwareLinear 思路），把 6/7-DOF action + 时间步投到 hidden</td><td>~30M</td></tr>
+<tr><td><b>Cross-attention DiT action head</b></td><td>GR00T 自研（<code>cross_attention_dit.py:204</code>）</td><td>N 层 BasicTransformerBlock：每层先 self-attn(action tokens)，再 cross-attn(action, VLM features)，AdaLayerNorm 注入 timestep；输出 noise/velocity prediction；默认 <code>tune_diffusion_model=True</code> 可训</td><td>~500M</td></tr>
+<tr><td><b>Flow-matching scheduler</b></td><td>GR00T 自研</td><td>continuous flow matching（同 π0.5/SmolVLA/X-VLA/FastWAM 家族）</td><td>—</td></tr>
+<tr><td><b>合计</b></td><td>—</td><td>—</td><td><b>~3B</b>（VLM frozen, trainable ~540M）</td></tr>
+</table>
+
+<svg width="980" height="600" viewBox="0 0 980 600" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="gr-ai" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#1f6feb" />
+    </marker>
+    <marker id="gr-ai2" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#cf222e" />
+    </marker>
+  </defs>
+
+  <text x="490" y="25" font-weight="bold" font-size="14" text-anchor="middle">GR00T N1.5/N1.6 内部数据流（Eagle2 VLM + Cross-attn Flow-matching DiT）</text>
+
+  <!-- INPUTS -->
+  <rect x="10" y="50" width="200" height="40" rx="6" fill="#e6f0ff" stroke="#1f6feb" stroke-width="2"/>
+  <text x="110" y="68" text-anchor="middle" font-size="11" font-weight="bold">images (B, V, 3, 224, 224)</text>
+  <text x="110" y="84" text-anchor="middle" font-size="10">front + wrist</text>
+
+  <rect x="10" y="100" width="200" height="40" rx="6" fill="#e6f0ff" stroke="#1f6feb" stroke-width="2"/>
+  <text x="110" y="118" text-anchor="middle" font-size="11" font-weight="bold">language prompt</text>
+  <text x="110" y="134" text-anchor="middle" font-size="10">"Pick up the orange..."</text>
+
+  <rect x="10" y="150" width="200" height="40" rx="6" fill="#e6f0ff" stroke="#1f6feb" stroke-width="2"/>
+  <text x="110" y="168" text-anchor="middle" font-size="11" font-weight="bold">state (B, 64)</text>
+  <text x="110" y="184" text-anchor="middle" font-size="10">SO-101 6D + pad → 64</text>
+
+  <rect x="10" y="200" width="200" height="40" rx="6" fill="#e6f0ff" stroke="#1f6feb" stroke-width="2"/>
+  <text x="110" y="218" text-anchor="middle" font-size="11" font-weight="bold">embodiment_tag (B,)</text>
+  <text x="110" y="234" text-anchor="middle" font-size="10">"new_embodiment" → cat_id</text>
+
+  <rect x="10" y="255" width="200" height="40" rx="6" fill="#ffeef0" stroke="#cf222e" stroke-width="2"/>
+  <text x="110" y="273" text-anchor="middle" font-size="11" font-weight="bold">action_clean (B, 50, 32)</text>
+  <text x="110" y="289" text-anchor="middle" font-size="10">GT chunk (训练)</text>
+
+  <rect x="10" y="310" width="200" height="55" rx="6" fill="#fff8e6" stroke="#d29922" stroke-width="2"/>
+  <text x="110" y="328" text-anchor="middle" font-size="11" font-weight="bold">flow t ~ U(0,1)</text>
+  <text x="110" y="344" text-anchor="middle" font-size="10">action_noisy = ε*t + a*(1-t)</text>
+  <text x="110" y="360" text-anchor="middle" font-size="10">continuous flow matching</text>
+
+  <!-- Eagle2 VLM -->
+  <rect x="240" y="50" width="220" height="220" rx="8" fill="#fff8e6" stroke="#d29922" stroke-width="3"/>
+  <text x="350" y="75" text-anchor="middle" font-size="13" font-weight="bold">Eagle2 / 2.5 VLM</text>
+  <text x="350" y="92" text-anchor="middle" font-size="10" fill="#555">NVIDIA, ~2.4B, frozen</text>
+
+  <rect x="255" y="105" width="190" height="35" rx="4" fill="#fffaf0" stroke="#d29922" stroke-width="1"/>
+  <text x="350" y="122" text-anchor="middle" font-size="10" font-weight="bold">Vision encoder (SigLIP-like)</text>
+  <text x="350" y="135" text-anchor="middle" font-size="9">multi-cam → image tokens</text>
+
+  <rect x="255" y="148" width="190" height="35" rx="4" fill="#fffaf0" stroke="#d29922" stroke-width="1"/>
+  <text x="350" y="165" text-anchor="middle" font-size="10" font-weight="bold">text tokenizer + embeddings</text>
+  <text x="350" y="178" text-anchor="middle" font-size="9">lerobot/eagle2hg-processor</text>
+
+  <rect x="255" y="191" width="190" height="70" rx="4" fill="#fffaf0" stroke="#d29922" stroke-width="1"/>
+  <text x="350" y="209" text-anchor="middle" font-size="10" font-weight="bold">Llama-style text decoder</text>
+  <text x="350" y="224" text-anchor="middle" font-size="9">N causal layers</text>
+  <text x="350" y="239" text-anchor="middle" font-size="9">输出 VLM features (B, T, D_vlm)</text>
+  <text x="350" y="254" text-anchor="middle" font-size="9" fill="#555">tune_llm=False (默认 frozen)</text>
+
+  <!-- Projector -->
+  <rect x="240" y="280" width="220" height="60" rx="6" fill="#f0f3f6" stroke="#555" stroke-width="2"/>
+  <text x="350" y="300" text-anchor="middle" font-size="11" font-weight="bold">Visual + state projector</text>
+  <text x="350" y="318" text-anchor="middle" font-size="10">VLM features + state → D_dit</text>
+  <text x="350" y="332" text-anchor="middle" font-size="9">tune_projector=True (训)</text>
+
+  <!-- Action expert (DiT) -->
+  <rect x="490" y="50" width="290" height="510" rx="8" fill="#e6f4ea" stroke="#1a7f37" stroke-width="3"/>
+  <text x="635" y="75" text-anchor="middle" font-size="13" font-weight="bold">Cross-attention DiT action head</text>
+  <text x="635" y="92" text-anchor="middle" font-size="10" fill="#555">~500M, tune_diffusion_model=True</text>
+
+  <rect x="505" y="110" width="260" height="60" rx="4" fill="#f0f7f3" stroke="#1a7f37" stroke-width="1"/>
+  <text x="635" y="128" text-anchor="middle" font-size="11" font-weight="bold">MultiEmbodimentActionEncoder</text>
+  <text x="635" y="143" text-anchor="middle" font-size="9">CategorySpecificMLP(cat_id):</text>
+  <text x="635" y="158" text-anchor="middle" font-size="9">action_noisy + t_emb → (B, 50, hidden)</text>
+
+  <rect x="505" y="180" width="260" height="50" rx="4" fill="#f0f7f3" stroke="#1a7f37" stroke-width="1"/>
+  <text x="635" y="200" text-anchor="middle" font-size="11" font-weight="bold">TimestepEncoder</text>
+  <text x="635" y="215" text-anchor="middle" font-size="9">sinusoidal(t) + MLP → AdaLN modulation</text>
+
+  <rect x="505" y="240" width="260" height="240" rx="4" fill="#d4e9d9" stroke="#1a7f37" stroke-width="1"/>
+  <text x="635" y="260" text-anchor="middle" font-size="12" font-weight="bold">× N BasicTransformerBlock</text>
+  <text x="635" y="278" text-anchor="middle" font-size="10">每层结构：</text>
+  <text x="515" y="298" font-size="10">  ① AdaLayerNorm (γ, β 由 t_emb 调制)</text>
+  <text x="515" y="314" font-size="10">  ② self-attn(action tokens)</text>
+  <text x="515" y="328" font-size="9" fill="#555">    bidirectional 全注意力</text>
+  <text x="515" y="348" font-size="10">  ③ AdaLayerNorm</text>
+  <text x="515" y="364" font-size="10">  ④ <b>cross-attn(action, VLM features)</b></text>
+  <text x="515" y="378" font-size="9" fill="#555">    action=Q, VLM=K/V — 经典 DiT</text>
+  <text x="515" y="398" font-size="10">  ⑤ AdaLayerNorm</text>
+  <text x="515" y="414" font-size="10">  ⑥ MLP (4× expansion)</text>
+  <text x="635" y="436" text-anchor="middle" font-size="10" fill="#555">类似 DALL-E 2 / SD 3 的 cross-attn</text>
+  <text x="635" y="454" text-anchor="middle" font-size="10" fill="#555">multi-embodiment 关键：</text>
+  <text x="635" y="468" text-anchor="middle" font-size="9" fill="#555">CategorySpecific 让不同机器人有独立 norm</text>
+
+  <rect x="505" y="490" width="260" height="55" rx="4" fill="#f0f7f3" stroke="#1a7f37" stroke-width="1"/>
+  <text x="635" y="508" text-anchor="middle" font-size="11" font-weight="bold">Action decoder</text>
+  <text x="635" y="523" text-anchor="middle" font-size="9">CategorySpecificMLP → (B, 50, 32)</text>
+  <text x="635" y="537" text-anchor="middle" font-size="9" fill="#555">取前 6 维 = SO-101</text>
+
+  <!-- Output -->
+  <rect x="810" y="200" width="160" height="60" rx="6" fill="#ffeef0" stroke="#cf222e" stroke-width="2"/>
+  <text x="890" y="220" text-anchor="middle" font-size="11" font-weight="bold">Flow-matching loss</text>
+  <text x="890" y="236" text-anchor="middle" font-size="10">L = ||v_pred − (ε−a)||²</text>
+  <text x="890" y="252" text-anchor="middle" font-size="10">仅在 action tokens</text>
+
+  <!-- Inference -->
+  <rect x="810" y="280" width="160" height="200" rx="6" fill="#f8f8f8" stroke="#999" stroke-width="1"/>
+  <text x="890" y="298" text-anchor="middle" font-size="11" font-weight="bold">推理 (inference)</text>
+  <text x="820" y="318" font-size="10">• x_T = N(0, 1) chunk=50</text>
+  <text x="820" y="334" font-size="10">• <b>VLM forward 1 次</b></text>
+  <text x="820" y="348" font-size="9" fill="#555">　缓存 VLM features (重要!)</text>
+  <text x="820" y="368" font-size="10">• for i in range(steps):</text>
+  <text x="820" y="384" font-size="10">　 DiT cross-attn → v_pred</text>
+  <text x="820" y="400" font-size="10">　 x_t ← scheduler.step()</text>
+  <text x="820" y="420" font-size="10" fill="#cf222e">→ ~80-100ms / chunk @ 4090</text>
+  <text x="820" y="438" font-size="10">• n_action_steps=50</text>
+  <text x="820" y="454" font-size="9" fill="#555">  整个 chunk 跑完再 query</text>
+  <text x="820" y="470" font-size="9" fill="#555">  step_hz=30 / 50 = 0.6Hz query</text>
+
+  <!-- Arrows -->
+  <line x1="210" y1="70" x2="248" y2="125" stroke="#1f6feb" stroke-width="1.5" marker-end="url(#gr-ai)"/>
+  <line x1="210" y1="120" x2="248" y2="165" stroke="#1f6feb" stroke-width="1.5" marker-end="url(#gr-ai)"/>
+  <line x1="210" y1="170" x2="248" y2="310" stroke="#1f6feb" stroke-width="1.5" stroke-dasharray="3,2" marker-end="url(#gr-ai)"/>
+  <text x="225" y="245" font-size="9" fill="#555">state</text>
+  <line x1="210" y1="220" x2="503" y2="143" stroke="#1f6feb" stroke-width="1.5" stroke-dasharray="3,2" marker-end="url(#gr-ai)"/>
+  <text x="225" y="195" font-size="9" fill="#555">cat_id</text>
+  <line x1="350" y1="340" x2="350" y2="346" stroke="#555" stroke-width="2"/>
+  <line x1="460" y1="320" x2="503" y2="370" stroke="#1f6feb" stroke-width="2" marker-end="url(#gr-ai)"/>
+  <text x="450" y="305" font-size="9" fill="#555">VLM features → KV</text>
+
+  <path d="M 210 290 Q 350 480 503 158" fill="none" stroke="#cf222e" stroke-width="1.5" stroke-dasharray="3,2" marker-end="url(#gr-ai2)"/>
+  <path d="M 210 345 Q 350 510 503 215" fill="none" stroke="#cf222e" stroke-width="1.5" stroke-dasharray="3,2" marker-end="url(#gr-ai2)"/>
+  <text x="290" y="450" font-size="9" fill="#cf222e">action_noisy + t</text>
+
+  <line x1="635" y1="170" x2="635" y2="178" stroke="#1a7f37" stroke-width="2" marker-end="url(#gr-ai)"/>
+  <line x1="635" y1="230" x2="635" y2="238" stroke="#1a7f37" stroke-width="2" marker-end="url(#gr-ai)"/>
+  <line x1="635" y1="480" x2="635" y2="488" stroke="#1a7f37" stroke-width="2" marker-end="url(#gr-ai)"/>
+
+  <line x1="770" y1="510" x2="810" y2="250" stroke="#cf222e" stroke-width="2" marker-end="url(#gr-ai2)"/>
+
+  <!-- N1.5 vs N1.6 callout -->
+  <rect x="10" y="390" width="220" height="180" rx="6" fill="#f8f8f8" stroke="#999" stroke-width="1"/>
+  <text x="120" y="410" text-anchor="middle" font-size="11" font-weight="bold">N1.5 vs N1.6 差异</text>
+  <text x="20" y="430" font-size="10">N1.5 (<code>nvidia/GR00T-N1.5-3B</code>):</text>
+  <text x="20" y="446" font-size="10">• Eagle2 vision</text>
+  <text x="20" y="462" font-size="10">• 我们 benchmark 0/3, 4/9</text>
+  <text x="20" y="486" font-size="10">N1.6 (<code>nvidia/GR00T-N1.6-3B</code>):</text>
+  <text x="20" y="502" font-size="10">• Eagle 2.5 vision</text>
+  <text x="20" y="518" font-size="10">• image augmentations</text>
+  <text x="20" y="534" font-size="10">• 优化 action head</text>
+  <text x="20" y="552" font-size="10" fill="#1a7f37">• 🥇 2/3, 6/9 (currently)</text>
+</svg>
+
+<p><b>读图要点</b>：</p>
+<ul>
+<li>GR00T 是 <b>flow-matching VLM-conditioned action expert</b> 范式（同 π0.5 / SmolVLA / X-VLA / FastWAM），但 action expert 是 <b>独立的 cross-attn DiT</b>（不与 VLM 共享 KV，是从 VLM features 用 cross-attn 拉信息）</li>
+<li><b>Multi-embodiment 关键</b>：<code>CategorySpecificLinear/MLP</code> 让不同机器人（cat_id）有独立的 fc 权重（同 X-VLA 的 DomainAwareLinear 思路），<code>embodiment_tag="new_embodiment"</code> 会自动分配一个 cat_id</li>
+<li><b>VLM 一次推理</b>，DiT cross-attn 拉它的 features 做 N 步 denoise，跟 π0.5 一样高效</li>
+<li><b>chunk_size=50, n_action_steps=50</b>：1.67s open-loop @ 30Hz — 但 GR00T 50 步比 X-VLA 32 步还长，靠 multi-embodiment 预训练弥补</li>
+<li>训练 default：<code>tune_llm=False, tune_visual=False, tune_projector=True, tune_diffusion_model=True</code> — Eagle2 全冻，只训 projector + DiT action head</li>
+</ul>
+
+<h2>2. 当前 benchmark 实测</h2>
+
+<table>
+<tr><th>ckpt</th><th>来源</th><th>Strict Rounds</th><th>🍊 / 9</th><th>Avg time</th><th>Peak VRAM</th></tr>
+<tr><td>LightwheelAI N1.5</td><td>HF</td><td>0/3</td><td>4/9</td><td>105s</td><td>16.2 GB</td></tr>
+<tr><td><b>LightwheelAI N1.6</b></td><td><b>HF</b></td><td><b>2/3</b></td><td><b>6/9</b></td><td><b>96s</b></td><td><b>17.3 GB</b></td></tr>
+</table>
+
+<p>N1.6 是 <b>leaderboard 🥇</b>，但显然 6/9 不是天花板 —— 还差 3 颗。下一步该自训。</p>
+
+<h2>3. 微调计划 — LoRA / QLoRA from N1.6 base</h2>
+
+<div class="callout good">
+<b>为什么 LoRA + N1.6 base 是合理下一步</b>：
+<ul>
+<li>N1.6 公开 ckpt 已 2/3 → 离 3/3 只差关键样本细节</li>
+<li>lerobot 原生支持 LoRA（<code>configuration_groot.py</code> 有 <code>lora_rank/lora_alpha/lora_dropout</code> 字段）</li>
+<li>Eagle2 backbone frozen 不动 → 只训 projector + DiT 几百 M params</li>
+<li>预期：从 multi-embodiment generalist → SO-101 specialist，6/9 → 8/9 是合理目标</li>
+</ul>
+</div>
+
+<h3>3.1 推荐配方：bf16 LoRA</h3>
+
+<table>
+<tr><th>config 字段</th><th>推荐值</th><th>理由</th></tr>
+<tr><td><code>base_model_path</code></td><td><code>nvidia/GR00T-N1.6-3B</code></td><td>当前 SOTA base，比 N1.5 强一档</td></tr>
+<tr><td><code>chunk_size</code></td><td>50</td><td>保留默认（dataset 30Hz × 1.67s 训练上下文）</td></tr>
+<tr><td><code>n_action_steps</code></td><td><b>16</b>（不要 50）</td><td>消费前 16 步重 query：267ms 重规划周期，避免 1.67s open-loop 错过抓握时机</td></tr>
+<tr><td><code>tune_llm</code></td><td><b>False</b></td><td>2.4B Eagle decoder 全冻</td></tr>
+<tr><td><code>tune_visual</code></td><td><b>False</b></td><td>vision encoder 全冻</td></tr>
+<tr><td><code>tune_projector</code></td><td><b>True</b></td><td>~10M，必须训以适配 SO-101</td></tr>
+<tr><td><code>tune_diffusion_model</code></td><td><b>True</b></td><td>~500M action head，主要 trainable</td></tr>
+<tr><td><code>lora_rank</code></td><td><b>32</b></td><td>0 = 全参微调（更准但 VRAM 紧），32 = LoRA on DiT cross-attn q/v（节省 VRAM）</td></tr>
+<tr><td><code>lora_alpha</code></td><td>16</td><td>默认 r=32 alpha=16，scale=0.5</td></tr>
+<tr><td><code>lora_dropout</code></td><td>0.1</td><td>默认</td></tr>
+<tr><td><code>lora_full_model</code></td><td>False</td><td>仅挂 DiT 不挂 VLM</td></tr>
+<tr><td><code>embodiment_tag</code></td><td><code>"new_embodiment"</code></td><td>自动分配新 cat_id；不要复用预训练 embodiment（会偏向其他机器人）</td></tr>
+<tr><td><code>max_state_dim</code></td><td>64</td><td>默认；我们 6D state pad → 64</td></tr>
+<tr><td><code>max_action_dim</code></td><td>32</td><td>默认；我们 6D action pad → 32</td></tr>
+<tr><td><code>use_bf16</code></td><td>True</td><td></td></tr>
+<tr><td><code>optimizer_lr</code></td><td>1e-4 (LoRA) / 2e-5 (full)</td><td>LoRA 可大学习率</td></tr>
+<tr><td><code>warmup_ratio</code></td><td>0.05</td><td>默认</td></tr>
+</table>
+
+<h3>3.2 GPU 资源估算（4090 24GB）</h3>
+
+<table>
+<tr><th>项</th><th>bf16 LoRA (推荐)</th><th>QLoRA NF4 (备选)</th><th>全参 bf16 (拒)</th></tr>
+<tr><td>Eagle2 base (frozen)</td><td>~4.8 GB</td><td>~1.3 GB</td><td>~4.8 GB</td></tr>
+<tr><td>DiT action head (trainable)</td><td>~1.0 GB</td><td>~1.0 GB</td><td>~1.0 GB</td></tr>
+<tr><td>LoRA params (r=32)</td><td>~0.05 GB</td><td>~0.05 GB</td><td>—（全参）</td></tr>
+<tr><td>Optimizer (LoRA only)</td><td>~0.2 GB</td><td>~0.2 GB</td><td>~6 GB</td></tr>
+<tr><td>Activations (batch=4, chunk=50)</td><td>~8-10 GB</td><td>~8-10 GB</td><td>~12 GB</td></tr>
+<tr><td><b>合计</b></td><td><b>~14-16 GB</b> <span class="tag-good">✅</span></td><td><b>~10-12 GB</b> <span class="tag-good">✅</span></td><td><b>~24 GB</b> <span class="tag-bad">❌ OOM</span></td></tr>
+</table>
+
+<p><b>推荐：bf16 LoRA</b>。QLoRA 不必要（base 4.8 GB，bf16 头顶 16 GB 还安全）；QLoRA 反而会引入 bnb flaky 问题（vanilla OpenVLA 那 4 类 crash）。</p>
+
+<h3>3.3 训练 launcher 草稿</h3>
+
+<pre># LeIsaac/scripts/finetune/gr00t/train.sh
+
+CONDA_ENV=lerobot \
+DATASET_DIR=$HOME/work/isaaclab-experience/LeIsaac/datasets/raw/leisaac-pick-orange \
+OUTPUT_DIR=$HOME/work/isaaclab-experience/LeIsaac/outputs/gr00t-n16-leisaac-pick-orange \
+BASE_CKPT=nvidia/GR00T-N1.6-3B \
+\
+conda run -n "$CONDA_ENV" --no-capture-output \
+    python -m lerobot.scripts.lerobot_train \
+        --policy.type=groot \
+        --policy.path="$BASE_CKPT" \
+        --policy.base_model_path="$BASE_CKPT" \
+        --policy.chunk_size=50 \
+        --policy.n_action_steps=16 \
+        --policy.tune_llm=false --policy.tune_visual=false \
+        --policy.tune_projector=true --policy.tune_diffusion_model=true \
+        --policy.lora_rank=32 --policy.lora_alpha=16 --policy.lora_dropout=0.1 \
+        --policy.lora_full_model=false \
+        --policy.embodiment_tag=new_embodiment \
+        --policy.use_bf16=true \
+        --policy.optimizer_lr=1e-4 \
+        --policy.warmup_ratio=0.05 \
+        --dataset.repo_id=local \
+        --dataset.root="$DATASET_DIR" \
+        --output_dir="$OUTPUT_DIR" \
+        --batch_size=4 --num_workers=4 \
+        --steps=10000 --save_freq=500
+</pre>
+
+<h2>4. 风险清单</h2>
+
+<table>
+<tr><th>风险</th><th>概率</th><th>影响</th><th>缓解</th></tr>
+<tr><td><b>🟡 N1.6 base 的 cat_id 预训练偏置盖过我们 LoRA</b></td><td>中</td><td>中</td><td>用 <code>new_embodiment</code> tag 新 cat_id；避免选 SO-101 已知 tag（如果有）</td></tr>
+<tr><td><b>🟡 chunk=50 open-loop 1.67s 抓握时机不稳</b></td><td>已观察</td><td>中</td><td>n_action_steps=16 重规划；如还不够再砍到 8</td></tr>
+<tr><td>🟡 SO-101 6D state pad 到 64 D 引入大量 0 通道</td><td>—</td><td>低</td><td>同其他 baseline，pad 默认无害</td></tr>
+<tr><td>🟢 GPU OOM</td><td>低</td><td>—</td><td>bf16 LoRA 头顶 16 GB</td></tr>
+<tr><td>🟢 lerobot trainer 兼容</td><td>低</td><td>低</td><td>同 dataset 已跑过 SmolVLA / DP / ACT</td></tr>
+<tr><td>🟢 Eagle2 vision encoder 跟我们 480×640 兼容</td><td>低</td><td>低</td><td>config 默认 <code>image_size=(224, 224)</code>，processor 会 resize</td></tr>
+</table>
+
+<h2>5. Phases</h2>
+
+<table>
+<tr><th>Phase</th><th>步骤</th><th>时间预算</th></tr>
+<tr><td>P0a</td><td>下载 <code>nvidia/GR00T-N1.6-3B</code> + cat <code>config.json</code> 比对超参</td><td>~30min</td></tr>
+<tr><td>P0b</td><td>验证 LeRobot v3.0 parquet → groot processor 兼容（应该原生支持）</td><td>~30min</td></tr>
+<tr><td>P1</td><td>Smoke：50 step 跑通 + 看 loss 下降 + 监控 GPU mem</td><td>~1h</td></tr>
+<tr><td>P2</td><td>Train 10k step，save_freq=500</td><td>~3-5h</td></tr>
+<tr><td>P3</td><td>Offline action smoke @ ckpt-2000, 5000, 10000</td><td>~1h</td></tr>
+<tr><td>P4</td><td>GUI eval @ step_hz=30, horizon=16 vs LightwheelAI N1.6 baseline</td><td>~1h</td></tr>
+</table>
+
+<p><b>总预算 ≈ 6-8h</b>，跟 X-VLA 同档；但因为 lerobot trainer 完全原生 + 起点就 2/3 → <b>风险最低、ROI 最高的下一个动作</b>。</p>
+
+<h2>6. 与 X-VLA 的取舍</h2>
+
+<table>
+<tr><th>维度</th><th>X-VLA</th><th>GR00T-N1.6 LoRA</th></tr>
+<tr><td>Starting point</td><td>0/3, 0/9 (cold)</td><td><b>2/3, 6/9 (warm)</b></td></tr>
+<tr><td>架构新奇度</td><td>soft-prompted Transformer (科研味浓)</td><td>flow-matching DiT (成熟)</td></tr>
+<tr><td>工程成本</td><td>需修 action space + domain reinit</td><td><b>0 修改（lerobot 原生）</b></td></tr>
+<tr><td>预期 leaderboard</td><td>1-2/3（如果一切顺利）</td><td><b>2-3/3</b>（最差也是当前水平）</td></tr>
+<tr><td>失败 fallback</td><td>X-VLA 半完成</td><td>仍然有 N1.6 base 兜底</td></tr>
+</table>
+
+<p><b>结论</b>：<b>GR00T-N1.6 LoRA 比 X-VLA 更值得先做</b> — 起点高、工程便宜、上限明确。X-VLA 作为"架构探索 + 多 family benchmark 多样性"价值，但 production 优先级低于 GR00T finetune。</p>
+
+<h2>7. 关联</h2>
+<ul>
+<li><code>leisaac-policy-comparison</code> memory — 多策略横评主线</li>
+<li><a href="xvla_finetune_plan.html"><code>xvla_finetune_plan.html</code></a> — 同 cross-embodiment 思路但科研味更浓</li>
+<li><a href="smolvla_finetune_pick_orange.html"><code>smolvla_finetune_pick_orange.html</code></a> — 同 cross-attn flow-matching 范式</li>
+<li><a href="pi05_finetune_pick_orange.html"><code>pi05_finetune_pick_orange.html</code></a> — 同 VLM + action expert 范式</li>
+<li><code>~/work/Isaac-GR00T/</code> — N1.6 官方仓库（不再走，全部用 lerobot 集成）</li>
+<li><code>~/work/Isaac-GR00T-N1.5/</code> — N1.5 仓库（历史）</li>
+</ul>
+
+</body>
+</html>

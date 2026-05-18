@@ -1,0 +1,285 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>π0.5 微调记录 — LeIsaac SO-101 PickOrange</title>
+<style>
+  :root {
+    --bg: #fafafa; --fg: #1a1a1a; --muted: #555;
+    --accent: #1f6feb; --warn: #d29922; --bad: #cf222e; --good: #1a7f37;
+    --code-bg: #f3f3f3; --border: #d0d7de;
+  }
+  body { font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+         background: var(--bg); color: var(--fg);
+         max-width: 1000px; margin: 28px auto; padding: 0 22px; line-height: 1.6; }
+  h1 { border-bottom: 2px solid var(--fg); padding-bottom: 6px; }
+  h2 { margin-top: 36px; border-left: 4px solid var(--accent); padding-left: 10px; }
+  h3 { margin-top: 24px; color: var(--accent); }
+  .en { color: var(--muted); font-style: italic; font-size: 0.92em; }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0; font-size: 0.94em; }
+  th, td { border: 1px solid var(--border); padding: 6px 10px; text-align: left; vertical-align: top; }
+  th { background: #f0f3f6; }
+  code, pre { font-family: "JetBrains Mono", Menlo, Consolas, monospace; }
+  pre { background: var(--code-bg); padding: 12px; border-radius: 4px; overflow-x: auto; font-size: 0.88em; }
+  code { background: var(--code-bg); padding: 1px 5px; border-radius: 3px; }
+  .tag-good { color: var(--good); font-weight: 600; }
+  .tag-warn { color: var(--warn); font-weight: 600; }
+  .tag-bad  { color: var(--bad); font-weight: 600; }
+  .callout { border-left: 4px solid var(--warn); background: #fff8e6; padding: 10px 14px; margin: 14px 0; }
+  .callout.bad { border-color: var(--bad); background: #ffeef0; }
+  .callout.good { border-color: var(--good); background: #e6f4ea; }
+  svg { display: block; margin: 14px auto; }
+  ul { padding-left: 22px; }
+  li { margin: 4px 0; }
+  .meta { color: var(--muted); font-size: 0.9em; }
+</style>
+</head>
+<body>
+
+<h1>π0.5 微调记录</h1>
+<p class="meta">SO-101 PickOrange · LeIsaac benchmark baseline #5 · 2026-05-18</p>
+<p class="en">Physical Intelligence π0.5 (Black et al. 2024) — PaliGemma-2B VLM with a 300M action expert head and
+flow-matching action generation. ~3.36B total params, our smallest "true" VLA in the leaderboard.</p>
+
+<h2>0. TL;DR</h2>
+<div class="callout good">
+<b>π0.5 是 VLA 家族最小成员</b>（3.36B params，PaliGemma 2B vision-language + 300M action expert + flow-matching）。
+本地 LoRA fine-tune（仅 ~5M trainable）+ MLX 部署 strict 表现 <b>0/3 round, 0/9 oranges</b>（leaderboard 末位），
+关键问题：<b>action_horizon=50 是 trap，正确值 35</b>（chunk-execution mismatch）。我们的小数据（50 demo）训出来过拟合明显。
+</div>
+
+<h2>1. 架构核心</h2>
+
+<table>
+<tr><th>组件</th><th>来源</th><th>实现</th><th>参数估算</th></tr>
+<tr><td><b>PaliGemma 2B VLM</b></td><td>Google 2024</td><td>SigLIP-So400m vision encoder + Gemma-2B text decoder（<code>configuration_pi05.py:line 1</code> <code>paligemma_variant="gemma_2b"</code>）；默认 <code>freeze_vision_encoder=False</code>，但 LoRA 时只挂 attention</td><td>~3B</td></tr>
+<tr><td><b>Action expert</b></td><td>π0.5 自研，Gemma 风格小模型</td><td><code>action_expert_variant="gemma_300m"</code>；独立 Q/MLP，通过 <b>cross-attn 与 VLM 共享每层 KV cache</b>（同 SmolVLA / FastWAM MoT 思路）</td><td>~300M</td></tr>
+<tr><td><b>State / Action projector</b></td><td>π0.5 自研</td><td>state 32D → hidden；action 32D + time_emb → hidden（min_period=4e-3 max_period=4.0 的 sinusoidal）</td><td>~1M</td></tr>
+<tr><td><b>Flow-matching scheduler</b></td><td>π0.5 自研（同 openpi）</td><td>Beta(1.5, 1.0) time sampling；continuous flow（不是 DDPM/DDIM）；num_inference_steps=10</td><td>—</td></tr>
+<tr><td><b>合计</b></td><td>—</td><td>—</td><td><b>~3.36B</b>（LoRA 训 ~5M, 0.15%）</td></tr>
+</table>
+
+<svg width="980" height="540" viewBox="0 0 980 540" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="p5-ai" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#1f6feb" />
+    </marker>
+    <marker id="p5-ai2" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#cf222e" />
+    </marker>
+  </defs>
+
+  <text x="490" y="25" font-weight="bold" font-size="14" text-anchor="middle">π0.5 内部数据流（PaliGemma + action expert + flow-matching）</text>
+
+  <!-- INPUTS -->
+  <rect x="10" y="50" width="200" height="40" rx="6" fill="#e6f0ff" stroke="#1f6feb" stroke-width="2"/>
+  <text x="110" y="68" text-anchor="middle" font-size="11" font-weight="bold">images (B, V, 3, 224, 224)</text>
+  <text x="110" y="84" text-anchor="middle" font-size="10">front + wrist</text>
+
+  <rect x="10" y="100" width="200" height="40" rx="6" fill="#e6f0ff" stroke="#1f6feb" stroke-width="2"/>
+  <text x="110" y="118" text-anchor="middle" font-size="11" font-weight="bold">prompt_ids (B, ≤200)</text>
+  <text x="110" y="134" text-anchor="middle" font-size="10">PaliGemma tokenizer</text>
+
+  <rect x="10" y="150" width="200" height="40" rx="6" fill="#e6f0ff" stroke="#1f6feb" stroke-width="2"/>
+  <text x="110" y="168" text-anchor="middle" font-size="11" font-weight="bold">state (B, 32)</text>
+  <text x="110" y="184" text-anchor="middle" font-size="10">SO-101 6D + pad → 32</text>
+
+  <rect x="10" y="200" width="200" height="40" rx="6" fill="#ffeef0" stroke="#cf222e" stroke-width="2"/>
+  <text x="110" y="218" text-anchor="middle" font-size="11" font-weight="bold">action_clean (B, 50, 32)</text>
+  <text x="110" y="234" text-anchor="middle" font-size="10">GT chunk (训练)</text>
+
+  <rect x="10" y="255" width="200" height="55" rx="6" fill="#fff8e6" stroke="#d29922" stroke-width="2"/>
+  <text x="110" y="273" text-anchor="middle" font-size="11" font-weight="bold">t ~ Beta(1.5, 1.0)</text>
+  <text x="110" y="289" text-anchor="middle" font-size="10">action_noisy = ε*t + a*(1-t)</text>
+  <text x="110" y="305" text-anchor="middle" font-size="10">flow-matching</text>
+
+  <!-- PaliGemma VLM -->
+  <rect x="240" y="50" width="220" height="230" rx="8" fill="#fff8e6" stroke="#d29922" stroke-width="3"/>
+  <text x="350" y="75" text-anchor="middle" font-size="13" font-weight="bold">PaliGemma 2B VLM</text>
+  <text x="350" y="92" text-anchor="middle" font-size="10" fill="#555">Google 2024, ~3B</text>
+
+  <rect x="255" y="105" width="190" height="40" rx="4" fill="#fffaf0" stroke="#d29922" stroke-width="1"/>
+  <text x="350" y="123" text-anchor="middle" font-size="10" font-weight="bold">SigLIP-So400m vision</text>
+  <text x="350" y="138" text-anchor="middle" font-size="9">~400M, image → tokens</text>
+
+  <rect x="255" y="150" width="190" height="40" rx="4" fill="#fffaf0" stroke="#d29922" stroke-width="1"/>
+  <text x="350" y="168" text-anchor="middle" font-size="10" font-weight="bold">Image → text token projector</text>
+  <text x="350" y="183" text-anchor="middle" font-size="9">vision token → gemma embedding</text>
+
+  <rect x="255" y="195" width="190" height="80" rx="4" fill="#fffaf0" stroke="#d29922" stroke-width="1"/>
+  <text x="350" y="213" text-anchor="middle" font-size="10" font-weight="bold">Gemma-2B text decoder</text>
+  <text x="350" y="228" text-anchor="middle" font-size="9">N layers causal LM</text>
+  <text x="350" y="244" text-anchor="middle" font-size="9">cache per-layer KV (重要!)</text>
+  <text x="350" y="262" text-anchor="middle" font-size="9" fill="#555">LoRA 训这层 q/v</text>
+
+  <!-- Action expert -->
+  <rect x="490" y="50" width="290" height="430" rx="8" fill="#e6f4ea" stroke="#1a7f37" stroke-width="3"/>
+  <text x="635" y="75" text-anchor="middle" font-size="13" font-weight="bold">Action Expert (Gemma-300M)</text>
+  <text x="635" y="92" text-anchor="middle" font-size="10" fill="#555">~300M, 独立 Q/MLP, 共享 KV</text>
+
+  <rect x="505" y="110" width="260" height="50" rx="4" fill="#f0f7f3" stroke="#1a7f37" stroke-width="1"/>
+  <text x="635" y="128" text-anchor="middle" font-size="11" font-weight="bold">state_proj (Linear 32 → hidden)</text>
+  <text x="635" y="143" text-anchor="middle" font-size="9">→ 1 token: state_emb</text>
+
+  <rect x="505" y="165" width="260" height="50" rx="4" fill="#f0f7f3" stroke="#1a7f37" stroke-width="1"/>
+  <text x="635" y="183" text-anchor="middle" font-size="11" font-weight="bold">action_in_proj + time_emb</text>
+  <text x="635" y="198" text-anchor="middle" font-size="9">action_noisy + sinusoidal(t) → (50, hidden)</text>
+
+  <rect x="505" y="220" width="260" height="180" rx="4" fill="#d4e9d9" stroke="#1a7f37" stroke-width="1"/>
+  <text x="635" y="240" text-anchor="middle" font-size="12" font-weight="bold">× N expert layers</text>
+  <text x="635" y="258" text-anchor="middle" font-size="10">每层做两件事：</text>
+  <text x="515" y="278" font-size="10">  ① <b>cross-attn(action_tok, VLM KV)</b></text>
+  <text x="515" y="292" font-size="9" fill="#555">    复用 PaliGemma 每层缓存的 K/V</text>
+  <text x="515" y="312" font-size="10">  ② self-attn(action + state)</text>
+  <text x="515" y="326" font-size="9" fill="#555">    bidirectional 全注意力</text>
+  <text x="515" y="346" font-size="10">  ③ MLP（独立于 VLM）</text>
+  <text x="635" y="370" text-anchor="middle" font-size="10" fill="#555">attention_mode 默认 cross_attn</text>
+  <text x="635" y="386" text-anchor="middle" font-size="10" fill="#555">expert 是 VLM 的"右半身"</text>
+
+  <rect x="505" y="408" width="260" height="55" rx="4" fill="#f0f7f3" stroke="#1a7f37" stroke-width="1"/>
+  <text x="635" y="426" text-anchor="middle" font-size="11" font-weight="bold">action_out_proj (Linear)</text>
+  <text x="635" y="441" text-anchor="middle" font-size="9">→ (B, 50, 32) flow velocity</text>
+  <text x="635" y="455" text-anchor="middle" font-size="9" fill="#555">取前 6 维 = SO-101 6D 输出</text>
+
+  <!-- Output -->
+  <rect x="810" y="200" width="160" height="60" rx="6" fill="#ffeef0" stroke="#cf222e" stroke-width="2"/>
+  <text x="890" y="220" text-anchor="middle" font-size="11" font-weight="bold">Flow loss</text>
+  <text x="890" y="236" text-anchor="middle" font-size="10">L = ||v_pred − (ε−a)||</text>
+  <text x="890" y="252" text-anchor="middle" font-size="10">+ KL on time (Beta)</text>
+
+  <!-- Inference loop -->
+  <rect x="810" y="280" width="160" height="180" rx="6" fill="#f8f8f8" stroke="#999" stroke-width="1"/>
+  <text x="890" y="300" text-anchor="middle" font-size="11" font-weight="bold">推理 (inference)</text>
+  <text x="820" y="320" font-size="10">• x_t = N(0, 1) chunk=50</text>
+  <text x="820" y="336" font-size="10">• <b>VLM forward 1 次</b></text>
+  <text x="820" y="350" font-size="9" fill="#555">　缓存所有 KV (重要!)</text>
+  <text x="820" y="368" font-size="10">• for i in range(10):</text>
+  <text x="820" y="384" font-size="10">　 expert forward (cross-attn</text>
+  <text x="820" y="398" font-size="10">　 拿 cached VLM KV)</text>
+  <text x="820" y="414" font-size="10">　 更新 action</text>
+  <text x="820" y="432" font-size="10" fill="#cf222e">→ ~150-200ms @ 4090</text>
+  <text x="820" y="448" font-size="9" fill="#555">VLM 不重跑 = 关键加速</text>
+
+  <!-- Arrows -->
+  <line x1="210" y1="70" x2="248" y2="125" stroke="#1f6feb" stroke-width="1.5" marker-end="url(#p5-ai)"/>
+  <line x1="210" y1="120" x2="248" y2="170" stroke="#1f6feb" stroke-width="1.5" marker-end="url(#p5-ai)"/>
+
+  <line x1="460" y1="235" x2="503" y2="290" stroke="#1f6feb" stroke-width="2" marker-end="url(#p5-ai)"/>
+  <text x="480" y="225" font-size="9" fill="#555">VLM KV (cached)</text>
+
+  <path d="M 210 170 Q 350 350 503 135" fill="none" stroke="#1f6feb" stroke-width="1.5" stroke-dasharray="3,2" marker-end="url(#p5-ai)"/>
+  <text x="290" y="320" font-size="9" fill="#555">state</text>
+
+  <path d="M 210 280 Q 350 410 503 190" fill="none" stroke="#cf222e" stroke-width="1.5" stroke-dasharray="3,2" marker-end="url(#p5-ai2)"/>
+  <text x="290" y="395" font-size="9" fill="#cf222e">action_noisy</text>
+
+  <line x1="635" y1="160" x2="635" y2="163" stroke="#1a7f37" stroke-width="2" marker-end="url(#p5-ai)"/>
+  <line x1="635" y1="215" x2="635" y2="218" stroke="#1a7f37" stroke-width="2" marker-end="url(#p5-ai)"/>
+  <line x1="635" y1="400" x2="635" y2="406" stroke="#1a7f37" stroke-width="2" marker-end="url(#p5-ai)"/>
+
+  <line x1="770" y1="438" x2="810" y2="250" stroke="#cf222e" stroke-width="2" marker-end="url(#p5-ai2)"/>
+
+  <!-- horizon trap note -->
+  <rect x="10" y="380" width="220" height="120" rx="6" fill="#ffeef0" stroke="#cf222e" stroke-width="1"/>
+  <text x="120" y="400" text-anchor="middle" font-size="11" font-weight="bold">🔴 chunk-execution trap</text>
+  <text x="20" y="420" font-size="9">chunk_size=50 训练，但部署</text>
+  <text x="20" y="434" font-size="9">不能 horizon=50 一把消费完</text>
+  <text x="20" y="448" font-size="9">否则后半 chunk 失准 → 失败</text>
+  <text x="20" y="464" font-size="9">实测 <b>horizon=35</b> 是甜点</text>
+  <text x="20" y="478" font-size="9">前 35 步 consume，再重 query</text>
+  <text x="20" y="492" font-size="9" fill="#cf222e">v1/v2 失败的根因</text>
+</svg>
+
+<p><b>读图要点</b>：</p>
+<ul>
+<li>π0.5 是 <b>VLM + action expert 双脑设计</b>：VLM 跑 1 次缓存 KV，expert 跑 10 次去噪（同 SmolVLA、FastWAM MoT 范式）</li>
+<li>真正的"加速 trick"是 <b>VLM 不参与去噪 loop</b>：去噪每步只跑小的 300M action expert，VLM KV 是只读 cache</li>
+<li>训练用 <b>flow-matching loss</b>（不是 DDPM），与 SmolVLA / X-VLA / FastWAM 同家族</li>
+<li>chunk_size=50 是大 chunk，<b>消费 horizon ≠ chunk_size</b>：v1 配 horizon=50 失败，v3 配 horizon=35 才出第一颗橙子（chunk-execution mismatch）</li>
+<li>state pad 到 32 维：跟 SmolVLA 一致，所有 lerobot policy 默认 <code>max_state_dim=32</code></li>
+</ul>
+
+<h2>2. 训练配置</h2>
+
+<p>我们用 <b>LoRA</b> + <b>MLX 后端</b>（自训 + 部署）：</p>
+
+<table>
+<tr><th>参数</th><th>值</th><th>说明</th></tr>
+<tr><td>backbone</td><td>PaliGemma 2B + Gemma-300M expert</td><td>HF <code>lerobot/pi05_base</code></td></tr>
+<tr><td>chunk_size</td><td>50</td><td>默认 openpi</td></tr>
+<tr><td>num_inference_steps</td><td>10</td><td>flow steps</td></tr>
+<tr><td>image_resolution</td><td>(224, 224)</td><td>SigLIP 兼容</td></tr>
+<tr><td>tokenizer_max_length</td><td>200</td><td>对齐 openpi</td></tr>
+<tr><td>LoRA targets</td><td>q/v_proj on PaliGemma + expert</td><td>~5M trainable</td></tr>
+<tr><td>batch_size</td><td>1（MLX 单卡限制）</td><td>grad_accum 补</td></tr>
+<tr><td>optimizer_lr</td><td>2.5e-5 (cosine peak)</td><td>openpi 默认</td></tr>
+<tr><td>cumulative steps</td><td>5000</td><td>第一轮自训</td></tr>
+<tr><td>训练侧</td><td>MLX (Apple Silicon)</td><td>4090 上跑 LoRA OOM，搬 M-series 上训</td></tr>
+<tr><td>推理侧</td><td>MLX server @ 192.168.3.238</td><td>SSH 远程 server，client 在 4090</td></tr>
+</table>
+
+<h2>3. Eval 参数 + chunk-execution mismatch</h2>
+
+<div class="callout bad">
+<b>🔴 horizon trap</b>：chunk_size=50 训练，但 <b>policy_action_horizon=50 是错的</b>。
+<ul>
+<li>v1 (horizon=50): 0/3, 0/9 — arm 漂移</li>
+<li>v2 (horizon=50, 不同 ckpt): 0/3, 0/9 — 同样问题</li>
+<li>v3 (horizon=35): 0/3, <b>1 颗落盘</b> — 终于第一次能抓到</li>
+</ul>
+原因：模型训的是 "50 步轨迹"，但部署消费完 50 步后 obs 已经偏离训练分布，最后 15 步是"垃圾外推"。
+</div>
+
+<table>
+<tr><th>eval 参数</th><th>值</th><th>说明</th></tr>
+<tr><td>step_hz</td><td>30</td><td>对齐 dataset 30Hz</td></tr>
+<tr><td>policy_action_horizon</td><td><b>35</b></td><td>chunk=50 但只消费前 35 步</td></tr>
+<tr><td>policy_timeout_ms</td><td>10000</td><td>MLX server 远端 SSH</td></tr>
+<tr><td>peak VRAM (client side)</td><td>~18.7 GB</td><td>包含 MLX network 开销</td></tr>
+<tr><td>avg inference latency</td><td>~150-200ms / chunk (远端)</td><td>含网络 RTT</td></tr>
+</table>
+
+<h2>4. Benchmark 结果</h2>
+
+<table>
+<tr><th>Source</th><th>Strict Rounds</th><th>🍊 / 9</th><th>Avg time</th><th>Peak VRAM</th></tr>
+<tr><td>π0.5 (自训 LoRA, v3)</td><td>0/3</td><td>0/9 (但 1 颗 sticky 落盘 not strict)</td><td>180s</td><td>18.7 GB</td></tr>
+</table>
+
+<p>位置：leaderboard 末位（同 edge-inference/SmolVLA 并列 0/9）。原因：</p>
+<ul>
+<li>50 demo 数据量对 3.36B 模型偏小，<b>分布偏置过拟合明显</b>（5k cumulative step 后训练 loss 还在降但 eval 不进步）</li>
+<li>视觉只放 5 颗橙子（应放 9 颗）的 sub-experiment 也 0/3，证明不是任务难度问题，是 priors 偏置</li>
+<li>continue 训 10k step + phased sampler（前 100 帧 ×8 重采样）也没能突破</li>
+</ul>
+
+<h2>5. 已踩过的坑</h2>
+
+<table>
+<tr><th>问题</th><th>诊断</th><th>修复</th></tr>
+<tr><td>horizon=50 失败</td><td>chunk-execution mismatch</td><td>降到 35</td></tr>
+<tr><td>4090 上训 LoRA OOM</td><td>3.36B base + flow training activations</td><td>搬 MLX (Apple M-series)</td></tr>
+<tr><td>MLX server 日志冻在 "loaded 800/812"</td><td>正常 — 加载完之后 MLX 没刷 stdout</td><td>不是 bug，是 MLX 缓冲行为</td></tr>
+<tr><td>state 喂 6 维报错</td><td>X-VLA / π0.5 都期望 max_state_dim=32</td><td>client 端补 26 维 0 padding</td></tr>
+</table>
+
+<h2>6. PyTorch 续训计划（暂停）</h2>
+
+<p>详见 <code>pi05-pytorch-training</code> memory：</p>
+<ul>
+<li>cumulative 5000 视觉放 5 只但 0/3 → 根因 = 分布偏置过拟合</li>
+<li>计划：action_horizon test + phased sampler 续训 1500 step (lr=1e-5, 前 100 帧 ×8)</li>
+<li>因为 X-VLA pivot，π0.5 续训暂时搁置</li>
+</ul>
+
+<h2>7. 关联</h2>
+<ul>
+<li><code>leisaac-policy-comparison</code> memory — 多策略横评主线</li>
+<li><code>pi05-pytorch-training</code> memory — 续训计划</li>
+<li><code>pi05-repo-layout</code> memory — server 目录约定</li>
+<li><a href="smolvla_finetune_pick_orange.html"><code>smolvla_finetune_pick_orange.html</code></a> — 同 cross-attn + flow-matching 范式</li>
+<li><a href="xvla_finetune_plan.html"><code>xvla_finetune_plan.html</code></a> — 同 flow-matching + soft prompt 升级版</li>
+</ul>
+
+</body>
+</html>

@@ -179,6 +179,171 @@
   <text x="550" y="338" text-anchor="middle" font-size="11">~220ms / chunk = 7s 动作</text>
 </svg>
 
+<h3>4.1 模型内部结构（实际代码逐行确认）</h3>
+
+<p>FastWAM 是 <b>world model</b>：拼装 <b>Wan2.2 视频生成 DiT（5B 主干）+ ActionDiT（action 专家）+ WanVAE（视频编解码）+ UMT5（文本编码）</b> 五件套，用 <b>MoT (Mixture of Transformers)</b> 编排 video / action 双 expert 共享 attention。<b>训练 joint flow-matching loss</b>，推理时 video 可关掉只跑 action 快路径。</p>
+
+<table>
+<tr><th>组件</th><th>来源</th><th>实现</th><th>参数估算</th></tr>
+<tr><td><b>WanVideoDiT (video expert)</b></td><td>Tongyi Wan-AI 2024（<code>wan_video_dit.py:310</code>）</td><td>视频扩散 DiT，input/output 都是 latent video（VAE 编码后），continuous flow matching loss。<b>~5B 参数</b>，标准 RoPE-attention + Adaptive LN</td><td>~5B</td></tr>
+<tr><td><b>WanVAE</b></td><td>Tongyi Wan-AI</td><td>3D 视频 VAE，把 (H, W, T) 视频压成 latent；推理只跑 1 步</td><td>~80M</td></tr>
+<tr><td><b>UMT5 Text Encoder</b></td><td>Google UMT5-XXL</td><td>预编码 prompt embedding，全程 frozen；可 CPU 预算（避免 fp32 转向 GPU 时 22GB 瞬时高峰）</td><td>~5.5B (frozen)</td></tr>
+<tr><td><b>ActionDiT (action expert)</b></td><td>FastWAM 自研（<code>action_dit.py:32</code>）</td><td>小型 DiT 风格 transformer，<b>复用</b> WanVideoDiT 的 DiTBlock 实现（同 RoPE 注意力）；额外有 <code>action_encoder</code>（linear）+ <code>text_embedding</code>（MLP）+ <code>ActionHead</code>（modulated linear）；continuous flow matching loss</td><td>~1B</td></tr>
+<tr><td><b>MoT (Mixture of Transformers)</b></td><td>FastWAM 自研（<code>mot.py</code>）</td><td>把 video + action 两个 expert 的 attention 串起来共享 KV，但 Q/MLP 独立（类似 SmolVLA 的 cross_attn 思路但更深度耦合）</td><td>orchestrator only</td></tr>
+<tr><td><b>Proprio encoder</b></td><td>FastWAM 自研（<code>fastwam.py:59</code>）</td><td>simple <code>Linear(proprio_dim → text_dim)</code>，把 robot state 投到跟 text embedding 同维</td><td>~1M</td></tr>
+<tr><td><b>合计</b></td><td>—</td><td>—</td><td><b>~12B</b>（含 UMT5；QLoRA 训只动 39M LoRA params）</td></tr>
+</table>
+
+<svg width="980" height="600" viewBox="0 0 980 600" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="fw-ai" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#1f6feb" />
+    </marker>
+    <marker id="fw-ai2" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#cf222e" />
+    </marker>
+  </defs>
+
+  <text x="490" y="25" font-weight="bold" font-size="14" text-anchor="middle">FastWAM 内部数据流（World Model: video + action joint flow-matching）</text>
+
+  <!-- ============= INPUTS ============= -->
+  <rect x="10" y="50" width="200" height="40" rx="6" fill="#e6f0ff" stroke="#1f6feb" stroke-width="2"/>
+  <text x="110" y="68" text-anchor="middle" font-size="11" font-weight="bold">video frames (B, T, 3, H, W)</text>
+  <text x="110" y="84" text-anchor="middle" font-size="10">2 cam, 训练用 GT video</text>
+
+  <rect x="10" y="100" width="200" height="40" rx="6" fill="#e6f0ff" stroke="#1f6feb" stroke-width="2"/>
+  <text x="110" y="118" text-anchor="middle" font-size="11" font-weight="bold">prompt text</text>
+  <text x="110" y="134" text-anchor="middle" font-size="10">"Grab orange..."</text>
+
+  <rect x="10" y="150" width="200" height="40" rx="6" fill="#e6f0ff" stroke="#1f6feb" stroke-width="2"/>
+  <text x="110" y="168" text-anchor="middle" font-size="11" font-weight="bold">proprio (B, dim)</text>
+  <text x="110" y="184" text-anchor="middle" font-size="10">SO-101 6D state</text>
+
+  <rect x="10" y="200" width="200" height="40" rx="6" fill="#ffeef0" stroke="#cf222e" stroke-width="2"/>
+  <text x="110" y="218" text-anchor="middle" font-size="11" font-weight="bold">action_clean (B, 24, 7)</text>
+  <text x="110" y="234" text-anchor="middle" font-size="10">GT chunk (target)</text>
+
+  <rect x="10" y="255" width="200" height="55" rx="6" fill="#fff8e6" stroke="#d29922" stroke-width="2"/>
+  <text x="110" y="273" text-anchor="middle" font-size="11" font-weight="bold">采样 t ~ U(0,1)</text>
+  <text x="110" y="289" text-anchor="middle" font-size="10">video_noisy + action_noisy</text>
+  <text x="110" y="305" text-anchor="middle" font-size="10">独立 t（含 shift schedule）</text>
+
+  <!-- ============= ENCODERS ============= -->
+  <rect x="240" y="50" width="200" height="100" rx="6" fill="#fff8e6" stroke="#d29922" stroke-width="2"/>
+  <text x="340" y="72" text-anchor="middle" font-size="11" font-weight="bold">WanVAE encoder</text>
+  <text x="340" y="89" text-anchor="middle" font-size="10" fill="#555">~80M, frozen</text>
+  <text x="340" y="108" text-anchor="middle" font-size="10">video → latent</text>
+  <text x="340" y="124" text-anchor="middle" font-size="10">(B, T', 16, h', w')</text>
+  <text x="340" y="140" text-anchor="middle" font-size="9" fill="#555">推理可省（只生成 action）</text>
+
+  <rect x="240" y="160" width="200" height="55" rx="6" fill="#fff8e6" stroke="#d29922" stroke-width="2"/>
+  <text x="340" y="180" text-anchor="middle" font-size="11" font-weight="bold">UMT5 text encoder</text>
+  <text x="340" y="196" text-anchor="middle" font-size="10" fill="#555">5.5B, frozen, CPU 预算</text>
+  <text x="340" y="210" text-anchor="middle" font-size="10">prompt → text_emb (L, D_t)</text>
+
+  <rect x="240" y="225" width="200" height="50" rx="6" fill="#fff8e6" stroke="#d29922" stroke-width="2"/>
+  <text x="340" y="243" text-anchor="middle" font-size="11" font-weight="bold">proprio_encoder</text>
+  <text x="340" y="259" text-anchor="middle" font-size="10">Linear → text_emb 维</text>
+  <text x="340" y="273" text-anchor="middle" font-size="10" fill="#555">拼到 text 序列后</text>
+
+  <!-- ============= MoT + Two Experts ============= -->
+  <rect x="470" y="50" width="320" height="490" rx="8" fill="#e6f4ea" stroke="#1a7f37" stroke-width="3"/>
+  <text x="630" y="75" text-anchor="middle" font-size="13" font-weight="bold">MoT (Mixture of Transformers)</text>
+  <text x="630" y="92" text-anchor="middle" font-size="10" fill="#555">video expert + action expert 共享 attention</text>
+
+  <!-- Video expert -->
+  <rect x="485" y="110" width="295" height="180" rx="6" fill="#e6f0ff" stroke="#1f6feb" stroke-width="2"/>
+  <text x="632" y="130" text-anchor="middle" font-size="12" font-weight="bold">WanVideoDiT (video expert)</text>
+  <text x="632" y="148" text-anchor="middle" font-size="10" fill="#555">~5B, Tongyi Wan-AI 2.2 / 2.1</text>
+  <text x="495" y="170" font-size="10">  • patch_embed: latent → tokens</text>
+  <text x="495" y="186" font-size="10">  • N × DiTBlock</text>
+  <text x="510" y="202" font-size="9" fill="#555">    pre-LN + RoPE self-attn + AdaLN modulation</text>
+  <text x="495" y="220" font-size="10">  • cross_attn(query=video, key/value=text)</text>
+  <text x="495" y="240" font-size="10">  • Head: predict video noise/velocity</text>
+  <text x="632" y="262" text-anchor="middle" font-size="11" font-weight="bold" fill="#cf222e">→ video flow-match loss</text>
+  <text x="632" y="278" text-anchor="middle" font-size="9" fill="#555">λ_video (我们曾设 0 救援)</text>
+
+  <!-- Action expert -->
+  <rect x="485" y="300" width="295" height="220" rx="6" fill="#fff" stroke="#1a7f37" stroke-width="2"/>
+  <text x="632" y="320" text-anchor="middle" font-size="12" font-weight="bold">ActionDiT (action expert)</text>
+  <text x="632" y="338" text-anchor="middle" font-size="10" fill="#555">~1B, 复用 DiTBlock 实现</text>
+  <text x="495" y="360" font-size="10">  • action_encoder: Linear(7 → hidden)</text>
+  <text x="495" y="376" font-size="10">  • text_embedding: MLP(text_dim → hidden)</text>
+  <text x="495" y="392" font-size="10">  • time_embedding: sinusoidal + MLP</text>
+  <text x="495" y="408" font-size="10">  • N × DiTBlock</text>
+  <text x="510" y="424" font-size="9" fill="#555">    self-attn(action) + cross-attn(text+proprio)</text>
+  <text x="495" y="444" font-size="10">  • ActionHead: modulated LayerNorm + Linear</text>
+  <text x="510" y="460" font-size="9" fill="#555">    shift/scale by t_emb (类 AdaLN)</text>
+  <text x="632" y="486" text-anchor="middle" font-size="11" font-weight="bold">+ LoRA r=16 in QLoRA</text>
+  <text x="632" y="504" text-anchor="middle" font-size="11" font-weight="bold" fill="#cf222e">→ action flow-match loss</text>
+  <text x="632" y="518" text-anchor="middle" font-size="9" fill="#555">λ_action (主 loss)</text>
+
+  <!-- MoT note -->
+  <rect x="485" y="528" width="295" height="0" stroke="none"/>
+
+  <!-- ============= OUTPUT ============= -->
+  <rect x="810" y="320" width="160" height="80" rx="6" fill="#ffeef0" stroke="#cf222e" stroke-width="2"/>
+  <text x="890" y="340" text-anchor="middle" font-size="11" font-weight="bold">action_pred</text>
+  <text x="890" y="356" text-anchor="middle" font-size="10">(B, 24, 7) velocity</text>
+  <text x="890" y="372" text-anchor="middle" font-size="10" fill="#555">取前 6 = SO-101</text>
+  <text x="890" y="388" text-anchor="middle" font-size="10" fill="#555">最后 1 dim = gripper</text>
+
+  <!-- Loss -->
+  <rect x="810" y="420" width="160" height="60" rx="6" fill="#fff8e6" stroke="#d29922" stroke-width="2"/>
+  <text x="890" y="438" text-anchor="middle" font-size="11" font-weight="bold">Total loss</text>
+  <text x="890" y="455" text-anchor="middle" font-size="10">L = λ_v·L_video</text>
+  <text x="890" y="470" text-anchor="middle" font-size="10">  + λ_a·L_action</text>
+
+  <!-- Arrows: inputs → encoders -->
+  <line x1="210" y1="70" x2="238" y2="95" stroke="#1f6feb" stroke-width="1.5" marker-end="url(#fw-ai)"/>
+  <line x1="210" y1="120" x2="238" y2="185" stroke="#1f6feb" stroke-width="1.5" marker-end="url(#fw-ai)"/>
+  <line x1="210" y1="170" x2="238" y2="250" stroke="#1f6feb" stroke-width="1.5" marker-end="url(#fw-ai)"/>
+
+  <!-- Encoders → experts -->
+  <line x1="440" y1="100" x2="483" y2="180" stroke="#1f6feb" stroke-width="1.5" stroke-dasharray="3,2" marker-end="url(#fw-ai)"/>
+  <text x="455" y="155" font-size="9" fill="#555">latent</text>
+  <line x1="440" y1="190" x2="483" y2="220" stroke="#1f6feb" stroke-width="1.5" stroke-dasharray="3,2" marker-end="url(#fw-ai)"/>
+  <line x1="440" y1="190" x2="483" y2="378" stroke="#1f6feb" stroke-width="1.5" stroke-dasharray="3,2" marker-end="url(#fw-ai)"/>
+  <text x="455" y="280" font-size="9" fill="#555">text_emb</text>
+  <line x1="440" y1="250" x2="483" y2="395" stroke="#1f6feb" stroke-width="1.5" stroke-dasharray="3,2" marker-end="url(#fw-ai)"/>
+  <text x="455" y="365" font-size="9" fill="#555">proprio</text>
+
+  <!-- Action input -->
+  <path d="M 210 220 Q 350 480 483 360" fill="none" stroke="#cf222e" stroke-width="1.5" stroke-dasharray="3,2" marker-end="url(#fw-ai2)"/>
+  <text x="370" y="465" font-size="9" fill="#cf222e">action_noisy</text>
+
+  <!-- MoT coupling line -->
+  <line x1="632" y1="290" x2="632" y2="305" stroke="#1a7f37" stroke-width="3" stroke-dasharray="4,3"/>
+  <text x="660" y="296" font-size="9" fill="#1a7f37">MoT 共享 attention KV</text>
+
+  <!-- Outputs -->
+  <line x1="780" y1="500" x2="810" y2="370" stroke="#cf222e" stroke-width="2" marker-end="url(#fw-ai2)"/>
+  <line x1="890" y1="400" x2="890" y2="418" stroke="#1a7f37" stroke-width="2" marker-end="url(#fw-ai)"/>
+
+  <!-- Inference note -->
+  <rect x="10" y="340" width="220" height="200" rx="6" fill="#f8f8f8" stroke="#999" stroke-width="1"/>
+  <text x="120" y="358" text-anchor="middle" font-size="11" font-weight="bold">推理快路径 (inference)</text>
+  <text x="20" y="378" font-size="10">• video expert <b>SKIP</b>（不生成视频）</text>
+  <text x="20" y="394" font-size="10">• action 从 N(0, 1) 起步</text>
+  <text x="20" y="410" font-size="10">• for i in range(num_steps):</text>
+  <text x="20" y="426" font-size="10">　 t_i + RoPE + flow step</text>
+  <text x="20" y="442" font-size="10">　 update action_t</text>
+  <text x="20" y="458" font-size="10">• num_steps 默认 ~10-20</text>
+  <text x="20" y="476" font-size="10" fill="#cf222e">→ ~220ms / chunk @ 4090</text>
+  <text x="20" y="492" font-size="10" fill="#cf222e">→ chunk=24 → sim 一次塞 24 步</text>
+  <text x="20" y="510" font-size="10">• 训练 5B world model 但</text>
+  <text x="20" y="526" font-size="10">  推理只跑 1B action expert</text>
+</svg>
+
+<p><b>读图要点</b>：</p>
+<ul>
+<li>FastWAM 是 <b>world model 范式</b>：训练时同时学 "未来视频" 和 "未来动作"，loss 加权求和。推理时 video 可关掉（只走快路径），所以部署 latency 不至于太可怕</li>
+<li>核心是 <b>MoT (Mixture of Transformers)</b>：video 和 action 两个 expert 在每层 attention 共享 KV cache 但有独立 Q/MLP（跟 SmolVLA 的 cross_attn 类似但更深度耦合）</li>
+<li>真正决定 robot policy 性能的是 <b>ActionDiT</b>，~1B 参数；WanVideoDiT 的 5B 在推理时是 dead weight</li>
+<li>训练 joint loss + 推理时只跑 action 是 FastWAM 的核心 trick — 用大世界模型监督但不付推理代价</li>
+<li>我们 2026-05-18 失败的根因：50 demo 数据量太小（OFT/SmolVLA 是 100-500 demo），过参数化 → step 8000 之后 extrapolate 出训练 range，gripper 失控</li>
+</ul>
+
 <h2>5. 实施路径 · Implementation</h2>
 
 <h3>Phase 0 — 资源准备（已部分完成）· Asset prep</h3>

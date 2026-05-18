@@ -1,0 +1,252 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>ACT 微调记录 — LeIsaac SO-101 PickOrange</title>
+<style>
+  :root {
+    --bg: #fafafa; --fg: #1a1a1a; --muted: #555;
+    --accent: #1f6feb; --warn: #d29922; --bad: #cf222e; --good: #1a7f37;
+    --code-bg: #f3f3f3; --border: #d0d7de;
+  }
+  body { font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+         background: var(--bg); color: var(--fg);
+         max-width: 1000px; margin: 28px auto; padding: 0 22px; line-height: 1.6; }
+  h1 { border-bottom: 2px solid var(--fg); padding-bottom: 6px; }
+  h2 { margin-top: 36px; border-left: 4px solid var(--accent); padding-left: 10px; }
+  h3 { margin-top: 24px; color: var(--accent); }
+  .en { color: var(--muted); font-style: italic; font-size: 0.92em; }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0; font-size: 0.94em; }
+  th, td { border: 1px solid var(--border); padding: 6px 10px; text-align: left; vertical-align: top; }
+  th { background: #f0f3f6; }
+  code, pre { font-family: "JetBrains Mono", Menlo, Consolas, monospace; }
+  pre { background: var(--code-bg); padding: 12px; border-radius: 4px; overflow-x: auto; font-size: 0.88em; }
+  code { background: var(--code-bg); padding: 1px 5px; border-radius: 3px; }
+  .tag-good { color: var(--good); font-weight: 600; }
+  .tag-warn { color: var(--warn); font-weight: 600; }
+  .tag-bad  { color: var(--bad); font-weight: 600; }
+  .callout { border-left: 4px solid var(--warn); background: #fff8e6; padding: 10px 14px; margin: 14px 0; }
+  .callout.bad { border-color: var(--bad); background: #ffeef0; }
+  .callout.good { border-color: var(--good); background: #e6f4ea; }
+  svg { display: block; margin: 14px auto; }
+  ul { padding-left: 22px; }
+  li { margin: 4px 0; }
+  .meta { color: var(--muted); font-size: 0.9em; }
+</style>
+</head>
+<body>
+
+<h1>ACT 微调记录</h1>
+<p class="meta">SO-101 PickOrange · LeIsaac benchmark baseline #1 · 2026-05-18</p>
+<p class="en">Action Chunking Transformer (Tonyzhao et al. 2023, ALOHA paper) — the simplest and cheapest baseline in the leaderboard:
+~80M params, no VLM, no diffusion, just a ResNet18 + Transformer encoder-decoder predicting an action chunk in one forward pass.</p>
+
+<h2>0. TL;DR</h2>
+<div class="callout good">
+<b>ACT 是 leaderboard 里最便宜的 baseline</b>（80M params，~10ms/chunk forward）。
+本地训出来的 ckpt <code>wsagi/ACT-PickOrange</code> 在 strict eval 下 <b>0/3 round, 2/9 oranges, avg 130s</b>（横评中位），
+关键发现是 chunk-execution horizon trap：默认 horizon=16 跑不动，必须 <b>h=32</b> 才能复现 demo 抓取行为。
+</div>
+
+<h2>1. 架构核心</h2>
+
+<table>
+<tr><th>组件</th><th>来源</th><th>实现</th><th>参数估算</th></tr>
+<tr><td><b>Vision backbone</b></td><td>torchvision ResNet18</td><td><code>vision_backbone="resnet18"</code> + ImageNet pretrained；可选 final stride→dilation；feature map flatten + projection 到 dim_model</td><td>~11M</td></tr>
+<tr><td><b>Transformer encoder</b></td><td>ACT 自研（<code>modeling_act.py:514</code>）</td><td>4 层标准 multi-head self-attention，<b>非 causal</b>（全 bidirectional）；输入：[CLS, image patches × N_cam, state, (训练时) latent z]</td><td>~10M</td></tr>
+<tr><td><b>Transformer decoder</b></td><td>ACT 自研（<code>modeling_act.py:572</code>）</td><td>7 层 decoder block；query = learnable positional embedding（chunk_size 个）；KV = encoder output；输出每个 query → 1 个 action</td><td>~25M</td></tr>
+<tr><td><b>CVAE encoder</b>（训练 only）</td><td>ACT 自研</td><td>训练时把 GT action chunk 编码成 latent z；推理时 z = 0；提供"action prior"正则</td><td>~10M</td></tr>
+<tr><td><b>合计</b></td><td>—</td><td>—</td><td><b>~80M</b>（全部 trainable，无 LoRA）</td></tr>
+</table>
+
+<svg width="980" height="530" viewBox="0 0 980 530" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="ac-ai" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#1f6feb" />
+    </marker>
+    <marker id="ac-ai2" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#cf222e" />
+    </marker>
+  </defs>
+
+  <text x="490" y="25" font-weight="bold" font-size="14" text-anchor="middle">ACT 内部数据流（CVAE 训练 / 推理 z=0）</text>
+
+  <!-- INPUTS -->
+  <rect x="10" y="50" width="200" height="40" rx="6" fill="#e6f0ff" stroke="#1f6feb" stroke-width="2"/>
+  <text x="110" y="68" text-anchor="middle" font-size="11" font-weight="bold">images (B, V=2, 3, H, W)</text>
+  <text x="110" y="84" text-anchor="middle" font-size="10">front + wrist</text>
+
+  <rect x="10" y="100" width="200" height="40" rx="6" fill="#e6f0ff" stroke="#1f6feb" stroke-width="2"/>
+  <text x="110" y="118" text-anchor="middle" font-size="11" font-weight="bold">state (B, 6)</text>
+  <text x="110" y="134" text-anchor="middle" font-size="10">SO-101 joint pos</text>
+
+  <rect x="10" y="155" width="200" height="40" rx="6" fill="#ffeef0" stroke="#cf222e" stroke-width="2"/>
+  <text x="110" y="173" text-anchor="middle" font-size="11" font-weight="bold">action_chunk (B, 100, 6)</text>
+  <text x="110" y="189" text-anchor="middle" font-size="10">GT (训练 only)</text>
+
+  <!-- CVAE encoder (only training) -->
+  <rect x="10" y="220" width="200" height="80" rx="6" fill="#fff8e6" stroke="#d29922" stroke-width="2"/>
+  <text x="110" y="240" text-anchor="middle" font-size="11" font-weight="bold">CVAE encoder</text>
+  <text x="110" y="256" text-anchor="middle" font-size="10">小型 transformer</text>
+  <text x="110" y="272" text-anchor="middle" font-size="10">action+state → z (D=32)</text>
+  <text x="110" y="290" text-anchor="middle" font-size="9" fill="#cf222e">推理时 z = 0</text>
+
+  <!-- ResNet18 -->
+  <rect x="250" y="50" width="200" height="200" rx="8" fill="#fff8e6" stroke="#d29922" stroke-width="3"/>
+  <text x="350" y="75" text-anchor="middle" font-size="13" font-weight="bold">ResNet18 vision backbone</text>
+  <text x="350" y="92" text-anchor="middle" font-size="10" fill="#555">torchvision, ~11M, ImageNet init</text>
+
+  <rect x="265" y="105" width="170" height="40" rx="4" fill="#fffaf0" stroke="#d29922" stroke-width="1"/>
+  <text x="350" y="123" text-anchor="middle" font-size="10" font-weight="bold">conv blocks 1-4</text>
+  <text x="350" y="138" text-anchor="middle" font-size="9">stride 32 (或 16 if dilated)</text>
+
+  <rect x="265" y="150" width="170" height="40" rx="4" fill="#fffaf0" stroke="#d29922" stroke-width="1"/>
+  <text x="350" y="168" text-anchor="middle" font-size="10" font-weight="bold">→ feature map (B, 512, h', w')</text>
+  <text x="350" y="183" text-anchor="middle" font-size="9">每 cam ~15×20 = 300 token</text>
+
+  <rect x="265" y="195" width="170" height="45" rx="4" fill="#fffaf0" stroke="#d29922" stroke-width="1"/>
+  <text x="350" y="213" text-anchor="middle" font-size="10" font-weight="bold">flatten + project → dim_model</text>
+  <text x="350" y="228" text-anchor="middle" font-size="9">+ 2D sinusoidal pos emb</text>
+
+  <!-- Encoder -->
+  <rect x="480" y="50" width="280" height="220" rx="8" fill="#e6f4ea" stroke="#1a7f37" stroke-width="3"/>
+  <text x="620" y="75" text-anchor="middle" font-size="13" font-weight="bold">ACT Encoder</text>
+  <text x="620" y="92" text-anchor="middle" font-size="10" fill="#555">~10M, 4 层 self-attn, bidirectional</text>
+
+  <rect x="495" y="105" width="250" height="55" rx="4" fill="#f0f7f3" stroke="#1a7f37" stroke-width="1"/>
+  <text x="620" y="123" text-anchor="middle" font-size="11" font-weight="bold">Input sequence:</text>
+  <text x="620" y="140" text-anchor="middle" font-size="9">[CLS, latent_z, state_proj, image_tokens × 2cam]</text>
+  <text x="620" y="155" text-anchor="middle" font-size="9">total ≈ 1 + 1 + 1 + 600 = 603 tokens</text>
+
+  <rect x="495" y="165" width="250" height="100" rx="4" fill="#d4e9d9" stroke="#1a7f37" stroke-width="1"/>
+  <text x="620" y="185" text-anchor="middle" font-size="12" font-weight="bold">× 4 EncoderLayer</text>
+  <text x="620" y="205" text-anchor="middle" font-size="10">pre-LN + MHSA (bidirectional)</text>
+  <text x="620" y="220" text-anchor="middle" font-size="10">+ MLP (4× expansion)</text>
+  <text x="620" y="240" text-anchor="middle" font-size="10" fill="#555">→ memory (B, 603, D)</text>
+  <text x="620" y="258" text-anchor="middle" font-size="10" fill="#555">用作 decoder 的 cross-attn KV</text>
+
+  <!-- Decoder -->
+  <rect x="480" y="290" width="280" height="200" rx="8" fill="#e6f4ea" stroke="#1a7f37" stroke-width="3"/>
+  <text x="620" y="315" text-anchor="middle" font-size="13" font-weight="bold">ACT Decoder</text>
+  <text x="620" y="332" text-anchor="middle" font-size="10" fill="#555">~25M, 7 层 cross-attn</text>
+
+  <rect x="495" y="345" width="250" height="50" rx="4" fill="#f0f7f3" stroke="#1a7f37" stroke-width="1"/>
+  <text x="620" y="363" text-anchor="middle" font-size="11" font-weight="bold">Query: learnable pos emb</text>
+  <text x="620" y="379" text-anchor="middle" font-size="9">(chunk_size=100, D)，固定参数</text>
+
+  <rect x="495" y="400" width="250" height="80" rx="4" fill="#d4e9d9" stroke="#1a7f37" stroke-width="1"/>
+  <text x="620" y="420" text-anchor="middle" font-size="11" font-weight="bold">× 7 DecoderLayer</text>
+  <text x="620" y="438" text-anchor="middle" font-size="10">  pre-LN + self-attn(query)</text>
+  <text x="620" y="453" text-anchor="middle" font-size="10">+ cross-attn(query, memory)</text>
+  <text x="620" y="468" text-anchor="middle" font-size="10">+ MLP</text>
+
+  <!-- Output -->
+  <rect x="790" y="380" width="170" height="100" rx="6" fill="#ffeef0" stroke="#cf222e" stroke-width="2"/>
+  <text x="875" y="400" text-anchor="middle" font-size="11" font-weight="bold">action_head (Linear)</text>
+  <text x="875" y="418" text-anchor="middle" font-size="10">(B, 100, D) → (B, 100, 6)</text>
+  <text x="875" y="438" text-anchor="middle" font-size="11" font-weight="bold" fill="#cf222e">L1 loss + KL(z, N(0,1))</text>
+  <text x="875" y="458" text-anchor="middle" font-size="9" fill="#555">单 forward 出整个 chunk</text>
+  <text x="875" y="472" text-anchor="middle" font-size="9" fill="#555">~10ms / chunk</text>
+
+  <!-- Arrows -->
+  <line x1="210" y1="70" x2="248" y2="125" stroke="#1f6feb" stroke-width="1.5" marker-end="url(#ac-ai)"/>
+  <line x1="450" y1="220" x2="478" y2="155" stroke="#1f6feb" stroke-width="2" marker-end="url(#ac-ai)"/>
+  <text x="455" y="200" font-size="9" fill="#555">image tokens</text>
+
+  <line x1="210" y1="120" x2="478" y2="145" stroke="#1f6feb" stroke-width="1.5" stroke-dasharray="3,2" marker-end="url(#ac-ai)"/>
+  <text x="280" y="115" font-size="9" fill="#555">state_proj</text>
+
+  <path d="M 210 175 Q 110 220 110 220" fill="none" stroke="#cf222e" stroke-width="1.5" stroke-dasharray="3,2" marker-end="url(#ac-ai2)"/>
+  <line x1="210" y1="260" x2="478" y2="138" stroke="#cf222e" stroke-width="1.5" stroke-dasharray="3,2" marker-end="url(#ac-ai2)"/>
+  <text x="290" y="240" font-size="9" fill="#cf222e">latent z</text>
+
+  <line x1="620" y1="265" x2="620" y2="285" stroke="#1a7f37" stroke-width="2" marker-end="url(#ac-ai)"/>
+  <text x="640" y="280" font-size="9" fill="#555">memory</text>
+  <line x1="620" y1="395" x2="620" y2="400" stroke="#1a7f37" stroke-width="2" marker-end="url(#ac-ai)"/>
+
+  <line x1="760" y1="440" x2="790" y2="430" stroke="#1a7f37" stroke-width="2" marker-end="url(#ac-ai)"/>
+
+  <!-- Temporal Ensembling note -->
+  <rect x="10" y="380" width="220" height="120" rx="6" fill="#f8f8f8" stroke="#999" stroke-width="1"/>
+  <text x="120" y="400" text-anchor="middle" font-size="11" font-weight="bold">Temporal Ensembling (推理)</text>
+  <text x="20" y="420" font-size="10">• 每 sim step 都 forward 一次</text>
+  <text x="20" y="436" font-size="10">• 累积 N 个过去 prediction</text>
+  <text x="20" y="452" font-size="10">• 加权平均（exp decay）</text>
+  <text x="20" y="468" font-size="10">• 取 chunk[0] 作为当前 action</text>
+  <text x="20" y="486" font-size="10" fill="#cf222e">→ 强 robustness, 但 latency × 1</text>
+</svg>
+
+<p><b>读图要点</b>：</p>
+<ul>
+<li><b>没有 VLM</b>：ACT 是纯 vision-conditioned policy，不接 language。任务身份由训练 dataset 决定，inference 时无 prompt</li>
+<li><b>CVAE 是 trick 不是核心</b>：训练时把 GT action 编成 latent z 提供正则，推理时 z=0；理论上简化版（去掉 CVAE）也能跑，paper 报 z=0 + KL 退火帮助 small-data 收敛</li>
+<li><b>单 forward 出整个 chunk</b>（chunk_size=100）：跟 ACT/DP/SmolVLA 一脉相承，但 ACT 是 <b>直接 regression，无 diffusion，最便宜</b>。10ms 跑完一个 100-step chunk = 等效 0.1ms/action</li>
+<li><b>Temporal ensembling（可选）</b>：每 sim step 都 forward，把多个过去 prediction 加权求平均 chunk[0] → 抗噪；我们 benchmark 没开，开后 latency 会上去</li>
+</ul>
+
+<h2>2. 训练配置（我们实际用的）</h2>
+
+<table>
+<tr><th>参数</th><th>值</th><th>来源</th></tr>
+<tr><td>backbone</td><td>resnet18</td><td>shadowHokage/act_policy 默认</td></tr>
+<tr><td>dim_model</td><td>512</td><td>同上</td></tr>
+<tr><td>n_heads</td><td>8</td><td>同上</td></tr>
+<tr><td>encoder layers</td><td>4</td><td>同上</td></tr>
+<tr><td>decoder layers</td><td>7</td><td>同上</td></tr>
+<tr><td>chunk_size</td><td>100</td><td>ALOHA paper 推荐</td></tr>
+<tr><td>batch_size</td><td>8</td><td>4090 上 ResNet+Transformer 容易 fit</td></tr>
+<tr><td>learning rate</td><td>1e-5</td><td>shadowHokage 推荐</td></tr>
+<tr><td>steps</td><td>10000</td><td>50 demo × ~200 step 足够 ACT</td></tr>
+<tr><td>image augmentation</td><td><b>off</b></td><td>shadowHokage 复刻配方</td></tr>
+<tr><td>vae_kl_weight</td><td>10</td><td>默认</td></tr>
+</table>
+
+<h2>3. Eval 参数 + chunk-execution horizon trap</h2>
+
+<div class="callout bad">
+<b>🔴 horizon trap</b>：默认 <code>--policy_action_horizon=16</code>（消费 chunk 前 16 步就重 query）跑不动，arm 漂浮无意义。<b>必须 horizon=32 才能复现 demo 行为</b>。
+</div>
+
+<table>
+<tr><th>eval 参数</th><th>值</th><th>说明</th></tr>
+<tr><td>step_hz</td><td>30</td><td>对齐 dataset 30Hz</td></tr>
+<tr><td>policy_action_horizon</td><td><b>32</b>（不是默认 16）</td><td>chunk=100 但只消费前 32 → 高频重规划</td></tr>
+<tr><td>episode_length_s</td><td>120</td><td></td></tr>
+<tr><td>eval_rounds</td><td>3</td><td>strict mode</td></tr>
+<tr><td>peak VRAM</td><td>~8-10 GB</td><td>最小的 baseline</td></tr>
+<tr><td>avg latency</td><td>~10 ms / chunk forward</td><td>等效 0.1ms / action</td></tr>
+</table>
+
+<h2>4. Benchmark 结果（leaderboard 位置）</h2>
+
+<table>
+<tr><th>Source</th><th>Strict Rounds</th><th>🍊 / 9</th><th>Avg time</th><th>Peak VRAM</th></tr>
+<tr><td><code>wsagi/ACT-PickOrange</code>（自训）</td><td>0/3</td><td>2/9</td><td>130s</td><td>10.4 GB</td></tr>
+<tr><td><code>shadowHokage/act_policy</code></td><td>0/3</td><td>1/9</td><td>127s</td><td>8.6 GB</td></tr>
+</table>
+
+<p>位置：leaderboard 中下游。原因不是模型架构问题，是 <b>80M params + 30Hz fine motor 任务</b>对 ACT 来说在抓握精度上欠拟合（同样数据 GR00T-N1.6 3B 能 2/3 round）。</p>
+
+<h2>5. Postmortem / 调试历程</h2>
+
+<p>详见 <a href="act_eval_debug_postmortem.html"><code>act_eval_debug_postmortem.html</code></a>。简表：</p>
+
+<table>
+<tr><th>问题</th><th>诊断</th><th>修复</th></tr>
+<tr><td>初次 eval 抓不到任何橙子</td><td>policy_action_horizon=16 默认值不对</td><td>调到 32</td></tr>
+<tr><td>arm 跳出工作区域</td><td>sim_warmup_steps 缺失 → 首帧渲染未完成 model 看到坏画面就 commit 100 步轨迹</td><td>加 30 步 sim warmup</td></tr>
+<tr><td>step_hz 与 dataset 30Hz 不匹配</td><td>默认 60Hz → 时间尺度漂移</td><td>对齐 30Hz</td></tr>
+<tr><td>shadowHokage 公开 ckpt 修完上面 3 个还是 0/N</td><td>我们的 dataset 跟它训练的可能不是 byte-exact 同源</td><td>用自训 wsagi/ACT-PickOrange 作为基准</td></tr>
+</table>
+
+<h2>6. 关联</h2>
+<ul>
+<li><a href="act_eval_debug_postmortem.html"><code>act_eval_debug_postmortem.html</code></a> — debug postmortem 详记</li>
+<li><a href="dp_finetune_pick_orange.html"><code>dp_finetune_pick_orange.html</code></a> — DP（同款 ResNet + UNet 风格）</li>
+<li><a href="smolvla_finetune_pick_orange.html"><code>smolvla_finetune_pick_orange.html</code></a> — VLM 增强版 chunk policy</li>
+<li><code>act-eval-debug-roundN</code> memory</li>
+<li><code>act-training-plan</code> memory</li>
+</ul>
+
+</body>
+</html>

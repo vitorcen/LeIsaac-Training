@@ -74,6 +74,144 @@
 <tr><td>Action representation</td><td>continuous float</td><td>discrete token (256 bins / DOF)</td></tr>
 </table>
 
+<h3>2.2 模型内部结构 · Internal architecture</h3>
+
+<p>OpenVLA 是 <b>Stanford Prismatic VLM (LLaVA-style 拼装) 上的 action token finetune</b>，<b>没有独立的 action head</b> —— action 直接复用 Llama lm_head 输出 32k 词表的顶端 256 个 token 作为离散 bin。</p>
+
+<table>
+<tr><th>组件</th><th>来源</th><th>实现</th><th>参数估算</th></tr>
+<tr><td><b>Fused Vision Backbone</b></td><td>Stanford Prismatic（<code>modeling_prismatic.py:63 PrismaticVisionBackbone</code>）</td><td>DINOv2 ViT-L + SigLIP ViT-L 双 encoder 并行，patch features <b>沿 channel 维 concat</b>；timm 实现，权重 frozen 不推荐 LoRA</td><td>~0.6B (300M + 300M)</td></tr>
+<tr><td><b>Linear Projector</b></td><td>Stanford Prismatic</td><td>2-layer MLP 把 vision patch features (D=2176) → Llama embedding 维 (D=4096)；通常 trainable</td><td>~30M</td></tr>
+<tr><td><b>OpenLlama-7B</b></td><td>OpenLM Research（开源 Llama-2 复刻）</td><td>32 层标准 causal Transformer；32k vocab；<b>action token 用顶端 256 个 vocab id</b>（<code>token_id = vocab_size - 1 - bin_idx</code>）</td><td>~7B</td></tr>
+<tr><td><b>合计</b></td><td>—</td><td>—</td><td><b>~7.6B</b>（其中 LoRA 我们训 ~17M）</td></tr>
+</table>
+
+<svg width="980" height="540" viewBox="0 0 980 540" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="ov-ai" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#1f6feb" />
+    </marker>
+    <marker id="ov-ai2" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#cf222e" />
+    </marker>
+  </defs>
+
+  <text x="490" y="25" font-weight="bold" font-size="14" text-anchor="middle">OpenVLA 内部数据流（训练 forward + autoregressive inference）</text>
+
+  <!-- ============= LAYER 1: INPUTS ============= -->
+  <rect x="10" y="50" width="200" height="40" rx="6" fill="#e6f0ff" stroke="#1f6feb" stroke-width="2"/>
+  <text x="110" y="68" text-anchor="middle" font-size="11" font-weight="bold">pixel_values (B, 6, 224, 224)</text>
+  <text x="110" y="84" text-anchor="middle" font-size="10">3ch DINOv2 + 3ch SigLIP fused</text>
+
+  <rect x="10" y="100" width="200" height="40" rx="6" fill="#e6f0ff" stroke="#1f6feb" stroke-width="2"/>
+  <text x="110" y="118" text-anchor="middle" font-size="11" font-weight="bold">prompt_ids</text>
+  <text x="110" y="134" text-anchor="middle" font-size="10">"In: What action ... ?\nOut:"</text>
+
+  <rect x="10" y="155" width="200" height="40" rx="6" fill="#ffeef0" stroke="#cf222e" stroke-width="2"/>
+  <text x="110" y="173" text-anchor="middle" font-size="11" font-weight="bold">action_token_ids (6,)</text>
+  <text x="110" y="189" text-anchor="middle" font-size="10">GT: vocab_size-1-bin_idx</text>
+
+  <!-- ============= LAYER 2: Vision Backbone ============= -->
+  <rect x="240" y="50" width="220" height="200" rx="8" fill="#fff8e6" stroke="#d29922" stroke-width="3"/>
+  <text x="350" y="75" text-anchor="middle" font-size="13" font-weight="bold">Fused Vision Backbone</text>
+  <text x="350" y="92" text-anchor="middle" font-size="10" fill="#555">Prismatic, ~0.6B, typically frozen</text>
+
+  <rect x="255" y="105" width="85" height="60" rx="4" fill="#fffaf0" stroke="#d29922" stroke-width="1"/>
+  <text x="297" y="124" text-anchor="middle" font-size="10" font-weight="bold">DINOv2</text>
+  <text x="297" y="138" text-anchor="middle" font-size="9">ViT-L/14</text>
+  <text x="297" y="152" text-anchor="middle" font-size="9">~300M</text>
+
+  <rect x="360" y="105" width="85" height="60" rx="4" fill="#fffaf0" stroke="#d29922" stroke-width="1"/>
+  <text x="402" y="124" text-anchor="middle" font-size="10" font-weight="bold">SigLIP</text>
+  <text x="402" y="138" text-anchor="middle" font-size="9">ViT-L/16</text>
+  <text x="402" y="152" text-anchor="middle" font-size="9">~300M</text>
+
+  <rect x="255" y="175" width="190" height="40" rx="4" fill="#fffaf0" stroke="#d29922" stroke-width="1"/>
+  <text x="350" y="193" text-anchor="middle" font-size="10" font-weight="bold">concat along channel</text>
+  <text x="350" y="208" text-anchor="middle" font-size="9">patches (B, 256, D=2176)</text>
+
+  <rect x="255" y="220" width="190" height="25" rx="4" fill="#fffaf0" stroke="#d29922" stroke-width="1"/>
+  <text x="350" y="237" text-anchor="middle" font-size="10" font-weight="bold">2-layer MLP projector → 4096</text>
+
+  <!-- ============= LAYER 3: Llama-7B ============= -->
+  <rect x="490" y="50" width="280" height="400" rx="8" fill="#e6f4ea" stroke="#1a7f37" stroke-width="3"/>
+  <text x="630" y="75" text-anchor="middle" font-size="13" font-weight="bold">OpenLlama-7B (causal LM)</text>
+  <text x="630" y="92" text-anchor="middle" font-size="10" fill="#555">32 layers · hidden 4096 · 32k vocab</text>
+
+  <rect x="505" y="105" width="250" height="40" rx="4" fill="#f0f7f3" stroke="#1a7f37" stroke-width="1"/>
+  <text x="630" y="123" text-anchor="middle" font-size="11" font-weight="bold">Input merge</text>
+  <text x="630" y="138" text-anchor="middle" font-size="9">[image_embeds; prompt_embeds; action_embeds]</text>
+
+  <rect x="505" y="155" width="250" height="200" rx="4" fill="#d4e9d9" stroke="#1a7f37" stroke-width="1"/>
+  <text x="630" y="175" text-anchor="middle" font-size="12" font-weight="bold">× 32 Llama Transformer block</text>
+  <text x="630" y="195" text-anchor="middle" font-size="10">pre-RMSNorm + GQA</text>
+  <text x="630" y="210" text-anchor="middle" font-size="10">+ RoPE causal attention</text>
+  <text x="630" y="225" text-anchor="middle" font-size="10">+ SwiGLU MLP</text>
+  <text x="630" y="252" text-anchor="middle" font-size="10" font-weight="bold" fill="#cf222e">✦ LoRA r=32 on q_proj+v_proj</text>
+  <text x="630" y="268" text-anchor="middle" font-size="10" fill="#cf222e">  (16.78M trainable, 0.22%)</text>
+  <text x="630" y="290" text-anchor="middle" font-size="10" font-weight="bold">causal mask (autoregressive)</text>
+  <text x="630" y="306" text-anchor="middle" font-size="9" fill="#555">token t 只能看 t-1, t-2, ...</text>
+  <text x="630" y="324" text-anchor="middle" font-size="10" font-weight="bold">QLoRA NF4 4-bit base</text>
+  <text x="630" y="340" text-anchor="middle" font-size="9" fill="#555">(bnb) 14GB → 3.8GB</text>
+
+  <rect x="505" y="365" width="250" height="40" rx="4" fill="#f0f7f3" stroke="#1a7f37" stroke-width="1"/>
+  <text x="630" y="383" text-anchor="middle" font-size="11" font-weight="bold">lm_head (Linear 4096 → 32000)</text>
+  <text x="630" y="398" text-anchor="middle" font-size="9">输出全 32k vocab logits</text>
+
+  <rect x="505" y="412" width="250" height="32" rx="4" fill="#f0f7f3" stroke="#1a7f37" stroke-width="1"/>
+  <text x="630" y="431" text-anchor="middle" font-size="10" font-weight="bold">取顶端 256 个 token = 离散 action bin</text>
+
+  <!-- ============= LAYER 4: OUTPUT ============= -->
+  <rect x="800" y="160" width="170" height="60" rx="6" fill="#ffeef0" stroke="#cf222e" stroke-width="2"/>
+  <text x="885" y="180" text-anchor="middle" font-size="11" font-weight="bold">Cross-entropy loss</text>
+  <text x="885" y="196" text-anchor="middle" font-size="10">仅对 action token 位置</text>
+  <text x="885" y="210" text-anchor="middle" font-size="10">prompt 位置 IGNORE</text>
+
+  <rect x="800" y="240" width="170" height="100" rx="6" fill="#f8f8f8" stroke="#999" stroke-width="1"/>
+  <text x="885" y="258" text-anchor="middle" font-size="11" font-weight="bold">推理 (inference)</text>
+  <text x="810" y="276" font-size="10">• AR decode 6 tokens</text>
+  <text x="810" y="290" font-size="10">• 每次 forward 1 token</text>
+  <text x="810" y="304" font-size="10">• <b>每 action = 6 forward</b></text>
+  <text x="810" y="318" font-size="10" fill="#cf222e">→ 240 ms @ 4090</text>
+  <text x="810" y="332" font-size="10" fill="#cf222e">→ sim 必须 step_hz≤5</text>
+
+  <rect x="800" y="360" width="170" height="80" rx="6" fill="#fff8e6" stroke="#d29922" stroke-width="2"/>
+  <text x="885" y="378" text-anchor="middle" font-size="11" font-weight="bold">反量化 (un-norm)</text>
+  <text x="810" y="396" font-size="10">bin_idx = vocab − 1 − token</text>
+  <text x="810" y="410" font-size="10">a_norm = bin_centers[bin]</text>
+  <text x="810" y="424" font-size="10">a = q01 + (a_n+1)/2 × (q99−q01)</text>
+  <text x="810" y="436" font-size="9" fill="#555">→ continuous 6-DOF joint</text>
+
+  <!-- Arrows -->
+  <line x1="210" y1="70" x2="238" y2="130" stroke="#1f6feb" stroke-width="2" marker-end="url(#ov-ai)"/>
+  <line x1="460" y1="240" x2="503" y2="125" stroke="#1f6feb" stroke-width="2" marker-end="url(#ov-ai)"/>
+  <text x="475" y="200" font-size="9" fill="#555">image_embeds</text>
+  <line x1="210" y1="120" x2="503" y2="125" stroke="#1f6feb" stroke-width="1.5" stroke-dasharray="3,2" marker-end="url(#ov-ai)"/>
+  <line x1="210" y1="175" x2="503" y2="135" stroke="#cf222e" stroke-width="1.5" stroke-dasharray="3,2" marker-end="url(#ov-ai2)"/>
+
+  <line x1="630" y1="145" x2="630" y2="153" stroke="#1a7f37" stroke-width="2" marker-end="url(#ov-ai)"/>
+  <line x1="630" y1="355" x2="630" y2="363" stroke="#1a7f37" stroke-width="2" marker-end="url(#ov-ai)"/>
+  <line x1="630" y1="405" x2="630" y2="411" stroke="#1a7f37" stroke-width="2" marker-end="url(#ov-ai)"/>
+
+  <line x1="755" y1="383" x2="798" y2="195" stroke="#cf222e" stroke-width="2" marker-end="url(#ov-ai2)"/>
+  <line x1="755" y1="430" x2="798" y2="400" stroke="#1a7f37" stroke-width="2" marker-end="url(#ov-ai)"/>
+
+  <!-- LoRA note bottom -->
+  <rect x="10" y="460" width="960" height="70" rx="6" fill="#fff8e6" stroke="#d29922" stroke-width="1"/>
+  <text x="490" y="480" text-anchor="middle" font-size="12" font-weight="bold">关键设计要点</text>
+  <text x="20" y="500" font-size="11">• <b>没有独立 action head</b>：action 复用 Llama lm_head 输出，顶端 256 个 vocab id 当 256 bin（vanilla 唯一的"创新"是把 action 当 text token）</text>
+  <text x="20" y="516" font-size="11">• <b>causal AR decode</b>：每 action = 6 个 sequential forward（与 chunk policy 全反），→ inference 慢，难高频闭环</text>
+</svg>
+
+<p><b>读图要点</b>：</p>
+<ul>
+<li>OpenVLA 没有专门的 action head — action 是 Llama 32k vocab 顶端 256 个 token id 的离散化，<b>token_id = vocab_size − 1 − bin_idx</b></li>
+<li>Vision = DINOv2 + SigLIP <b>双 encoder concat channel</b>（不是 sum、不是单 encoder），这是 Prismatic VLM 论文的设计</li>
+<li>Llama causal AR decode 意味着 6-DOF action = 6 次 forward，<b>没法并行</b>，这是 240ms/action latency 的根因</li>
+<li>我们做 QLoRA 微调时只动 q_proj+v_proj 的 16.78M 参数（0.22%），vision + projector + 其他 Llama 层全 frozen</li>
+<li>OpenVLA-OFT 解决方案就是替换 lm_head 为独立 MLP action head + chunked action + bidirectional attn（见 <a href="openvla_oft_finetune_plan.html"><code>openvla_oft_finetune_plan.html</code></a>）</li>
+</ul>
+
 <h2>3. 系统流程图 · Architecture Diagram</h2>
 
 <svg width="900" height="360" viewBox="0 0 900 360" xmlns="http://www.w3.org/2000/svg">
@@ -226,12 +364,40 @@
 <li>B: convert LeRobot v3.0 → RLDS（耗时但可用 openvla 原生训练）</li>
 </ul>
 
-<h3>Phase 4 — LoRA 微调 (~12h，含反复跑)</h3>
-<p>新建 <code>scripts/training/openvla/train.sh</code>（类比 pi05 的 train.sh）：</p>
-<pre>--lora_rank=32 --lora_alpha=16 --lora_target_modules q_proj,v_proj
---batch_size=4 --lr=5e-5 --grad_accum=2 --gradient_checkpointing=true
---steps=10000 --save_freq=1000
---bf16 --image_aug=true</pre>
+<h3>Phase 4 — QLoRA 微调（已实测，2026-05-18）</h3>
+<p>位置：<code>LeIsaac/scripts/finetune/openvla/{dataset.py, train.py, train.sh, smoke.py}</code>。conda env <code>openvla</code>（transformers 4.40.1 / peft 0.11.1 / bnb 0.43.1 / torch 2.3.1+cu121）。</p>
+
+<table>
+<tr><th>实测项 (smoke.py)</th><th>值</th></tr>
+<tr><td>4-bit base 加载</td><td>8.5 s, 4.38 GB</td></tr>
+<tr><td>LoRA wrap (r=32, q+v_proj)</td><td><b>trainable 16.78 M (0.222%)</b></td></tr>
+<tr><td>1 forward (batch=2)</td><td>loss=16.6, 0.53 s</td></tr>
+<tr><td>1 backward</td><td>GPU peak 5.84 GB, 0.46 s</td></tr>
+<tr><td>1 video frame decode (PyAV seek)</td><td><b>6–9 ms</b></td></tr>
+</table>
+
+<div class="callout good">
+<b>✅ 定版 LoRA 配方：</b><br/>
+<code>r=32, alpha=16, dropout=0.0, target_modules=[q_proj, v_proj], bias="none"</code><br/>
+~16.78 M trainable params on 7B (0.222%). <b>不要挂 FFN</b>，FastWAM 失败教训。
+</div>
+
+<pre>--batch_size=4 --grad_accum=4         # effective batch 16
+--lr=5e-5 --warmup=100 --max_steps=10000
+--lora_rank=32 --lora_targets q_proj,v_proj
+--gradient_checkpointing --bf16
+--optim paged_adamw_8bit
+--save_steps=1000 --save_total_limit=3</pre>
+
+<div class="callout">
+<b>必须的工程 trick：</b>
+<ul>
+<li><code>import torchgen.model as _torchgen_model</code> 放 train.py 顶部 — 否则 accelerate.find_tied_parameters 触发 enum lazy init 崩溃（FastWAM 原坑）</li>
+<li><code>prepare_model_for_kbit_training</code> 必须 BEFORE <code>get_peft_model</code></li>
+<li><code>pixel_values</code> 保持 float32 — vision backbone 是 timm fp32，只 Llama 是 bf16</li>
+<li><code>gradient_checkpointing_kwargs={"use_reentrant": False}</code> 必带</li>
+</ul>
+</div>
 
 <h3>Phase 5 — Eval + benchmark (~2h)</h3>
 <p>接到 LeIsaac eval pipeline：</p>

@@ -1,0 +1,533 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>X-VLA 微调计划 — LeIsaac SO-101 PickOrange</title>
+<style>
+  :root {
+    --bg: #fafafa; --fg: #1a1a1a; --muted: #555;
+    --accent: #1f6feb; --warn: #d29922; --bad: #cf222e; --good: #1a7f37;
+    --code-bg: #f3f3f3; --border: #d0d7de;
+  }
+  body { font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+         background: var(--bg); color: var(--fg);
+         max-width: 1000px; margin: 28px auto; padding: 0 22px; line-height: 1.6; }
+  h1 { border-bottom: 2px solid var(--fg); padding-bottom: 6px; }
+  h2 { margin-top: 36px; border-left: 4px solid var(--accent); padding-left: 10px; }
+  h3 { margin-top: 24px; color: var(--accent); }
+  .en { color: var(--muted); font-style: italic; font-size: 0.92em; }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0; font-size: 0.94em; }
+  th, td { border: 1px solid var(--border); padding: 6px 10px; text-align: left; vertical-align: top; }
+  th { background: #f0f3f6; }
+  code, pre { font-family: "JetBrains Mono", Menlo, Consolas, monospace; }
+  pre { background: var(--code-bg); padding: 12px; border-radius: 4px; overflow-x: auto; font-size: 0.88em; }
+  code { background: var(--code-bg); padding: 1px 5px; border-radius: 3px; }
+  .tag-good { color: var(--good); font-weight: 600; }
+  .tag-warn { color: var(--warn); font-weight: 600; }
+  .tag-bad  { color: var(--bad); font-weight: 600; }
+  .callout { border-left: 4px solid var(--warn); background: #fff8e6; padding: 10px 14px; margin: 14px 0; }
+  .callout.bad { border-color: var(--bad); background: #ffeef0; }
+  .callout.good { border-color: var(--good); background: #e6f4ea; }
+  svg { display: block; margin: 14px auto; }
+  ul { padding-left: 22px; }
+  li { margin: 4px 0; }
+  .meta { color: var(--muted); font-size: 0.9em; }
+</style>
+</head>
+<body>
+
+<h1>X-VLA QLoRA 微调计划</h1>
+<p class="meta">SO-101 PickOrange · 第 6 个 baseline · pivot from OpenVLA / OFT / LingBot · 2026-05-18</p>
+<p class="en">Cross-embodiment soft-prompted Transformer with 0.9B params, natively integrated into LeRobot.
+Replaces OpenVLA-OFT and LingBot-VLA on the roadmap because of dramatically lower engineering cost
+and a more direct architectural fit for SO-101 single-arm pick-and-place.</p>
+
+<h2>0. TL;DR</h2>
+<div class="callout good">
+<b>为什么 X-VLA</b>：（1）<b>LeRobot 原生集成</b> — <code>lerobot.policies.xvla.XVLAPolicy</code> 是 <code>PreTrainedPolicy</code> 子类，复用 lerobot trainer；（2）<b>0.9B 参数</b>，bf16 全精度吃得下 24GB 4090；（3）<b>SO-101 已被官方 action_hub 支持</b>（<code>BimanualSO101ActionSpace</code> 单臂可仿写）；（4）<b>chunked + iterative denoising</b> 规避 vanilla OpenVLA 的 step_hz + discrete bin 痛点；（5）<b>cross-embodiment 是设计目标</b>。
+<br/><br/>
+<b>Base ckpt</b>：<code>lerobot/xvla-base</code>（3.86k DL / 20 likes）。<br/>
+<b>训练栈</b>：bf16 LoRA（不必 QLoRA）+ LeRobot 原生 <code>lerobot.scripts.lerobot_train</code>。
+</div>
+
+<div class="callout bad">
+<b>⚠️ Codex 评审 (2026-05-18) 抓到 6 个真 🔴，原 v1 plan 不能直接执行。此版已修订 → v2。带行号的源码引用都是 <code>lerobot/lerobot/src/lerobot/policies/xvla/</code> 下：</b>
+<ul>
+<li><b>🔴 #1 不是 regression，是 iterative denoising (rectified-flow)</b>。<code>modeling_xvla.py:203</code> 训练采样时间 t，<code>action_noisy = noise*t + action*(1-t)</code>，喂模型后算 noise 预测 loss；<code>modeling_xvla.py:249</code> 推理从高斯噪声起步循环 <code>num_denoising_steps=10</code> 次。<b>每次 chunk inference = 0.9B forward × 10 steps</b>。架构图与 latency 已重画。</li>
+<li><b>🔴 #2 domain_id 没有"fresh slot"</b>。<code>soft_transformer.py:340</code> <code>soft_prompt_hub = nn.Embedding(30, ...)</code> 全 30 slot 都是预训练参数。配 <code>domain_id=29</code> 是 <b>复用 slot 29 的预训练权重</b>，不是 from scratch。要 fresh 必须显式 reinit 那个 embedding slice。<b>v2 默认走 slot 0（最稳）</b>。</li>
+<li><b>🔴 #3 CLI 写错</b>。entry 是 <code>lerobot.scripts.lerobot_train</code>（不是 <code>scripts.train</code>），pretrained 字段是 <code>--policy.path</code>（不是 <code>--policy.pretrained_path</code>）。最坏：看似能跑但没加载预训练权重。</li>
+<li><b>🔴 #4 AutoActionSpace 是偷偷改协议</b>。预训练 action head 有 <b>channel semantics</b>（EE6D/JointActionSpace/BimanualSO101 都把 gripper 放在特定 index 用特定后处理）。AutoActionSpace 把 6D 硬塞前 6 dim = 发明新 wire format，预训练参数对不上。<b>v2 推荐自写 SingleArmSO101 子类继承正确的 channel layout</b>。</li>
+<li><b>🔴 #5 chunk=32 + n_action_steps=32 = 1.07s open-loop</b>。无 TAE / overlap averaging（<code>modeling_xvla.py:421</code> select_action 纯 popleft）。<b>v2 锁定 n_action_steps=8 重规划周期，chunk_size 训练时可保留 32 拿长上下文</b>。</li>
+<li><b>🔴 #6 IDENTITY normalization + continuous gripper 是隐性陷阱</b>。<code>configuration_xvla.py:67</code> 默认 <code>normalization_mapping</code> 对 state/action 是 IDENTITY，gripper 2.4-58.3° 直接进模型，跟预训练分布不对齐。<b>v2 必须显式配 MIN_MAX 或 MEAN_STD 归一化</b>。</li>
+</ul>
+</div>
+
+<h2>1. X-VLA 架构核心（v2 修订后）</h2>
+
+<p><b>关键校正</b>：X-VLA 不是 chunked regression，而是 <b>rectified-flow / iterative denoising</b> action diffusion。训练通过 noise 注入 + flow loss，推理通过 10-step 去噪循环。这跟 π0.5 / DP 同家族。</p>
+
+<svg width="960" height="380" viewBox="0 0 960 380" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#1f6feb" />
+    </marker>
+  </defs>
+
+  <text x="480" y="25" font-weight="bold" font-size="14" text-anchor="middle">X-VLA — Soft-prompted rectified-flow action diffusion (0.9B)</text>
+
+  <!-- Inputs (training) -->
+  <rect x="20" y="50" width="130" height="50" rx="8" fill="#e6f0ff" stroke="#1f6feb" stroke-width="2"/>
+  <text x="85" y="72" text-anchor="middle" font-size="11" font-weight="bold">obs (img + state + lang)</text>
+  <text x="85" y="88" text-anchor="middle" font-size="10">front cam, 6D state</text>
+
+  <rect x="20" y="120" width="130" height="50" rx="8" fill="#e6f0ff" stroke="#1f6feb" stroke-width="2"/>
+  <text x="85" y="142" text-anchor="middle" font-size="11" font-weight="bold">GT action_chunk</text>
+  <text x="85" y="158" text-anchor="middle" font-size="10">(chunk=32, dim=20)</text>
+
+  <rect x="20" y="190" width="130" height="50" rx="8" fill="#e6f0ff" stroke="#1f6feb" stroke-width="2"/>
+  <text x="85" y="212" text-anchor="middle" font-size="11" font-weight="bold">domain_id (slot 0)</text>
+  <text x="85" y="228" text-anchor="middle" font-size="10">soft prompt selector</text>
+
+  <!-- Noise injection -->
+  <rect x="180" y="120" width="160" height="50" rx="8" fill="#fff8e6" stroke="#d29922" stroke-width="2"/>
+  <text x="260" y="142" text-anchor="middle" font-size="11" font-weight="bold">Sample t ∈ [0,1]</text>
+  <text x="260" y="158" text-anchor="middle" font-size="10">action_noisy = noise*t + a*(1-t)</text>
+
+  <!-- Florence2 + soft prompts -->
+  <rect x="180" y="50" width="160" height="50" rx="8" fill="#fff8e6" stroke="#d29922" stroke-width="2"/>
+  <text x="260" y="72" text-anchor="middle" font-size="11" font-weight="bold">Florence2 + soft_prompt</text>
+  <text x="260" y="88" text-anchor="middle" font-size="10">(frozen) Embedding(30, ...)</text>
+
+  <!-- Transformer denoise -->
+  <rect x="370" y="50" width="180" height="200" rx="8" fill="#e6f4ea" stroke="#1a7f37" stroke-width="2"/>
+  <text x="460" y="80" text-anchor="middle" font-size="13" font-weight="bold">Policy Transformer</text>
+  <text x="460" y="100" text-anchor="middle" font-size="11">hidden=1024, depth=24</text>
+  <text x="460" y="118" text-anchor="middle" font-size="11">bidirectional full attn</text>
+  <text x="460" y="148" text-anchor="middle" font-size="12" font-weight="bold">predict noise/velocity</text>
+  <text x="460" y="166" text-anchor="middle" font-size="11">(rectified-flow loss)</text>
+  <text x="460" y="196" text-anchor="middle" font-size="11" font-weight="bold">inference loop:</text>
+  <text x="460" y="214" text-anchor="middle" font-size="11">x_init = N(0,1) → denoise</text>
+  <text x="460" y="232" text-anchor="middle" font-size="11" fill="#cf222e">×10 iterations / chunk</text>
+
+  <!-- Action head -->
+  <rect x="580" y="50" width="180" height="200" rx="8" fill="#ffeef0" stroke="#cf222e" stroke-width="2"/>
+  <text x="670" y="80" text-anchor="middle" font-size="13" font-weight="bold">Action hub head</text>
+  <text x="670" y="100" text-anchor="middle" font-size="11">model dim = 20</text>
+  <text x="670" y="118" text-anchor="middle" font-size="11">channel semantics 严格</text>
+  <text x="670" y="148" text-anchor="middle" font-size="11">EE6D / JointActionSpace</text>
+  <text x="670" y="166" text-anchor="middle" font-size="11">BimanualSO101 / AutoSpace</text>
+  <text x="670" y="196" text-anchor="middle" font-size="12" font-weight="bold" fill="#cf222e">⚠️ SO-101 单臂 6D</text>
+  <text x="670" y="214" text-anchor="middle" font-size="11">需自写 SingleArmSO101</text>
+  <text x="670" y="232" text-anchor="middle" font-size="11">不要用 Auto 偷偷改协议</text>
+
+  <!-- Output -->
+  <rect x="790" y="120" width="150" height="50" rx="8" fill="#e6f4ea" stroke="#1a7f37" stroke-width="2"/>
+  <text x="865" y="142" text-anchor="middle" font-size="11" font-weight="bold">action_chunk (32, 20)</text>
+  <text x="865" y="158" text-anchor="middle" font-size="10">→ trim 前 6 → sim</text>
+
+  <!-- Arrows -->
+  <line x1="150" y1="75" x2="178" y2="75" stroke="#1f6feb" stroke-width="2" marker-end="url(#arrow)"/>
+  <line x1="150" y1="145" x2="178" y2="145" stroke="#1f6feb" stroke-width="2" marker-end="url(#arrow)"/>
+  <line x1="150" y1="215" x2="178" y2="215" stroke="#1f6feb" stroke-width="2" marker-end="url(#arrow)"/>
+  <line x1="340" y1="75" x2="368" y2="75" stroke="#1f6feb" stroke-width="2" marker-end="url(#arrow)"/>
+  <line x1="340" y1="145" x2="368" y2="145" stroke="#1f6feb" stroke-width="2" marker-end="url(#arrow)"/>
+  <line x1="550" y1="145" x2="578" y2="145" stroke="#1f6feb" stroke-width="2" marker-end="url(#arrow)"/>
+  <line x1="760" y1="145" x2="788" y2="145" stroke="#1f6feb" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <!-- Latency note -->
+  <rect x="180" y="290" width="600" height="60" rx="8" fill="#fff8e6" stroke="#d29922" stroke-width="2"/>
+  <text x="480" y="310" text-anchor="middle" font-size="12" font-weight="bold">Latency math (codex 校正)</text>
+  <text x="480" y="328" text-anchor="middle" font-size="11">0.9B bf16 forward ≈ 30-50 ms/iter × 10 iterations = <b>300-500 ms / chunk inference</b></text>
+  <text x="480" y="344" text-anchor="middle" font-size="11">→ 必须 chunk_size=32 训练长上下文 + <b>n_action_steps=8 重规划周期 (266ms)</b>，吞吐才正</text>
+</svg>
+
+<h3>1.1 模型内部结构（实际代码逐行确认）</h3>
+
+<p>X-VLA <b>不是单一 LLM/VLM 微调</b>，是 <b>Microsoft Florence2 (VLM) + 自研 SoftPromptedTransformer (policy 主干)</b> 的拼装。</p>
+
+<table>
+<tr><th>组件</th><th>来源</th><th>实现</th><th>参数估算</th></tr>
+<tr><td><b>Florence2 VLM</b></td><td>Microsoft 2024（<code>modeling_florence2.py:1 Copyright</code>）</td><td>DaViT vision tower + BART encoder-decoder language model；X-VLA 仅用 <b>vision tower + language encoder</b>，不用 decoder</td><td>~0.23B (base) ~ 0.77B (large)</td></tr>
+<tr><td><b>SoftPromptedTransformer</b></td><td>X-VLA 自研（<code>soft_transformer.py:292</code>）</td><td>24 层标准 pre-LN Transformer block（vanilla MHSA + MLP），<b>没有特殊架构</b>。Innovations 在 4 个外围模块（见下）</td><td>~0.66B（depth=24, hidden=1024, mlp_ratio=4）</td></tr>
+<tr><td><b>合计</b></td><td>—</td><td>—</td><td><b>~0.9B</b> ✓</td></tr>
+</table>
+
+<h4>X-VLA 的 4 个 custom design</h4>
+<table>
+<tr><th>组件</th><th>位置</th><th>作用</th></tr>
+<tr><td><code>DomainAwareLinear</code></td><td><code>soft_transformer.py:215</code></td><td>每个 domain 一套 fc/bias 参数（存在 nn.Embedding 里），输入 (x, domain_id) 用对应 domain 的 weight 做线性变换。<b>30 个机器人 embodiment = 30 套独立 linear 权重</b></td></tr>
+<tr><td><code>soft_prompt_hub</code></td><td><code>soft_transformer.py:340</code></td><td><code>nn.Embedding(30, 32*1024)</code> — 每个 domain 学 32 个 1024 维 soft prompt token，作为额外输入序列拼到主干</td></tr>
+<tr><td>rectified-flow loss</td><td><code>modeling_xvla.py:225</code></td><td><code>action_noisy = noise*t + action*(1-t)</code>，model 预测 noise；推理从 N(0,1) 起步迭代 10 步去噪</td></tr>
+<tr><td><code>timestep_embedding</code></td><td><code>soft_transformer.py:183</code></td><td>sinusoidal time encoding（同 DDPM/Diffusion），让 model 知道当前噪声 level</td></tr>
+</table>
+
+<h4>内部数据流（前向）</h4>
+
+<svg width="980" height="540" viewBox="0 0 980 540" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="ai" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#1f6feb" />
+    </marker>
+    <marker id="ai2" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#cf222e" />
+    </marker>
+  </defs>
+
+  <text x="490" y="25" font-weight="bold" font-size="14" text-anchor="middle">X-VLA 内部数据流（训练 forward）</text>
+
+  <!-- ============= LAYER 1: INPUTS ============= -->
+  <rect x="10" y="50" width="200" height="40" rx="6" fill="#e6f0ff" stroke="#1f6feb" stroke-width="2"/>
+  <text x="110" y="68" text-anchor="middle" font-size="11" font-weight="bold">pixel_values (B, V, 3, H, W)</text>
+  <text x="110" y="84" text-anchor="middle" font-size="10">multi-view 224×224</text>
+
+  <rect x="10" y="100" width="200" height="40" rx="6" fill="#e6f0ff" stroke="#1f6feb" stroke-width="2"/>
+  <text x="110" y="118" text-anchor="middle" font-size="11" font-weight="bold">input_ids (B, L_text)</text>
+  <text x="110" y="134" text-anchor="middle" font-size="10">"Grab orange..." via BART tok</text>
+
+  <rect x="10" y="150" width="200" height="40" rx="6" fill="#e6f0ff" stroke="#1f6feb" stroke-width="2"/>
+  <text x="110" y="168" text-anchor="middle" font-size="11" font-weight="bold">proprio (B, 32)</text>
+  <text x="110" y="184" text-anchor="middle" font-size="10">SO-101 6D + pad → 32</text>
+
+  <rect x="10" y="200" width="200" height="40" rx="6" fill="#e6f0ff" stroke="#1f6feb" stroke-width="2"/>
+  <text x="110" y="218" text-anchor="middle" font-size="11" font-weight="bold">domain_id (B,) = 0</text>
+  <text x="110" y="234" text-anchor="middle" font-size="10">embodiment slot selector</text>
+
+  <rect x="10" y="250" width="200" height="40" rx="6" fill="#ffeef0" stroke="#cf222e" stroke-width="2"/>
+  <text x="110" y="268" text-anchor="middle" font-size="11" font-weight="bold">action_clean (B, 32, 20)</text>
+  <text x="110" y="284" text-anchor="middle" font-size="10">GT chunk (target)</text>
+
+  <!-- Noise injection -->
+  <rect x="10" y="305" width="200" height="55" rx="6" fill="#fff8e6" stroke="#d29922" stroke-width="2"/>
+  <text x="110" y="323" text-anchor="middle" font-size="11" font-weight="bold">采样 t ~ U(0,1)</text>
+  <text x="110" y="339" text-anchor="middle" font-size="10">action_noisy = ε*t + action*(1-t)</text>
+  <text x="110" y="354" text-anchor="middle" font-size="10">→ (B, 32, 20)</text>
+
+  <!-- ============= LAYER 2: FLORENCE2 VLM ============= -->
+  <rect x="240" y="50" width="220" height="180" rx="8" fill="#fff8e6" stroke="#d29922" stroke-width="3"/>
+  <text x="350" y="75" text-anchor="middle" font-size="13" font-weight="bold">Florence2 VLM (Microsoft)</text>
+  <text x="350" y="92" text-anchor="middle" font-size="10" fill="#555">~0.23B-0.77B, frozen</text>
+
+  <rect x="255" y="105" width="190" height="35" rx="4" fill="#fffaf0" stroke="#d29922" stroke-width="1"/>
+  <text x="350" y="122" text-anchor="middle" font-size="10" font-weight="bold">DaViT vision encoder</text>
+  <text x="350" y="135" text-anchor="middle" font-size="9">image → tokens (V, T_img, D)</text>
+
+  <rect x="255" y="148" width="190" height="35" rx="4" fill="#fffaf0" stroke="#d29922" stroke-width="1"/>
+  <text x="350" y="165" text-anchor="middle" font-size="10" font-weight="bold">BART text embeddings</text>
+  <text x="350" y="178" text-anchor="middle" font-size="9">input_ids → (B, L_text, D)</text>
+
+  <rect x="255" y="190" width="190" height="35" rx="4" fill="#fffaf0" stroke="#d29922" stroke-width="1"/>
+  <text x="350" y="207" text-anchor="middle" font-size="10" font-weight="bold">BART language encoder</text>
+  <text x="350" y="220" text-anchor="middle" font-size="9">merged image+text → vlm_features</text>
+
+  <text x="350" y="248" text-anchor="middle" font-size="10" fill="#555">decoder NOT used</text>
+
+  <!-- ============= LAYER 3: SoftPromptedTransformer ============= -->
+  <rect x="490" y="50" width="290" height="430" rx="8" fill="#e6f4ea" stroke="#1a7f37" stroke-width="3"/>
+  <text x="635" y="75" text-anchor="middle" font-size="13" font-weight="bold">SoftPromptedTransformer (custom)</text>
+  <text x="635" y="92" text-anchor="middle" font-size="10" fill="#555">~0.66B, hidden=1024, depth=24</text>
+
+  <!-- Action encoder (DomainAwareLinear) -->
+  <rect x="505" y="110" width="260" height="55" rx="4" fill="#f0f7f3" stroke="#1a7f37" stroke-width="1"/>
+  <text x="635" y="128" text-anchor="middle" font-size="11" font-weight="bold">action_encoder = DomainAwareLinear</text>
+  <text x="635" y="143" text-anchor="middle" font-size="9">in: cat(action_noisy, proprio, time_emb)</text>
+  <text x="635" y="158" text-anchor="middle" font-size="9">→ (B, 32, 1024) action tokens</text>
+
+  <!-- Visual projector -->
+  <rect x="505" y="173" width="260" height="42" rx="4" fill="#f0f7f3" stroke="#1a7f37" stroke-width="1"/>
+  <text x="635" y="190" text-anchor="middle" font-size="11" font-weight="bold">vlm_proj + aux_visual_proj</text>
+  <text x="635" y="206" text-anchor="middle" font-size="9">Linear（or DomainAwareLinear）→ 1024</text>
+
+  <!-- Soft prompts -->
+  <rect x="505" y="223" width="260" height="42" rx="4" fill="#f0f7f3" stroke="#1a7f37" stroke-width="1"/>
+  <text x="635" y="240" text-anchor="middle" font-size="11" font-weight="bold">soft_prompt_hub[domain_id]</text>
+  <text x="635" y="256" text-anchor="middle" font-size="9">Embedding(30, 32×1024) → (B, 32, 1024)</text>
+
+  <!-- Concat -->
+  <rect x="505" y="273" width="260" height="30" rx="4" fill="#fff" stroke="#1a7f37" stroke-width="1" stroke-dasharray="3,2"/>
+  <text x="635" y="293" text-anchor="middle" font-size="10" font-weight="bold">concat → x: (B, T_total, 1024)</text>
+
+  <!-- 24 Transformer Blocks -->
+  <rect x="505" y="312" width="260" height="100" rx="4" fill="#d4e9d9" stroke="#1a7f37" stroke-width="1"/>
+  <text x="635" y="332" text-anchor="middle" font-size="12" font-weight="bold">× 24 TransformerBlock</text>
+  <text x="635" y="350" text-anchor="middle" font-size="10">pre-LN MHSA (full bidirectional)</text>
+  <text x="635" y="365" text-anchor="middle" font-size="10">+ residual</text>
+  <text x="635" y="382" text-anchor="middle" font-size="10">pre-LN MLP (4× expansion)</text>
+  <text x="635" y="397" text-anchor="middle" font-size="10">+ residual</text>
+
+  <!-- Action decoder -->
+  <rect x="505" y="420" width="260" height="50" rx="4" fill="#f0f7f3" stroke="#1a7f37" stroke-width="1"/>
+  <text x="635" y="438" text-anchor="middle" font-size="11" font-weight="bold">action_decoder = DomainAwareLinear</text>
+  <text x="635" y="453" text-anchor="middle" font-size="9">取前 32 action token → (B, 32, 20)</text>
+  <text x="635" y="466" text-anchor="middle" font-size="9">→ pred_action</text>
+
+  <!-- ============= LAYER 4: OUTPUT ============= -->
+  <rect x="810" y="220" width="160" height="60" rx="6" fill="#ffeef0" stroke="#cf222e" stroke-width="2"/>
+  <text x="890" y="242" text-anchor="middle" font-size="11" font-weight="bold">action_space</text>
+  <text x="890" y="258" text-anchor="middle" font-size="10">compute_loss(pred, GT)</text>
+  <text x="890" y="272" text-anchor="middle" font-size="10">MSE/BCE per dim</text>
+
+  <rect x="810" y="300" width="160" height="50" rx="6" fill="#fff" stroke="#1a7f37" stroke-width="2"/>
+  <text x="890" y="320" text-anchor="middle" font-size="11" font-weight="bold">loss → backward</text>
+  <text x="890" y="336" text-anchor="middle" font-size="10">仅 backbone unfrozen 部分</text>
+
+  <!-- Arrows: Inputs → Florence2 -->
+  <line x1="210" y1="70" x2="238" y2="120" stroke="#1f6feb" stroke-width="1.5" marker-end="url(#ai)"/>
+  <line x1="210" y1="120" x2="238" y2="165" stroke="#1f6feb" stroke-width="1.5" marker-end="url(#ai)"/>
+
+  <!-- Florence2 → Soft transformer -->
+  <line x1="460" y1="190" x2="503" y2="190" stroke="#1f6feb" stroke-width="2" marker-end="url(#ai)"/>
+  <text x="478" y="183" font-size="9" fill="#555">vlm_features</text>
+
+  <!-- Inputs → Soft transformer (action / proprio / domain) -->
+  <path d="M 210 170 Q 350 350 503 138" fill="none" stroke="#1f6feb" stroke-width="1.5" stroke-dasharray="3,2" marker-end="url(#ai)"/>
+  <path d="M 210 220 Q 350 380 503 240" fill="none" stroke="#1f6feb" stroke-width="1.5" stroke-dasharray="3,2" marker-end="url(#ai)"/>
+  <path d="M 210 330 Q 350 400 503 138" fill="none" stroke="#cf222e" stroke-width="1.5" stroke-dasharray="3,2" marker-end="url(#ai2)"/>
+
+  <!-- Inside soft transformer arrows -->
+  <line x1="635" y1="165" x2="635" y2="171" stroke="#1a7f37" stroke-width="1.5" marker-end="url(#ai)"/>
+  <line x1="635" y1="215" x2="635" y2="221" stroke="#1a7f37" stroke-width="1.5" marker-end="url(#ai)"/>
+  <line x1="635" y1="265" x2="635" y2="271" stroke="#1a7f37" stroke-width="1.5" marker-end="url(#ai)"/>
+  <line x1="635" y1="303" x2="635" y2="310" stroke="#1a7f37" stroke-width="2" marker-end="url(#ai)"/>
+  <line x1="635" y1="412" x2="635" y2="418" stroke="#1a7f37" stroke-width="2" marker-end="url(#ai)"/>
+
+  <!-- Soft transformer → output -->
+  <line x1="765" y1="445" x2="850" y2="270" stroke="#cf222e" stroke-width="2" marker-end="url(#ai2)"/>
+  <text x="800" y="360" font-size="9" fill="#cf222e">pred (B,32,20)</text>
+
+  <!-- Loss → back -->
+  <line x1="890" y1="300" x2="890" y2="290" stroke="#1a7f37" stroke-width="1.5" marker-end="url(#ai)"/>
+
+  <!-- Legend -->
+  <rect x="10" y="430" width="200" height="100" rx="6" fill="#f8f8f8" stroke="#999" stroke-width="1"/>
+  <text x="110" y="448" text-anchor="middle" font-size="11" font-weight="bold">推理时 (inference) 区别</text>
+  <text x="20" y="467" font-size="10">• 从 x_t = N(0, 1) 起步</text>
+  <text x="20" y="481" font-size="10">• for i in range(10, 0, -1):</text>
+  <text x="20" y="494" font-size="10">　 t = i/10 → forward → 更新</text>
+  <text x="20" y="508" font-size="10">• 共 10 次 forward / chunk</text>
+  <text x="20" y="522" font-size="10" fill="#cf222e">→ latency × 10</text>
+</svg>
+
+<p><b>读图要点</b>：</p>
+<ul>
+<li>Florence2 是 <b>外购的 Microsoft VLM</b>，X-VLA 把它当 frozen 视觉/语言编码器使用，不动其权重</li>
+<li>真正的 X-VLA 创新在 <b>policy transformer 的外围</b>（DomainAwareLinear 让 30 个 embodiment 共享主干但有独立 linear 投影；soft_prompt_hub 让每个 embodiment 学独立的 prompt prefix；rectified-flow 风格的训练/推理）</li>
+<li>主干本身（24 层 TransformerBlock）是 <b>vanilla pre-LN Transformer</b>，<b>没有 causal mask</b>（全 bidirectional attn），跟 OFT 论文那种 "action position bidirectional + lm causal" 不同</li>
+<li>训练单 forward，推理 <b>10 次 forward</b>（rectified-flow 去噪循环）</li>
+</ul>
+
+<table>
+<tr><th>config 字段（来自 <code>configuration_xvla.py</code> 默认）</th><th>值</th><th>含义</th></tr>
+<tr><td><code>hidden_size / depth / num_heads</code></td><td>1024 / 24 / 16</td><td>policy transformer ≈ 0.9B 主体</td></tr>
+<tr><td><code>chunk_size</code> / <code>n_action_steps</code></td><td>32 / 32</td><td><b>一次 forward 出 32 步动作</b>（比 OFT 8 长 4 倍）</td></tr>
+<tr><td><code>num_domains</code> / <code>len_soft_prompts</code></td><td>30 / 32</td><td>30 种机器人 embodiment，各 32 个 soft prompt token</td></tr>
+<tr><td><code>num_denoising_steps</code></td><td>10</td><td>flow-matching / 类 diffusion 风格的 chunk 解码</td></tr>
+<tr><td><code>action_mode</code></td><td><code>"ee6d"</code> 默认</td><td>支持 ee6d / joint / auto / so101_bimanual / agibot_ee6d / franka_joint7</td></tr>
+<tr><td><code>max_state_dim / max_action_dim</code></td><td>32 / 20</td><td>所有 embodiment 共享的 padding 维度</td></tr>
+<tr><td><code>tokenizer_name</code></td><td><code>facebook/bart-large</code></td><td>语言 prompt 用 BART encoder</td></tr>
+<tr><td><code>use_proprio</code></td><td>True</td><td>带 proprio 输入（我们用 6D state）</td></tr>
+</table>
+
+<h2>2. 我们的 6D SO-101 单臂 → X-VLA 对接 contract（v2）</h2>
+
+<div class="callout bad">
+<b>🔴 codex 校正：AutoActionSpace 是偷偷改协议，不是"通用入口"。</b><br/>
+预训练 action head 有严格的 <b>channel semantics</b>（EE6D 把 gripper 放在 idx 9/19；BimanualSO101 在 5/11）。AutoActionSpace 把 6D 硬塞前 6 dim 等于发明新 wire format，**预训练 head 参数对不上你的语义**，迁移收益只剩 backbone。
+</div>
+
+<table>
+<tr><th>方案</th><th>怎么做</th><th>优</th><th>缺</th><th>v2 评价</th></tr>
+<tr><td><b>A. AutoActionSpace</b></td><td><code>action_mode="auto"</code>, <code>real_dim=6, max_dim=20</code></td><td>零代码</td><td>偷改 channel layout → 预训练 head 失效</td><td>🟡 仅作"快速看起来跑得动"的 baseline</td></tr>
+<tr><td><b>B. SingleArmSO101JointActionSpace（v2 默认）</b></td><td>仿 <code>BimanualSO101ActionSpace</code>，<code>REAL_DIM=6, gripper_idx=(5,), dim_action=20</code>，注册 <code>@register_action("so101_single")</code></td><td>显式 channel semantics 跟预训练 head 对齐（gripper 在 idx 5，joints 在 0-4）；继承 BimanualSO101 的 MSE+BCE 损失分流</td><td>需写 ~80 行子类 + 决定 gripper 是 binary（BCE）还是 continuous（MSE）</td><td>🟢 <b>v2 推荐</b></td></tr>
+<tr><td><b>C. BimanualSO101 + 屏蔽右臂</b></td><td>用 12-dim 双臂，前 6 dim 单臂，后 6 dim 0 + mask loss</td><td>action_hub 完全不动</td><td>半屏蔽脏耦合，gripper_idx=(5,11) 跟单臂 (5,) 半对齐</td><td>❌ 拒</td></tr>
+</table>
+
+<h3>2.1 Gripper 决策（关键）</h3>
+<p>SO-101 dataset gripper 是 <b>continuous degrees</b>（2.4° 夹紧 → 58.3° 张开）。两种处理：</p>
+<table>
+<tr><th>策略</th><th>Loss</th><th>X-VLA pretrained 期望</th><th>风险</th></tr>
+<tr><td>continuous (norm 到 [-1,1])</td><td>MSE</td><td>未知（可能期望 binary）</td><td>预训练 gripper bias 可能误导</td></tr>
+<tr><td>binarize (threshold @ ~30°)</td><td>BCE</td><td>EE6D/BimanualSO101 头都用 BCE，对齐</td><td>损失 gripper 速度信息，部署时需 thresh→degree 反推</td></tr>
+</table>
+<p><b>v2 推荐</b>：先 continuous + MSE 跑（B 方案），保留 dataset 原始度数信号。如 ckpt-2000 gripper 闭合精度差，再 binarize 试 BCE 版。</p>
+
+<h3>2.2 数据契约（必须显式配，不靠默认）</h3>
+<table>
+<tr><th>项</th><th>X-VLA 默认（坑）</th><th>v2 显式策略</th></tr>
+<tr><td>state/action normalization</td><td><code>IDENTITY</code> — 度数原样喂模型</td><td><b>显式配 <code>MEAN_STD</code></b>（state）+ <b><code>MIN_MAX</code></b>（action），让 dataset stats 接管</td></tr>
+<tr><td>chunk_size / n_action_steps</td><td>32 / 32 = 1.07s open-loop（codex 🔴 #5）</td><td>训练 chunk_size=32 保留长上下文，<b>n_action_steps=8</b>（266ms 重规划周期）</td></tr>
+<tr><td>domain_id</td><td>不传 → slot 0</td><td><b>显式配 <code>domain_id=0</code></b>（不冒险用 29 期待 fresh，那是 codex 🔴 #2）</td></tr>
+<tr><td>freeze flags</td><td>注释说"frozen by default"但默认值都 False（codex 抓到的 bug）</td><td><b>显式 <code>--policy.freeze_vision_encoder=true --policy.freeze_language_encoder=true</code></b></td></tr>
+<tr><td>proprio (state)</td><td><code>use_proprio=True, max_state_dim=32</code></td><td>保留默认；6D state 自动 pad 到 32</td></tr>
+<tr><td>image input</td><td>(B, num_views, C, H, W)</td><td>front + wrist 480×640 → <code>resize_imgs_with_padding=[224,224]</code></td></tr>
+<tr><td>language</td><td>BART tok max_length=64</td><td>"Grab orange and place into plate"</td></tr>
+</table>
+
+<h3>2.1 数据契约 contract（必须钉死）</h3>
+<table>
+<tr><th>项</th><th>X-VLA 期望</th><th>我们 LeRobot v3 dataset</th><th>动作</th></tr>
+<tr><td>Action format</td><td>chunk_size=32 future steps</td><td>逐帧 30Hz action</td><td>collator 切 32 连续 frame</td></tr>
+<tr><td>Action range</td><td>归一化到 [-1, 1]（或按 action_space 自己 normalize）</td><td>joint degrees [-99, 100]，gripper [2.4, 58.3]</td><td>按 (q01, q99) 归一化到 [-1, 1]，或交给 lerobot Normalize processor</td></tr>
+<tr><td>Gripper representation</td><td>BCE 暗示 binary [0, 1]</td><td>continuous 度数</td><td><b>关键决策点</b>：方案 A 不需要 binarize（MSE 通吃），方案 B 必须 binarize（如 threshold=30°）</td></tr>
+<tr><td>Proprio (state)</td><td><code>OBS_STATE</code> shape (B, dim_proprio)，pad 到 32</td><td>(B, 6) joint position</td><td>lerobot 内部 <code>pad_vector</code> 自动处理</td></tr>
+<tr><td>Image input</td><td>(B, num_views, C, H, W)</td><td>front + wrist 480×640</td><td><code>resize_imgs_with_padding</code> 配 224×224 letterbox</td></tr>
+<tr><td>Language</td><td>BART tok max_length=64</td><td>"Grab orange and place into plate"</td><td>直接喂，无 wrap 模板</td></tr>
+<tr><td>Domain id</td><td>0..29 选一个（30 个 embodiment 槽位）</td><td>—</td><td>需要决策：用某个 SO-101 已训过的 domain id（如 BimanualSO101 对应那个），或新建一个 domain</td></tr>
+</table>
+
+<h2>3. Base ckpt 选择</h2>
+
+<table>
+<tr><th>HF repo</th><th>DL / Likes</th><th>说明</th><th>推荐</th></tr>
+<tr><td><code>lerobot/xvla-base</code></td><td><b>3.86k / 20</b></td><td>通用 cross-embodiment 预训练 base，未做下游任务特化</td><td>🥇 <b>首选</b></td></tr>
+<tr><td><code>lerobot/xvla-libero</code></td><td>1.52k / 4</td><td>LIBERO benchmark 特化</td><td>🥈 备选（任务相似度高，但 LIBERO 是 Panda，embodiment 远）</td></tr>
+<tr><td><code>lerobot/xvla-widowx</code></td><td>855 / 4</td><td>WidowX 单臂特化（embodiment 最像 SO-101）</td><td>🥉 备选（embodiment 友好，但 task 不一定 pick-place）</td></tr>
+<tr><td><code>lerobot/xvla-folding</code></td><td>105 / 12</td><td>叠衣服特化任务</td><td>✗</td></tr>
+<tr><td><code>lerobot/xvla-google-robot</code> / <code>xvla-agibot-world</code></td><td>9 / 7/4</td><td>不同机器人特化</td><td>✗</td></tr>
+</table>
+
+<p><b>为什么 xvla-base 而不是 xvla-widowx</b>：base 训过 30 个 domain 的 soft prompts，转移到新 embodiment 时**只需要学一个新 domain 的 32 token soft prompt**，主干完全保留。任务特化 ckpt 的 soft prompts 已经偏向特定 domain，对我们 SO-101 的迁移收益小。</p>
+
+<h2>4. 资源估算 — 0.9B 不是事</h2>
+
+<table>
+<tr><th>项</th><th>bf16 LoRA（默认推荐）</th><th>QLoRA NF4（备选）</th></tr>
+<tr><td>Base 0.9B 权重</td><td>~1.8 GB</td><td>~0.5 GB</td></tr>
+<tr><td>Soft prompts（32 × 30 × 1024）</td><td>~0.01 GB</td><td>~0.01 GB</td></tr>
+<tr><td>LoRA r=32 (attention)</td><td>~0.06 GB</td><td>~0.06 GB</td></tr>
+<tr><td>Optimizer (AdamW fp32)</td><td>~0.1 GB（只对 trainable）</td><td>~0.1 GB</td></tr>
+<tr><td>Activations (batch=4, chunk=32, no grad_ckpt)</td><td>~5-7 GB</td><td>~5-7 GB</td></tr>
+<tr><td><b>合计</b></td><td><b>~7-9 GB</b> <span class="tag-good">✅ 余量 15GB+</span></td><td><b>~6-8 GB</b> <span class="tag-good">✅</span></td></tr>
+</table>
+
+<p><b>结论：bf16 LoRA 即可，不必上 QLoRA</b>。0.9B 全精度都不挤显存，去掉 bnb 4-bit 的 flaky bug（vanilla OpenVLA 那 4 类 crash）= 大幅简化训练稳定性。</p>
+
+<h2>5. 训练 launcher — 100% 复用 lerobot 原生（v2 CLI 校正）</h2>
+
+<p>X-VLA 已注册到 lerobot policy registry（<code>@PreTrainedConfig.register_subclass("xvla")</code>），entry 是 <b><code>lerobot.scripts.lerobot_train</code></b>（不是 <code>scripts.train</code>），pretrained 字段是 <b><code>--policy.path</code></b>（不是 <code>--policy.pretrained_path</code>，codex 🔴 #3）。</p>
+
+<pre># LeIsaac/scripts/finetune/xvla/train.sh  (~40 行, v2 修订)
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+LEISAAC_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+LEROBOT_ROOT="${LEROBOT_ROOT:-$HOME/work/lerobot-experience/lerobot}"
+
+CONDA_ENV="${CONDA_ENV:-lerobot}"
+OUTPUT_DIR="${OUTPUT_DIR:-$LEISAAC_ROOT/outputs/xvla-leisaac-pick-orange}"
+DATASET_DIR="${DATASET_DIR:-$LEISAAC_ROOT/datasets/raw/leisaac-pick-orange}"
+BASE_CKPT="${BASE_CKPT:-lerobot/xvla-base}"
+
+cd "$LEROBOT_ROOT"
+exec conda run -n "$CONDA_ENV" --no-capture-output \
+    python -m lerobot.scripts.lerobot_train \
+        --policy.type=xvla \
+        --policy.path="$BASE_CKPT" \
+        --policy.chunk_size=32 \
+        --policy.n_action_steps=8 \
+        --policy.action_mode=so101_single \
+        --policy.max_state_dim=32 \
+        --policy.max_action_dim=20 \
+        --policy.freeze_vision_encoder=true \
+        --policy.freeze_language_encoder=true \
+        --policy.train_policy_transformer=true \
+        --policy.train_soft_prompts=true \
+        --policy.normalization_mapping.STATE=MEAN_STD \
+        --policy.normalization_mapping.ACTION=MIN_MAX \
+        --policy.domain_feature_key=null \
+        --policy.num_denoising_steps=10 \
+        --policy.resize_imgs_with_padding="[224,224]" \
+        --dataset.repo_id=local \
+        --dataset.root="$DATASET_DIR" \
+        --output_dir="$OUTPUT_DIR" \
+        --batch_size=4 --num_workers=4 \
+        --steps=10000 --save_freq=500 \
+        --optimizer.type=xvla_adamw \
+        --optimizer.lr=1e-4 \
+        --scheduler.type=cosine_decay_with_warmup --scheduler.num_warmup_steps=200
+</pre>
+
+<p><b>v2 主要变化（vs v1 / codex 🔴 修复）</b>：</p>
+<ul>
+<li><code>scripts.train</code> → <code>scripts.lerobot_train</code>（codex 🔴 #3）</li>
+<li><code>--policy.pretrained_path</code> → <code>--policy.path</code>（codex 🔴 #3）</li>
+<li><code>--policy.n_action_steps=32 → 8</code>（codex 🔴 #5，266ms 重规划周期 vs 1.07s open-loop）</li>
+<li><code>--policy.action_mode=auto → so101_single</code>（codex 🔴 #4，自写子类后用我们注册的名字；如果暂时没写子类，回退 auto 但接受预训练 head 失效的代价）</li>
+<li>显式 <code>normalization_mapping</code> 防 IDENTITY 默认值陷阱（codex 🔴 #6）</li>
+<li>显式 <code>freeze_vision/language_encoder=true</code>（codex 抓到的注释 vs 默认值不一致 bug）</li>
+<li>显式 <code>num_denoising_steps=10</code>（确认 v1 latency 估算缺失）</li>
+</ul>
+
+<h2>6. Implementation Phases（v2，含 codex 修复）</h2>
+
+<table>
+<tr><th>Phase</th><th>步骤</th><th>时间预算</th></tr>
+<tr><td><b>P0a</b></td><td>下载 <code>lerobot/xvla-base</code> + cat <code>config.json</code>，比对 <code>chunk_size / num_domains / max_action_dim / num_denoising_steps</code> 跟我们 train.sh 参数一致</td><td>~30min</td></tr>
+<tr><td><b>P0b</b></td><td>读 <code>modeling_xvla.py</code> 行 200-260（训练 + 推理）确认 rectified-flow loss / 10-step denoise loop 实现；测量 1 次 chunk inference 实际 latency</td><td>~45min</td></tr>
+<tr><td><b>P0c</b></td><td>读 <code>processor_xvla.py</code> + <code>configs/parser.py</code>，<b>确认 CLI flag 名（policy.path / freeze 字段 / normalization）跟我们 train.sh 一致</b></td><td>~30min</td></tr>
+<tr><td><b>P0d</b></td><td>写 <code>SingleArmSO101JointActionSpace</code> 子类（仿 <code>BimanualSO101</code>，<code>REAL_DIM=6, gripper_idx=(5,)</code>），注册 <code>@register_action("so101_single")</code></td><td>~1h</td></tr>
+<tr><td><b>P0e</b></td><td>验证 LeRobot v3.0 parquet 跟 lerobot trainer 内置 dataset loader 兼容（应该原生支持，但确认 obs 字段映射）</td><td>~30min</td></tr>
+<tr><td>P1</td><td>Smoke：起 lerobot trainer 跑 50 step，看 loss 下降 + GPU 内存 + <b>断言 base ckpt 加载成功</b>（log 里搜"loaded pretrained"）</td><td>~1h</td></tr>
+<tr><td>P2</td><td>Train 10k step，save_freq=500</td><td>~2-3h</td></tr>
+<tr><td>P3</td><td>写 X-VLA inference server（仿 <code>server/openvla_leisaac/server.py</code>，wire format: chunk=8 输出，10-step denoise inference）</td><td>~1.5h</td></tr>
+<tr><td>P4</td><td>GUI eval @ step_hz=30 horizon=8 vs vanilla OpenVLA baseline</td><td>~1h</td></tr>
+</table>
+
+<p><b>总工程预算 ≈ 8-10h</b>（v1 估 6-8h，加上 codex 抓的 P0 工作量）。</p>
+
+<h2>7. 风险清单（v2 codex 整合后）</h2>
+
+<table>
+<tr><th>风险</th><th>概率</th><th>影响</th><th>缓解</th></tr>
+<tr><td><b>🔴 iterative denoising latency × 10 steps = 300-500ms / chunk</b>（不是单 forward）</td><td>确定</td><td>高</td><td>n_action_steps=8 → 266ms 重规划周期；若推理仍跟不上，切 num_denoising_steps=5 或减 chunk_size</td></tr>
+<tr><td><b>🔴 AutoActionSpace 偷偷改协议 → 预训练 action head 失效</b></td><td>确定（若选 A）</td><td>高</td><td>选 B：自写 SingleArmSO101JointActionSpace，让 channel semantics 对齐 BimanualSO101 pattern</td></tr>
+<tr><td><b>🔴 CLI flag 名错（policy.path / lerobot_train）</b></td><td>已发生（v1）</td><td>致命（看似能跑但没加载 base ckpt）</td><td>v2 已校正；P1 smoke 时搜 log "loaded pretrained" 断言</td></tr>
+<tr><td><b>🔴 domain_id 默认 slot 0 + 误以为 "fresh slot 29" 可用</b></td><td>已发生（v1）</td><td>中</td><td>v2 锁定 slot 0；若想 fresh 必须 P0d 加 reinit code（暂不做）</td></tr>
+<tr><td><b>🔴 IDENTITY normalization + 度数原值</b></td><td>已发生（v1）</td><td>高</td><td>v2 显式配 MEAN_STD/MIN_MAX</td></tr>
+<tr><td>🟡 0.9B 容量天花板低于 7B OpenVLA</td><td>中</td><td>中</td><td>GR00T-N1.6（3B）已 2/3 round，证明小模型可行</td></tr>
+<tr><td>🟡 chunk_size=32 训练 / 部署 n_action_steps=8 错配（model 学的是 32 步轨迹但执行只取前 8）</td><td>中</td><td>低</td><td>这是 ACT/SmolVLA 标准做法（chunk_size > n_action_steps）；不应影响 loss 收敛，但需要 P4 实测验证</td></tr>
+<tr><td>🟡 Florence2 vs SigLIP+DINOv2</td><td>—</td><td>低</td><td>论文设计就是 Florence2，照搬</td></tr>
+<tr><td>🟡 LeRobot v3.0 parquet 兼容性</td><td>低</td><td>高</td><td>P0e 验证；SmolVLA / DP / ACT 已成功跑过相同 dataset</td></tr>
+<tr><td>🟡 freeze flag 默认值跟注释打架</td><td>已发生（v1）</td><td>低</td><td>v2 显式传，不靠默认</td></tr>
+<tr><td>🟢 GPU OOM</td><td>极低</td><td>—</td><td>0.9B bf16 全精度都不挤</td></tr>
+<tr><td>🟢 训练 crash</td><td>低</td><td>低</td><td>不用 bnb → 无 vanilla 那 4 类 flaky bug</td></tr>
+</table>
+
+<h2>8. 预期 benchmark 表现</h2>
+
+<table>
+<tr><th>指标</th><th>vanilla OpenVLA-7B（ckpt-2000，预测 ckpt-10000）</th><th>X-VLA QLoRA（目标）</th></tr>
+<tr><td>Strict Rounds 完成数</td><td>0/3 ~ 1/3</td><td><b>1/3 ~ 2/3</b></td></tr>
+<tr><td>橙子完成数</td><td>~2/9</td><td><b>4/9 ~ 6/9</b></td></tr>
+<tr><td>step_hz</td><td>5 Hz</td><td><b>30 Hz</b></td></tr>
+<tr><td>Latency / chunk</td><td>240 ms / 1 action</td><td><b>~30-50 ms / 32 actions = ~1.5 ms 等效</b></td></tr>
+<tr><td>Peak VRAM</td><td>~18 GB</td><td><b>~7-9 GB</b></td></tr>
+<tr><td>训练时间</td><td>~7h (10k step + crashes)</td><td><b>~2-3h</b></td></tr>
+</table>
+
+<h2>9. Pivot 与备份策略</h2>
+
+<ol>
+<li><b>现在 (2026-05-18)</b>：vanilla OpenVLA ckpt-2000，loss 2.94，继续训到 ckpt-5000</li>
+<li><b>ckpt-5000 GUI 验证</b>：观察 gripper 是否能成功夹住任一颗橙子
+    <ul>
+    <li>如果能：vanilla 训完 10k 进 leaderboard，然后做 X-VLA 作为新 family baseline</li>
+    <li>如果不能：杀掉 vanilla，立刻 P0a 开始 X-VLA</li>
+    </ul>
+</li>
+<li><b>X-VLA 完成后</b>：OFT 留为长期 R&D，LingBot 同样降级</li>
+</ol>
+
+<h2>10. 关联记忆</h2>
+<ul>
+<li><code>openvla-finetune-plan</code> — vanilla 计划主线</li>
+<li><code>openvla_oft_finetune_plan.html</code> — 已 codex review 但 deprioritized</li>
+<li><code>leisaac-policy-comparison</code> — 多策略横评</li>
+<li><code>feedback-training-resume-chunks</code> — 长训练拆段</li>
+<li><code>feedback-training-save-policy</code> — ckpt 数量裁剪</li>
+<li><code>feedback-pre-run-gpu-check</code> — 启动前 nvidia-smi</li>
+<li><code>feedback-benchmark-table-sort</code> — README 排序规则</li>
+</ul>
+
+</body>
+</html>

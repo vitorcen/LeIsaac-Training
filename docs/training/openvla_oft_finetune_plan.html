@@ -1,0 +1,323 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>OpenVLA-OFT QLoRA 微调计划 — LeIsaac SO-101 PickOrange</title>
+<style>
+  :root {
+    --bg: #fafafa; --fg: #1a1a1a; --muted: #555;
+    --accent: #1f6feb; --warn: #d29922; --bad: #cf222e; --good: #1a7f37;
+    --code-bg: #f3f3f3; --border: #d0d7de;
+  }
+  body { font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+         background: var(--bg); color: var(--fg);
+         max-width: 1000px; margin: 28px auto; padding: 0 22px; line-height: 1.6; }
+  h1 { border-bottom: 2px solid var(--fg); padding-bottom: 6px; }
+  h2 { margin-top: 36px; border-left: 4px solid var(--accent); padding-left: 10px; }
+  h3 { margin-top: 24px; color: var(--accent); }
+  .en { color: var(--muted); font-style: italic; font-size: 0.92em; }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0; font-size: 0.94em; }
+  th, td { border: 1px solid var(--border); padding: 6px 10px; text-align: left; vertical-align: top; }
+  th { background: #f0f3f6; }
+  code, pre { font-family: "JetBrains Mono", Menlo, Consolas, monospace; }
+  pre { background: var(--code-bg); padding: 12px; border-radius: 4px; overflow-x: auto; font-size: 0.88em; }
+  code { background: var(--code-bg); padding: 1px 5px; border-radius: 3px; }
+  .tag-good { color: var(--good); font-weight: 600; }
+  .tag-warn { color: var(--warn); font-weight: 600; }
+  .tag-bad  { color: var(--bad); font-weight: 600; }
+  .callout { border-left: 4px solid var(--warn); background: #fff8e6; padding: 10px 14px; margin: 14px 0; }
+  .callout.bad { border-color: var(--bad); background: #ffeef0; }
+  .callout.good { border-color: var(--good); background: #e6f4ea; }
+  svg { display: block; margin: 14px auto; }
+  ul { padding-left: 22px; }
+  li { margin: 4px 0; }
+  .meta { color: var(--muted); font-size: 0.9em; }
+</style>
+</head>
+<body>
+
+<h1>OpenVLA-OFT QLoRA 微调计划</h1>
+<p class="meta">SO-101 PickOrange · 第 6 个 fine-tune baseline · pivot from vanilla OpenVLA · 2026-05-18</p>
+<p class="en">Migration plan: vanilla OpenVLA-7B (discrete token, autoregressive) → OpenVLA-OFT (continuous L1, parallel decode, chunked actions).
+The goal is to break the step_hz=5 ceiling and the gripper-precision floor we hit on vanilla.</p>
+
+<h2>0. TL;DR</h2>
+<div class="callout good">
+<b>Pivot 触发条件</b>：vanilla OpenVLA ckpt-2000 GUI 实测显示"机械臂朝目标移动 + 试图抓握 + gripper 差 ~30° 闭不到位"。<br/>
+<b>Why pivot</b>：（1）<b>step_hz 错配</b>本质 — vanilla 单步 token AR @ 240ms/action 强制 sim step_hz=5，训练数据是 30Hz；（2）<b>discrete bin floor</b> — gripper 在 256-bin 离散化下夹紧区只有 ~10 bins。<br/>
+<b>How OFT solves both</b>：parallel decoding + chunked action + continuous L1 loss。<br/>
+<b>Hardware</b>：QLoRA NF4 on 4090（同 vanilla 链路，零工程成本，<b>注意：这是非官方栈，官方用 bf16 LoRA + DDP，4-bit 只用于推理</b>）。
+</div>
+
+<div class="callout bad">
+<b>⚠️ Codex 评审 (2026-05-18) 抓到 3 个真 critical（已修订）+ 1 个误报：</b>
+<ul>
+<li><b>🔴 #1 Architecture</b>：OFT 不是"单 forward 出 (8,6)"。<b>实际：chunk_size × action_dim 个 action positions（chunk=8 + 6D = 48 positions），bidirectional attn 算 hidden，独立 MLP head 按 timestep 聚合</b>。仅改 collator shape + server output shape <b>不够</b>，model contract 必须照官方实现。</li>
+<li><b>🔴 #2 Embodiment gap</b>：LIBERO ckpt 是 <code>ACTION_DIM=7, PROPRIO_DIM=8</code> 写死全局常量。SO-101 是 6D joint + 6D state。<b><code>action_head</code> 和 <code>proprio_projector</code> 权重 shape 完全不匹配，必须 random-init 重训</b>。"libero-spatial 是最佳起点"的论断<b>不成立</b> — 最值钱的两个辅助头反而不能继承。</li>
+<li><b>🔴 #3 QLoRA + HF Trainer 是非官方栈</b>：官方 <code>vla-scripts/finetune.py</code> 是自写 DDP + bf16 LoRA，<b>没有训练时 load_in_4bit</b>。我们继承 vanilla 的 QLoRA-Trainer 路径意味着发明一个 QLoRA-OFT，风险 +1。</li>
+<li><b>🟢 #4 Wire compat broken — 已实测推翻</b>：Pi05ServicePolicyClient 是同步阻塞 ZMQ REQ/REP（不是 lerobot async gRPC），server 慢只会让 client 阻塞等，不会 repeat last_action。<code>policy_inference.py:539</code> 用 <code>for i in range(min(horizon, chunk_size))</code> 按顺序消费 chunk。<b>wire 兼容性 OK</b>。</li>
+</ul>
+</div>
+
+<div class="callout">
+<b>Time alignment（codex 提醒）</b>：OFT label 是 <code>[action[t], action[t+1], ..., action[t+7]]</code>（current + next 7），不是"未来 8"。Absolute action 的尾部 padding 必须 <b>repeat last valid action</b>（不是 0）。<code>obs_t = (image[t], state[t])</code> → 监督 8 个连续 action 起点是 <code>t</code> 不是 <code>t+1</code>。
+</div>
+
+<h2>1. 背景 — 为什么 vanilla 收敛慢且抓不住</h2>
+
+<table>
+<tr><th>问题</th><th>vanilla OpenVLA 实测（ckpt-2000）</th><th>OFT 是否解决</th></tr>
+<tr><td>Inference latency / action</td><td>200-240 ms（实测）</td><td><span class="tag-good">✅</span> chunk=8 / forward ≈ 30-50 ms</td></tr>
+<tr><td>Eval step_hz</td><td><span class="tag-bad">5 Hz（被 latency 限制）</span></td><td><span class="tag-good">✅</span> 可恢复 30 Hz</td></tr>
+<tr><td>训练/serve 时间尺度</td><td>30Hz 学 / 5Hz 服务 → <b>每步 200ms 撑住 33ms 的 target</b></td><td><span class="tag-good">✅</span> chunk=8 摊薄到对齐</td></tr>
+<tr><td>Action 精度（gripper）</td><td><span class="tag-bad">256 bin × (q01,q99)=(2.4°,58.3°) → 0.22°/bin，夹紧区仅 ~10 bins</span></td><td><span class="tag-good">✅</span> 连续 L1 回归无量化损失</td></tr>
+<tr><td>训练数据稀缺（grasp transition）</td><td>1-2% 帧</td><td><span class="tag-warn">⚠️ 同样存在</span>（chunk 摊薄略缓解）</td></tr>
+</table>
+
+<p class="en">Vanilla failure mode: arm reaches toward target but gripper closes too slowly because each predicted "Δ ≈ 0.5° / 33ms" gets executed for 200ms in sim — 6× time-stretched. By the end of an episode the arm has only made ~300 sim steps instead of the 1800 the training distribution implicitly assumed.</p>
+
+<h2>2. OpenVLA-OFT 架构核心差异</h2>
+
+<svg width="940" height="380" viewBox="0 0 940 380" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#1f6feb" />
+    </marker>
+  </defs>
+
+  <!-- Vanilla path -->
+  <text x="220" y="30" font-weight="bold" font-size="14" text-anchor="middle">Vanilla OpenVLA-7B</text>
+  <rect x="20" y="50" width="120" height="60" rx="8" fill="#e6f0ff" stroke="#1f6feb" stroke-width="2"/>
+  <text x="80" y="80" text-anchor="middle" font-size="12">obs (img+state)</text>
+  <text x="80" y="98" text-anchor="middle" font-size="12">+ prompt</text>
+
+  <rect x="170" y="50" width="160" height="60" rx="8" fill="#fff8e6" stroke="#d29922" stroke-width="2"/>
+  <text x="250" y="76" text-anchor="middle" font-size="12" font-weight="bold">Llama backbone</text>
+  <text x="250" y="93" text-anchor="middle" font-size="11">autoregressive</text>
+  <text x="250" y="106" text-anchor="middle" font-size="11">single token / step</text>
+
+  <rect x="360" y="50" width="170" height="60" rx="8" fill="#ffeef0" stroke="#cf222e" stroke-width="2"/>
+  <text x="445" y="76" text-anchor="middle" font-size="12" font-weight="bold">6 tokens AR decode</text>
+  <text x="445" y="93" text-anchor="middle" font-size="11">256-bin discrete</text>
+  <text x="445" y="106" text-anchor="middle" font-size="11" fill="#cf222e">~240 ms / action</text>
+
+  <line x1="140" y1="80" x2="168" y2="80" stroke="#1f6feb" stroke-width="2" marker-end="url(#arr)"/>
+  <line x1="330" y1="80" x2="358" y2="80" stroke="#1f6feb" stroke-width="2" marker-end="url(#arr)"/>
+
+  <text x="220" y="150" font-size="12" fill="#555">→ sim @ step_hz=5（被 latency 限制）</text>
+
+  <!-- Divider -->
+  <line x1="0" y1="180" x2="940" y2="180" stroke="#999" stroke-dasharray="4,3"/>
+
+  <!-- OFT path -->
+  <text x="220" y="210" font-weight="bold" font-size="14" text-anchor="middle">OpenVLA-OFT (parallel + chunked)</text>
+  <rect x="20" y="230" width="120" height="60" rx="8" fill="#e6f0ff" stroke="#1f6feb" stroke-width="2"/>
+  <text x="80" y="260" text-anchor="middle" font-size="12">obs (img+state)</text>
+  <text x="80" y="278" text-anchor="middle" font-size="12">+ prompt</text>
+
+  <rect x="170" y="230" width="160" height="60" rx="8" fill="#fff8e6" stroke="#d29922" stroke-width="2"/>
+  <text x="250" y="256" text-anchor="middle" font-size="12" font-weight="bold">Llama backbone</text>
+  <text x="250" y="273" text-anchor="middle" font-size="11">bidirectional attn</text>
+  <text x="250" y="286" text-anchor="middle" font-size="11">on action tokens</text>
+
+  <rect x="360" y="230" width="170" height="60" rx="8" fill="#e6f4ea" stroke="#1a7f37" stroke-width="2"/>
+  <text x="445" y="256" text-anchor="middle" font-size="12" font-weight="bold">Action expert MLP</text>
+  <text x="445" y="273" text-anchor="middle" font-size="11">L1 regression</text>
+  <text x="445" y="286" text-anchor="middle" font-size="11">→ chunk=8 × 6 DOF</text>
+
+  <rect x="560" y="230" width="170" height="60" rx="8" fill="#e6f4ea" stroke="#1a7f37" stroke-width="2"/>
+  <text x="645" y="256" text-anchor="middle" font-size="12" font-weight="bold">parallel decode</text>
+  <text x="645" y="273" text-anchor="middle" font-size="11">single forward pass</text>
+  <text x="645" y="286" text-anchor="middle" font-size="11" fill="#1a7f37">~30-50 ms / 8 actions</text>
+
+  <line x1="140" y1="260" x2="168" y2="260" stroke="#1f6feb" stroke-width="2" marker-end="url(#arr)"/>
+  <line x1="330" y1="260" x2="358" y2="260" stroke="#1f6feb" stroke-width="2" marker-end="url(#arr)"/>
+  <line x1="530" y1="260" x2="558" y2="260" stroke="#1f6feb" stroke-width="2" marker-end="url(#arr)"/>
+
+  <text x="370" y="330" font-size="12" fill="#1a7f37">→ sim @ step_hz=30 (一次 chunk 喂 8 个 action，跑完再 query 下一 chunk)</text>
+</svg>
+
+<table>
+<tr><th>维度</th><th>vanilla OpenVLA</th><th>OpenVLA-OFT</th></tr>
+<tr><td>Action 表示</td><td>256-bin discrete token</td><td><b>连续 float（直接 regression）</b></td></tr>
+<tr><td>Decode 方式</td><td>autoregressive，每 token 一个 forward</td><td><b>single forward 出整个 chunk</b></td></tr>
+<tr><td>Loss</td><td>Cross-entropy on action tokens</td><td><b>L1 loss on continuous actions</b></td></tr>
+<tr><td>Action head</td><td>shared lm_head + bin mapping</td><td><b>独立的 MLP action expert</b></td></tr>
+<tr><td>Attention pattern (action)</td><td>causal</td><td><b>bidirectional</b>（chunk 内 actions 互相看到）</td></tr>
+<tr><td>Chunk size</td><td>1 step / forward</td><td><b>8 steps / forward</b>（论文默认）</td></tr>
+<tr><td>实测 latency</td><td>~240 ms / action</td><td>论文报 ~30-50 ms / chunk(8 actions) = <b>~5 ms / effective action</b></td></tr>
+</table>
+
+<h2>3. 起点选择 — Base ckpt 对比</h2>
+
+<table>
+<tr><th>HF repo_id</th><th>Downloads / Likes</th><th>任务匹配</th><th>推荐</th></tr>
+<tr><td><code>moojink/openvla-7b-oft-finetuned-libero-spatial</code></td><td><b>15k / 14</b></td><td>✅ 单对象 pick+place + 位置随机化（= PickOrange 完全对应）</td><td>🥇 <b>首选</b></td></tr>
+<tr><td><code>moojink/openvla-7b-oft-finetuned-libero-spatial-object-goal-10</code></td><td>6.1k / 10</td><td>🟡 多对象+多目标+多任务，over-parameterized</td><td>🥈 备选</td></tr>
+<tr><td><code>moojink/openvla-7b-oft-finetuned-libero-10</code></td><td>3.8k / 3</td><td>❌ 10 个 long-horizon 任务，偏离单步 pick</td><td>✗</td></tr>
+<tr><td><code>moojink/openvla-7b-oft-finetuned-libero-goal</code></td><td>5.6k / 2</td><td>❌ 多目标变化，与单盘子目标偏离</td><td>✗</td></tr>
+<tr><td><code>moojink/openvla-7b-oft-finetuned-libero-object</code></td><td>4.0k / 2</td><td>❌ 多对象类型（不只是橙子）</td><td>✗</td></tr>
+</table>
+
+<h3>3.1 重新评估 libero-spatial — 经 codex review 校正</h3>
+<div class="callout bad">
+<b>之前的"libero-spatial 最佳"结论站不住脚。</b>真正决定迁移收益的不是任务语义，而是 <b>embodiment gap</b>：
+<ul>
+<li>LIBERO ckpt 的 <code>action_head</code>：(in=hidden, out=<b>7</b>) × <b>8 chunks</b> = 56 outputs</li>
+<li>LIBERO ckpt 的 <code>proprio_projector</code>：(in=<b>8</b>, out=hidden)</li>
+<li>SO-101 我们的：action <b>6</b>D, state <b>6</b>D（甚至不一定带 proprio）</li>
+</ul>
+<b>结论</b>：action_head 和 proprio_projector 必须 random-init 重训。能继承的只有 <b>backbone + LoRA 先验</b>，那部分是"通用 VLA pick-place 能力"，跟 spatial / object / goal / combined 子任务关系不大。
+</div>
+
+<h3>3.2 修订后的 base ckpt 决策</h3>
+<table>
+<tr><th>选项</th><th>能继承</th><th>不能继承</th><th>推荐度</th></tr>
+<tr><td><code>libero-spatial</code></td><td>backbone, 8% LoRA prior（spatial pick-place）</td><td>action_head, proprio_projector（shape 不匹配）</td><td>🟡 跟 combined 差异不大</td></tr>
+<tr><td><code>libero-spatial-object-goal-10</code> combined</td><td>backbone, 通用 LoRA prior</td><td>同上</td><td>🟡 备选，论文报 combined 跟 task-specific 平均成功率仅差 0.3pp</td></tr>
+<tr><td>OFT base (无 LIBERO 偏置)</td><td>backbone（最干净）</td><td>—（heads 反正要重训）</td><td>🥇 如果有发布</td></tr>
+<tr><td>vanilla OpenVLA-7b + 自己加 OFT 改造</td><td>backbone + 我们 vanilla 训的 LoRA</td><td>—</td><td>🟢 可选但等于重新实现 OFT</td></tr>
+</table>
+
+<p><b>实操建议</b>：先 cat <code>moojink/openvla-7b-oft-finetuned-libero-spatial</code> 的 <code>config.json</code> 看 <code>ACTION_DIM</code> 等超参是不是真写死。如果是，**spatial 跟 combined 选一个都行**。等 ckpt-5000 vanilla GUI 结果出来再确认 pivot。</p>
+
+<h2>4. 资源估算 — QLoRA 在 24GB 4090</h2>
+
+<div class="callout good">
+<b>结论：QLoRA 是正确选择（同 vanilla 链路，零工程成本）。</b>
+</div>
+
+<table>
+<tr><th>项</th><th>bf16 LoRA</th><th><b>QLoRA NF4</b></th></tr>
+<tr><td>Base 7-8B 权重</td><td>~14-16 GB</td><td><b>~3.8 GB</b></td></tr>
+<tr><td>Action expert MLP（OFT 新增）</td><td>~0.3 GB</td><td>~0.3 GB</td></tr>
+<tr><td>LoRA r=32 q/v</td><td>~0.4 GB</td><td>~0.4 GB</td></tr>
+<tr><td>Optimizer (AdamW fp32)</td><td>~0.8 GB</td><td>~0.8 GB</td></tr>
+<tr><td>Activations (batch=4, chunk=8, no grad_ckpt)</td><td>~10-12 GB</td><td>~10-12 GB</td></tr>
+<tr><td><b>合计</b></td><td><b>~26-30 GB</b> <span class="tag-bad">❌ OOM</span></td><td><b>~15-17 GB</b> <span class="tag-good">✅ OK</span></td></tr>
+</table>
+
+<p>注：OFT 训练时不再 AR decode（label 也是连续 float），但 chunk=8 让 sequence length 增加（虽然只是 8 个 token vs 6 个），influence 不大。</p>
+
+<h2>5. 代码改动清单（vs 现有 OpenVLA scaffold）</h2>
+
+<h3>5.1 文件级（少改动 / 复用最大化）</h3>
+
+<table>
+<tr><th>文件</th><th>动作</th><th>主要改动</th></tr>
+<tr><td><code>LeIsaac/scripts/finetune/openvla_oft/dataset.py</code></td><td>新建（copy + 改）</td><td>collator 产连续 action label，shape <code>(chunk=8, 6)</code>；去掉 ActionTokenizer/256-bin 量化；保留 (q01,q99) normalize 到 [-1,1]</td></tr>
+<tr><td><code>LeIsaac/scripts/finetune/openvla_oft/train.py</code></td><td>新建（copy + 改）</td><td>base 换 <code>moojink/openvla-7b-oft-finetuned-libero-spatial</code>；loss 由 HF Trainer 默认 CE 改为自定义 L1 on action logits（需自写 <code>compute_loss</code>）；保留 watchdog + auto-resume + ckpt validity 全部 fixes</td></tr>
+<tr><td><code>LeIsaac/scripts/finetune/openvla_oft/{train.sh, watchdog.sh, smoke.py, offline_eval.py}</code></td><td>复制 + 改路径</td><td>仅改 import / output_dir / model 名</td></tr>
+<tr><td><code>server/openvla_oft_leisaac/server.py</code></td><td>新建（copy + 改）</td><td>调 OFT 模型的 chunk predict 接口（具体函数名要看 moojink repo）；输出 shape 从 <code>(1, 6)</code> 改为 <code>(8, 6)</code>；client 端 horizon=8</td></tr>
+<tr><td><code>LeIsaac/source/leisaac/.../service_policy_clients.py</code></td><td>不改</td><td>已有 <code>Pi05ServicePolicyClient</code>，OFT server wire-compatible（chunk 通过 horizon 字段传）</td></tr>
+<tr><td><code>scripts/evaluation/policy_inference.py</code></td><td>不改</td><td>用 <code>--policy_type=pi05 --policy_action_horizon=8 --step_hz=30</code> 即可</td></tr>
+</table>
+
+<h3>5.2 关键代码骨架</h3>
+
+<p><b>Action label（dataset.py 改动）</b>：</p>
+<pre># Vanilla: action_tokens (6,) = vocab_size - 1 - bin_idx
+# OFT:     action_chunk (chunk=8, 6) = continuous normalized actions in [-1, 1]
+
+def __getitem__(self, idx):
+    ep = self.episodes_by_idx[idx]
+    f0 = self.frame_idx[idx]
+    # Sample 8 consecutive frames (clip at episode end)
+    f_range = np.arange(f0, min(f0 + 8, ep.from_idx + ep.length))
+    pad = 8 - len(f_range)
+    actions = self.actions[f_range]                        # (≤8, 6)
+    if pad: actions = np.concatenate([actions, np.tile(actions[-1:], (pad, 1))])
+    a_norm = normalize_action(actions, self.stats)         # (8, 6) ∈ [-1, 1]
+    img = self._video_cache().get(self._video_path(ep)).read_at(ts0)
+    return {"image": img, "action_chunk": a_norm, "prompt": self._prompt}</pre>
+
+<p><b>Custom L1 loss in train.py（替换 HF Trainer 默认 CE）</b>：</p>
+<pre>class OFTTrainer(Trainer):
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        # model.forward returns continuous action predictions, shape (B, chunk, 6)
+        pred = model(input_ids=..., pixel_values=...).action_pred
+        target = inputs["action_chunk"]                    # (B, chunk, 6)
+        loss = torch.nn.functional.l1_loss(pred, target)
+        return (loss, pred) if return_outputs else loss</pre>
+
+<p><b>Server output（openvla_oft_leisaac/server.py 改动）</b>：</p>
+<pre>def predict_action(self, front_img, state6, prompt):
+    inputs = self.processor(fmt_prompt, img)
+    # OFT returns (chunk, 6) continuous floats in [-1, 1], we unnorm
+    a_norm = self.inner.predict_action_chunk(**inputs, unnorm_key="leisaac")  # (8, 6)
+    a = unnorm(a_norm, self.stats)                         # (8, 6) joint positions
+    return a   # shape (8, 6)
+# wire format: action.single_arm (8, 5) + action.gripper (8, 1)</pre>
+
+<h2>6. 修订后的训练计划 — 增加前置 contract 验证</h2>
+
+<table>
+<tr><th>Phase</th><th>步骤</th><th>时间预算</th><th>codex worry 对应</th></tr>
+<tr><td><b>P0a</b></td><td><b>读 moojink/openvla-oft 的 <code>modeling_prismatic.py + action_heads.py + datasets.py + train_utils.py + constants.py</code> 5 个文件，钉死 <code>ACTION_DIM / PROPRIO_DIM / NUM_ACTIONS_CHUNK / action slot layout / bidirectional mask</code> 的真实实现</b></td><td>~2h</td><td>🔴 #1</td></tr>
+<tr><td><b>P0b</b></td><td><b>写 OFT contract spec：钉死 (a) 我们的 6D action / 6D state / chunk=8 配置，(b) action_head/proprio_projector 必须 random init，(c) time alignment = <code>[a_t, ..., a_{t+7}]</code> + tail padding = repeat-last，(d) wire format = (chunk=8, 6) per ZMQ blocking call</b></td><td>~1h</td><td>🔴 #1,#2 + time-align</td></tr>
+<tr><td><b>P0c</b></td><td><b>路径决策</b>：fork moojink + 改 6D vs 在 vanilla scaffold 里自写 OFT-style chunk training（不用 moojink modeling 代码）</td><td>~30min</td><td>🔴 #3</td></tr>
+<tr><td>P1</td><td>Smoke：（适配后的）4 阶段（dataset emit chunk / 4-bit load + adapter + new heads random init / LoRA wrap / 1 fw+bw + L1 loss）</td><td>~1h</td><td>—</td></tr>
+<tr><td>P2</td><td>Train QLoRA：batch=4 grad_accum=4 lr=5e-5 max_steps=10000 save_steps=200, watchdog 50 retries（复用 vanilla 全套）</td><td>~6h（含 crash overhead）</td><td>—</td></tr>
+<tr><td>P3</td><td>Offline eval @ ckpt-2000, 5000, 10000：抽 3 帧测 chunk[0] in_range + 全 chunk per-dim L1 MAE（特别看 gripper 维）</td><td>~1h</td><td>—</td></tr>
+<tr><td>P4</td><td>GUI eval @ step_hz=30 horizon=8：3-round PickOrange + 比对 vanilla baseline</td><td>~1h</td><td>—</td></tr>
+</table>
+
+<h3>6.1 P0c 决策 matrix</h3>
+<table>
+<tr><th>选项</th><th>优</th><th>缺</th></tr>
+<tr><td><b>A. Fork moojink/openvla-oft</b></td><td>model contract 官方实现，bidirectional mask 等细节免错</td><td>要适配 6D + LeRobot v3 parquet + QLoRA + watchdog；moojink 用 DDP/RLDS 跟我们栈差异大</td></tr>
+<tr><td><b>B. 自写 OFT-style chunk training in vanilla scaffold</b></td><td>完全复用 vanilla 工程链路（QLoRA, watchdog, dataset adapter, server）</td><td>要重新实现 bidirectional mask + action slot logic + action_head/proprio_projector，等于重做 OFT 论文</td></tr>
+<tr><td><b>C. 折中：保留 OpenVLA-7b base（vanilla 已熟），自加 chunked L1 head（不要 OFT bidirectional）</b></td><td>最小改动，1-day 可上手</td><td>不是真 OFT，只是 chunk-L1 patch — 拿不到 OFT 论文的 25× 加速，单 forward 仍是 6-token AR</td></tr>
+</table>
+<p><b>初评</b>：B 是认真做 OFT 的正确路径，但成本是 fork + 重新对齐两套实现细节。A 看似最简单但 LeRobot v3 parquet → RLDS 转换本身就是大坑。C 是"假 OFT，真 chunk-L1"，可能只解决 gripper 精度但不解决 step_hz。决策待 ckpt-5000 vanilla GUI 结果。</p>
+
+<h2>7. 风险清单 / Risk register（codex review 后增强版）</h2>
+
+<table>
+<tr><th>风险</th><th>概率</th><th>影响</th><th>缓解</th></tr>
+<tr><td><b>🔴 OFT 架构理解错误（action slots 不是简单 chunk×head）</b></td><td>高</td><td><b>致命</b></td><td>P0a 必须读官方 5 个文件；P0b contract spec 钉死后再写代码</td></tr>
+<tr><td><b>🔴 action_head / proprio_projector shape mismatch</b></td><td>确定</td><td><b>致命</b></td><td>必须 random-init 重训这两个头，pretrained ckpt 只继承 backbone</td></tr>
+<tr><td><b>🔴 自写 QLoRA + HF Trainer 跟 OFT bf16 + DDP 官方栈不同</b></td><td>高</td><td>中</td><td>承认这是 QLoRA-OFT 新分支；P0c 选 path B 时要计入"重新实现 bidirectional mask"成本</td></tr>
+<tr><td>🟡 Time alignment off-by-one（label = current + next 7 不是 future 8）</td><td>低</td><td>高</td><td>collator 严格按 <code>actions[f0:f0+8]</code>，<b>f0 对应当前 obs</b>；tail pad = repeat last</td></tr>
+<tr><td>🟡 No-op 帧污染（30Hz 数据里大量小动作）</td><td>中</td><td>中</td><td>训练前过滤 |Δaction| < ε 的连续段，或单独看 gripper 维 MAE 监控</td></tr>
+<tr><td>🟢 LIBERO-spatial 先验对 SO-101 适配差（embodiment 双重 gap）</td><td>中</td><td>低</td><td>反正 heads 重训，pretrained 价值有限；最差也是 vanilla 水平</td></tr>
+<tr><td>🟢 QLoRA NF4 对新 action_head MLP 兼容</td><td>低</td><td>低</td><td>新加的 MLP 默认 fp32，不进 bnb 量化范围</td></tr>
+<tr><td>🟢 wire compat（chunk=8 在 sim 消费）</td><td>低</td><td>低</td><td><b>已实测推翻 codex 担忧</b>：Pi05ServicePolicyClient 同步 ZMQ blocking，<code>policy_action_horizon=8</code> 直接消费</td></tr>
+<tr><td>🟢 训练 crash 模式跟 vanilla 一样</td><td>高</td><td>低</td><td>watchdog + auto-resume + ckpt validity 全套复用</td></tr>
+</table>
+
+<h2>8. 跟 vanilla OpenVLA 的横评对比预期</h2>
+
+<table>
+<tr><th>指标</th><th>vanilla OpenVLA-7B（ckpt-10000）</th><th>OpenVLA-OFT QLoRA（目标）</th></tr>
+<tr><td>Strict Rounds 完成数</td><td>0/3 ~ 1/3（预测）</td><td><b>1/3 ~ 2/3</b></td></tr>
+<tr><td>橙子完成数</td><td>~2/9（gripper 闭不到位）</td><td><b>4/9 ~ 6/9</b></td></tr>
+<tr><td>step_hz</td><td>5 Hz</td><td><b>30 Hz</b></td></tr>
+<tr><td>Latency / 等效 action</td><td>240 ms</td><td><b>~5-10 ms</b>（chunk 摊薄）</td></tr>
+<tr><td>Peak VRAM</td><td>~18 GB</td><td>~17 GB</td></tr>
+</table>
+
+<p>排序按 <code>[[feedback-benchmark-table-sort]]</code>：Rounds DESC → 🍊 DESC → time ASC。OFT 如果做出来应该能挤进 leaderboard 中位。</p>
+
+<h2>9. 当前训练状态 (vanilla, for reference)</h2>
+
+<table>
+<tr><th>项</th><th>值</th></tr>
+<tr><td>当前 step</td><td>~2050 / 10000（resume from ckpt-2000）</td></tr>
+<tr><td>Loss</td><td>2.89（still 慢速下降）</td></tr>
+<tr><td>下一里程碑</td><td>ckpt-5000 GUI 验证收敛</td></tr>
+<tr><td>Pivot 决策点</td><td>ckpt-5000 GUI 结果 — 若仍"差一点"夹不下去，立刻杀掉 vanilla 训练，全力 OFT</td></tr>
+</table>
+
+<h2>10. 关联记忆 / Linked memory</h2>
+<ul>
+<li><code>openvla-finetune-plan</code> — vanilla 计划主线（含 codex review 4 个 worry 实测验证）</li>
+<li><code>leisaac-policy-comparison</code> — 多策略横评</li>
+<li><code>feedback-training-resume-chunks</code> — 长训练拆段 / watchdog 模板</li>
+<li><code>feedback-training-save-policy</code> — ckpt 数量裁剪</li>
+<li><code>feedback-benchmark-table-sort</code> — README 排序规则</li>
+<li><code>feedback-pre-run-gpu-check</code> — 启动前 nvidia-smi</li>
+</ul>
+
+</body>
+</html>

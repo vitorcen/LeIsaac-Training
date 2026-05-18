@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>Diffusion Policy 微调记录 — LeIsaac SO-101 PickOrange</title>
+<style>
+  :root {
+    --bg: #fafafa; --fg: #1a1a1a; --muted: #555;
+    --accent: #1f6feb; --warn: #d29922; --bad: #cf222e; --good: #1a7f37;
+    --code-bg: #f3f3f3; --border: #d0d7de;
+  }
+  body { font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+         background: var(--bg); color: var(--fg);
+         max-width: 1000px; margin: 28px auto; padding: 0 22px; line-height: 1.6; }
+  h1 { border-bottom: 2px solid var(--fg); padding-bottom: 6px; }
+  h2 { margin-top: 36px; border-left: 4px solid var(--accent); padding-left: 10px; }
+  h3 { margin-top: 24px; color: var(--accent); }
+  .en { color: var(--muted); font-style: italic; font-size: 0.92em; }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0; font-size: 0.94em; }
+  th, td { border: 1px solid var(--border); padding: 6px 10px; text-align: left; vertical-align: top; }
+  th { background: #f0f3f6; }
+  code, pre { font-family: "JetBrains Mono", Menlo, Consolas, monospace; }
+  pre { background: var(--code-bg); padding: 12px; border-radius: 4px; overflow-x: auto; font-size: 0.88em; }
+  code { background: var(--code-bg); padding: 1px 5px; border-radius: 3px; }
+  .tag-good { color: var(--good); font-weight: 600; }
+  .tag-warn { color: var(--warn); font-weight: 600; }
+  .tag-bad  { color: var(--bad); font-weight: 600; }
+  .callout { border-left: 4px solid var(--warn); background: #fff8e6; padding: 10px 14px; margin: 14px 0; }
+  .callout.bad { border-color: var(--bad); background: #ffeef0; }
+  .callout.good { border-color: var(--good); background: #e6f4ea; }
+  svg { display: block; margin: 14px auto; }
+  ul { padding-left: 22px; }
+  li { margin: 4px 0; }
+  .meta { color: var(--muted); font-size: 0.9em; }
+</style>
+</head>
+<body>
+
+<h1>Diffusion Policy 微调记录</h1>
+<p class="meta">SO-101 PickOrange · LeIsaac benchmark baseline #2 · 2026-05-18</p>
+<p class="en">Diffusion Policy (Chi et al. 2023) — image-conditioned action denoising via a temporal UNet1D.
+~267M params, no VLM, no language conditioning. Strongest "plain" baseline before VLA-class models.</p>
+
+<h2>0. TL;DR</h2>
+<div class="callout good">
+<b>DP 是 mid-size baseline</b>（267M params，DDIM 32-step inference ~147ms/chunk）。
+本地 ckpt <code>wsagi/DiffusionPolicy-PickOrange</code> strict 表现 <b>0/3 round, 2/9 oranges, avg 108s, 10.6 GB</b>，
+关键工程提速：<b>训练用 DDPM 100-step，部署 swap 为 DDIM 32-step</b>（无需重训）让 latency 393ms → 147ms。
+</div>
+
+<h2>1. 架构核心</h2>
+
+<table>
+<tr><th>组件</th><th>来源</th><th>实现</th><th>参数估算</th></tr>
+<tr><td><b>Vision encoder</b></td><td>torchvision ResNet18</td><td><code>vision_backbone="resnet18"</code> + GroupNorm 替 BatchNorm + SpatialSoftmax keypoints；可选 per-camera 独立 encoder</td><td>~11M × N_cam</td></tr>
+<tr><td><b>SpatialSoftmax</b></td><td>Levine et al.</td><td>把 feature map (B, 512, h, w) → (B, K=32, 2) 个 (x, y) keypoint，再 flatten 成 64D 全局特征</td><td>~0M</td></tr>
+<tr><td><b>FiLM-conditioned UNet1D</b></td><td>DP 自研（<code>modeling_diffusion.py:628 DiffusionConditionalUnet1d</code>）</td><td>沿 chunk 时间维做 1D 卷积；条件经过 FiLM 注入到每个 conv block；4 stage down + 4 stage up；conv kernel=5</td><td>~250M</td></tr>
+<tr><td><b>Time embedding</b></td><td>Sinusoidal + MLP</td><td>把扩散时间步 t 编码到 condition vector</td><td>~0.1M</td></tr>
+<tr><td><b>合计</b></td><td>—</td><td>—</td><td><b>~267M</b>（全部 trainable，无 LoRA）</td></tr>
+</table>
+
+<svg width="980" height="540" viewBox="0 0 980 540" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="dp-ai" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#1f6feb" />
+    </marker>
+    <marker id="dp-ai2" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#cf222e" />
+    </marker>
+  </defs>
+
+  <text x="490" y="25" font-weight="bold" font-size="14" text-anchor="middle">Diffusion Policy 内部数据流（DDPM 训练 → DDIM 部署）</text>
+
+  <!-- INPUTS -->
+  <rect x="10" y="50" width="200" height="40" rx="6" fill="#e6f0ff" stroke="#1f6feb" stroke-width="2"/>
+  <text x="110" y="68" text-anchor="middle" font-size="11" font-weight="bold">images (B, n_obs=2, V=2, 3, H, W)</text>
+  <text x="110" y="84" text-anchor="middle" font-size="10">past 2 frames × 2 cam</text>
+
+  <rect x="10" y="100" width="200" height="40" rx="6" fill="#e6f0ff" stroke="#1f6feb" stroke-width="2"/>
+  <text x="110" y="118" text-anchor="middle" font-size="11" font-weight="bold">state (B, 2, 6)</text>
+  <text x="110" y="134" text-anchor="middle" font-size="10">past 2 frames joint pos</text>
+
+  <rect x="10" y="155" width="200" height="40" rx="6" fill="#ffeef0" stroke="#cf222e" stroke-width="2"/>
+  <text x="110" y="173" text-anchor="middle" font-size="11" font-weight="bold">action_clean (B, 16, 6)</text>
+  <text x="110" y="189" text-anchor="middle" font-size="10">GT chunk (训练)</text>
+
+  <rect x="10" y="210" width="200" height="55" rx="6" fill="#fff8e6" stroke="#d29922" stroke-width="2"/>
+  <text x="110" y="228" text-anchor="middle" font-size="11" font-weight="bold">采样 t ∈ [0, 1000]</text>
+  <text x="110" y="244" text-anchor="middle" font-size="10">action_noisy = α_t·a + σ_t·ε</text>
+  <text x="110" y="260" text-anchor="middle" font-size="10">cosine β schedule</text>
+
+  <!-- Vision tower -->
+  <rect x="240" y="50" width="220" height="240" rx="8" fill="#fff8e6" stroke="#d29922" stroke-width="3"/>
+  <text x="350" y="75" text-anchor="middle" font-size="13" font-weight="bold">Vision tower (per cam)</text>
+  <text x="350" y="92" text-anchor="middle" font-size="10" fill="#555">ResNet18 + GroupNorm</text>
+
+  <rect x="255" y="105" width="190" height="40" rx="4" fill="#fffaf0" stroke="#d29922" stroke-width="1"/>
+  <text x="350" y="123" text-anchor="middle" font-size="10" font-weight="bold">ResNet18 conv1-4</text>
+  <text x="350" y="138" text-anchor="middle" font-size="9">BN → GN (避免 BN 在 batch=1)</text>
+
+  <rect x="255" y="150" width="190" height="40" rx="4" fill="#fffaf0" stroke="#d29922" stroke-width="1"/>
+  <text x="350" y="168" text-anchor="middle" font-size="10" font-weight="bold">→ feature (B, 512, h', w')</text>
+  <text x="350" y="183" text-anchor="middle" font-size="9">center-cropped 84×84</text>
+
+  <rect x="255" y="195" width="190" height="40" rx="4" fill="#fffaf0" stroke="#d29922" stroke-width="1"/>
+  <text x="350" y="213" text-anchor="middle" font-size="10" font-weight="bold">SpatialSoftmax (K=32)</text>
+  <text x="350" y="228" text-anchor="middle" font-size="9">→ (B, 32, 2) keypoints</text>
+
+  <rect x="255" y="240" width="190" height="40" rx="4" fill="#fffaf0" stroke="#d29922" stroke-width="1"/>
+  <text x="350" y="258" text-anchor="middle" font-size="10" font-weight="bold">flatten → 64D feature</text>
+  <text x="350" y="273" text-anchor="middle" font-size="9">×2 cam ×2 timestep = 256D</text>
+
+  <!-- Condition -->
+  <rect x="240" y="300" width="220" height="60" rx="6" fill="#f0f3f6" stroke="#555" stroke-width="2"/>
+  <text x="350" y="320" text-anchor="middle" font-size="11" font-weight="bold">condition vector</text>
+  <text x="350" y="338" text-anchor="middle" font-size="10">cat(visual_features, state, t_emb)</text>
+  <text x="350" y="352" text-anchor="middle" font-size="10">→ ~300D，喂入 FiLM</text>
+
+  <!-- UNet1D -->
+  <rect x="490" y="50" width="290" height="430" rx="8" fill="#e6f4ea" stroke="#1a7f37" stroke-width="3"/>
+  <text x="635" y="75" text-anchor="middle" font-size="13" font-weight="bold">FiLM-conditioned UNet1D</text>
+  <text x="635" y="92" text-anchor="middle" font-size="10" fill="#555">~250M, conv 沿 chunk 时间维</text>
+
+  <!-- UNet down path -->
+  <rect x="505" y="110" width="260" height="115" rx="4" fill="#d4e9d9" stroke="#1a7f37" stroke-width="1"/>
+  <text x="635" y="130" text-anchor="middle" font-size="11" font-weight="bold">Down path (× 4 stages)</text>
+  <text x="515" y="150" font-size="10">  • Conv1d(kernel=5) + FiLM(γ, β | cond)</text>
+  <text x="515" y="166" font-size="10">  • GroupNorm + Mish</text>
+  <text x="515" y="182" font-size="10">  • Conv1d + FiLM + GN + Mish (residual)</text>
+  <text x="515" y="198" font-size="10">  • Downsample (stride 2 沿时间维)</text>
+  <text x="635" y="216" text-anchor="middle" font-size="9" fill="#555">channels: 256 → 512 → 1024 → 2048</text>
+
+  <!-- Mid -->
+  <rect x="505" y="230" width="260" height="50" rx="4" fill="#f0f7f3" stroke="#1a7f37" stroke-width="1"/>
+  <text x="635" y="248" text-anchor="middle" font-size="11" font-weight="bold">Mid block</text>
+  <text x="635" y="263" text-anchor="middle" font-size="9">attention 可选；FiLM-conditioned ResBlock × 2</text>
+
+  <!-- Up path -->
+  <rect x="505" y="285" width="260" height="115" rx="4" fill="#d4e9d9" stroke="#1a7f37" stroke-width="1"/>
+  <text x="635" y="305" text-anchor="middle" font-size="11" font-weight="bold">Up path (× 4 stages)</text>
+  <text x="515" y="325" font-size="10">  • Concat skip from down path</text>
+  <text x="515" y="341" font-size="10">  • Conv1d + FiLM + GN + Mish (× 2)</text>
+  <text x="515" y="357" font-size="10">  • Upsample (transpose conv 沿时间维)</text>
+  <text x="635" y="377" text-anchor="middle" font-size="9" fill="#555">channels: 2048 → 1024 → 512 → 256</text>
+
+  <!-- Output head -->
+  <rect x="505" y="410" width="260" height="55" rx="4" fill="#f0f7f3" stroke="#1a7f37" stroke-width="1"/>
+  <text x="635" y="430" text-anchor="middle" font-size="11" font-weight="bold">final Conv1d → (B, 16, 6)</text>
+  <text x="635" y="445" text-anchor="middle" font-size="9">predict ε (epsilon prediction)</text>
+  <text x="635" y="458" text-anchor="middle" font-size="9" fill="#555">非 v-pred，是 noise pred</text>
+
+  <!-- Output -->
+  <rect x="810" y="200" width="160" height="80" rx="6" fill="#ffeef0" stroke="#cf222e" stroke-width="2"/>
+  <text x="890" y="220" text-anchor="middle" font-size="11" font-weight="bold">MSE loss</text>
+  <text x="890" y="236" text-anchor="middle" font-size="10">L = ||ε_pred − ε||²</text>
+  <text x="890" y="252" text-anchor="middle" font-size="10">单 forward 训练</text>
+  <text x="890" y="266" text-anchor="middle" font-size="9" fill="#555">采样 t ∈ [0, 1000]</text>
+
+  <!-- Inference -->
+  <rect x="810" y="300" width="160" height="160" rx="6" fill="#f8f8f8" stroke="#999" stroke-width="1"/>
+  <text x="890" y="320" text-anchor="middle" font-size="11" font-weight="bold">推理 (inference)</text>
+  <text x="820" y="340" font-size="10">• x_T = N(0, I)</text>
+  <text x="820" y="356" font-size="10">• for t in [T..0]:</text>
+  <text x="820" y="372" font-size="10">　 ε_pred = UNet(x_t, cond, t)</text>
+  <text x="820" y="388" font-size="10">　 x_{t-1} = scheduler.step()</text>
+  <text x="820" y="408" font-size="10">• <b>train</b>: DDPM T=100</text>
+  <text x="820" y="424" font-size="10">• <b>deploy</b>: DDIM T=32</text>
+  <text x="820" y="442" font-size="10" fill="#cf222e">→ 393ms → 147ms</text>
+  <text x="820" y="456" font-size="9" fill="#555">无需重训，热 swap</text>
+
+  <!-- Arrows -->
+  <line x1="210" y1="70" x2="248" y2="125" stroke="#1f6feb" stroke-width="1.5" marker-end="url(#dp-ai)"/>
+  <line x1="210" y1="120" x2="248" y2="330" stroke="#1f6feb" stroke-width="1.5" stroke-dasharray="3,2" marker-end="url(#dp-ai)"/>
+  <line x1="210" y1="250" x2="248" y2="335" stroke="#1f6feb" stroke-width="1.5" stroke-dasharray="3,2" marker-end="url(#dp-ai)"/>
+
+  <line x1="350" y1="285" x2="350" y2="298" stroke="#555" stroke-width="2" marker-end="url(#dp-ai)"/>
+
+  <line x1="460" y1="330" x2="503" y2="160" stroke="#1f6feb" stroke-width="2" marker-end="url(#dp-ai)"/>
+  <text x="465" y="290" font-size="9" fill="#555">cond → FiLM</text>
+
+  <path d="M 210 175 Q 350 480 503 425" fill="none" stroke="#cf222e" stroke-width="1.5" stroke-dasharray="3,2" marker-end="url(#dp-ai2)"/>
+  <text x="280" y="450" font-size="9" fill="#cf222e">action_noisy</text>
+
+  <line x1="635" y1="225" x2="635" y2="227" stroke="#1a7f37" stroke-width="2" marker-end="url(#dp-ai)"/>
+  <line x1="635" y1="280" x2="635" y2="283" stroke="#1a7f37" stroke-width="2" marker-end="url(#dp-ai)"/>
+  <line x1="635" y1="400" x2="635" y2="408" stroke="#1a7f37" stroke-width="2" marker-end="url(#dp-ai)"/>
+
+  <line x1="770" y1="440" x2="810" y2="245" stroke="#cf222e" stroke-width="2" marker-end="url(#dp-ai2)"/>
+
+  <!-- must_go note -->
+  <rect x="10" y="380" width="220" height="130" rx="6" fill="#fff8e6" stroke="#d29922" stroke-width="1"/>
+  <text x="120" y="400" text-anchor="middle" font-size="11" font-weight="bold">⚠ must_go trap</text>
+  <text x="20" y="420" font-size="9">DP chunk=8 太短 → 抓到 orange</text>
+  <text x="20" y="434" font-size="9">后 model 输出 hold-pose chunk</text>
+  <text x="20" y="448" font-size="9">+ obs 跟之前几乎一样</text>
+  <text x="20" y="462" font-size="9">→ 触发 client dedup → 不发新 obs</text>
+  <text x="20" y="476" font-size="9">→ server 永远拿同个 obs → 同 chunk</text>
+  <text x="20" y="490" font-size="9" fill="#cf222e">→ grasp-and-freeze attractor</text>
+  <text x="20" y="504" font-size="9">修复: must_go=True 强发 obs</text>
+</svg>
+
+<p><b>读图要点</b>：</p>
+<ul>
+<li><b>无 VLM 无 language</b>：DP 是 image-conditioned 纯视觉策略，跟 ACT 一样</li>
+<li><b>UNet1D 沿 chunk 时间维做 1D 卷积</b>（不是 transformer），FiLM 在每个 conv block 注入条件（visual+state+t_emb）</li>
+<li><b>训练 DDPM 100-step → 部署 DDIM 32-step</b>，无需重训直接 swap：4090 上 393ms → 147ms（公式 <code>(target_ms - 36) / 3.3 ≈ 29 step</code>）</li>
+<li><b>n_obs_steps=2</b>：DP 看 past 2 frame 而不是 1 frame，提供 implicit velocity 信息</li>
+<li><b>SpatialSoftmax</b>：经典 manipulation policy 套路，把 feature map → keypoints 让网络专注空间位置而不是 texture</li>
+<li><b>must_go trap</b>（我们踩过的）：chunk=8 短 → 抓握后 hold-pose chunk → client dedup → 永远不发新 obs → 卡死。修：long-chunk policy must_go=False，short-chunk 必 True</li>
+</ul>
+
+<h2>2. 训练配置</h2>
+
+<p>训练侧 ckpt 我们直接用了第三方 <code>wsagi/DiffusionPolicy-PickOrange</code>（社区训好的），未自训。配置参考：</p>
+
+<table>
+<tr><th>参数</th><th>值</th><th>说明</th></tr>
+<tr><td>vision_backbone</td><td>resnet18</td><td></td></tr>
+<tr><td>horizon</td><td>16</td><td>chunk 预测长度</td></tr>
+<tr><td>n_obs_steps</td><td>2</td><td>看 past 2 frame</td></tr>
+<tr><td>n_action_steps</td><td>8</td><td>实际执行 8 步再重 query</td></tr>
+<tr><td>down_dims</td><td>[256, 512, 1024, 2048]</td><td>4 stage UNet</td></tr>
+<tr><td>kernel_size</td><td>5</td><td>conv1d 时间维</td></tr>
+<tr><td>num_train_timesteps</td><td>100</td><td>DDPM 训练步</td></tr>
+<tr><td>beta_schedule</td><td>squaredcos_cap_v2</td><td>cosine schedule</td></tr>
+<tr><td>prediction_type</td><td>epsilon</td><td>predict noise (经典 DDPM)</td></tr>
+</table>
+
+<h2>3. Eval 参数（含 DDIM swap）</h2>
+
+<table>
+<tr><th>eval 参数</th><th>值</th><th>说明</th></tr>
+<tr><td>step_hz</td><td>30</td><td>对齐 dataset 30Hz</td></tr>
+<tr><td>policy_action_horizon</td><td>8</td><td>= n_action_steps，每 8 步重 query</td></tr>
+<tr><td><b>noise_scheduler</b></td><td><b>DDIM</b>（部署 swap）</td><td>训练 DDPM，部署 DDIM 加速</td></tr>
+<tr><td><b>num_inference_steps</b></td><td><b>32</b></td><td>从训练 100 步降到 32 步，latency 393→147ms</td></tr>
+<tr><td>peak VRAM</td><td>~10.6 GB</td><td></td></tr>
+<tr><td>must_go</td><td>True</td><td>chunk=8 必须强发 obs 避免 grasp-and-freeze</td></tr>
+</table>
+
+<h2>4. Benchmark 结果</h2>
+
+<table>
+<tr><th>Source</th><th>Strict Rounds</th><th>🍊 / 9</th><th>Avg time</th><th>Peak VRAM</th></tr>
+<tr><td><code>wsagi/DiffusionPolicy-PickOrange</code></td><td>0/3</td><td>2/9</td><td>108s</td><td>10.6 GB</td></tr>
+</table>
+
+<p>位置：leaderboard 中位。267M 比 ACT 80M 大 3 倍但 oranges 相同（2/9），说明在这个数据规模（50 demo）下大模型边际收益小。</p>
+
+<h2>5. 已踩过的坑</h2>
+
+<ul>
+<li><b>DDPM 100-step latency 393ms</b> → 部署后 sim 跟不上，必须降到 DDIM 32-step（详见 <a href="dp_inference_speedup_and_dynamic_timeout.html"><code>dp_inference_speedup_and_dynamic_timeout.html</code></a>）</li>
+<li><b>must_go=False 时 grasp-and-freeze</b>：chunk=8 抓到后 hold-pose，obs 不变，client dedup（atol=1），server 永远拿同个 obs → 死循环。修复：DP 必 must_go=True，长 chunk policy（ACT 100, SmolVLA 50）must_go=False</li>
+<li><b>step_hz=60 与 dataset 30Hz 错配</b>：部署时间尺度漂移，arm 速度加倍。修：step_hz=30</li>
+</ul>
+
+<h2>6. 关联</h2>
+<ul>
+<li><a href="dp_inference_speedup_and_dynamic_timeout.html"><code>dp_inference_speedup_and_dynamic_timeout.html</code></a> — DDIM swap 详记 + dynamic timeout</li>
+<li><a href="act_finetune_pick_orange.html"><code>act_finetune_pick_orange.html</code></a> — ACT（同款 ResNet 路线，但 transformer 解码）</li>
+<li><code>leisaac-eval-timeout</code> memory</li>
+</ul>
+
+</body>
+</html>
