@@ -1,0 +1,3 @@
+# Empty task override (knobs live in train.yaml).  Hydra requires the
+# `task` group to resolve to something.
+{}

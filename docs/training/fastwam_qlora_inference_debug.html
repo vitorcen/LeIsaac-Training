@@ -1,0 +1,445 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>Fast-WAM QLoRA Inference Debug & Validation Checklist</title>
+<style>
+body { font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif; max-width: 1100px; margin: 24px auto; padding: 0 18px; line-height: 1.55; color: #222; background: #fafafa; }
+h1, h2, h3 { font-weight: 700; }
+h1 { border-bottom: 2px solid #444; padding-bottom: 8px; }
+h2 { margin-top: 2em; border-left: 4px solid #2b6cb0; padding-left: 10px; }
+h3 { color: #2b6cb0; }
+code, pre { font-family: Menlo, Monaco, Consolas, monospace; }
+pre { background: #f6f8fa; padding: 12px; border-radius: 5px; overflow-x: auto; font-size: 12.5px; line-height: 1.45; }
+code { background: #f1f3f5; padding: 1px 5px; border-radius: 3px; font-size: 0.92em; }
+.bad { background: #fff5f5; border-left: 4px solid #c53030; padding: 8px 12px; margin: 8px 0; }
+.good { background: #f0fff4; border-left: 4px solid #2f855a; padding: 8px 12px; margin: 8px 0; }
+.warn { background: #fffaf0; border-left: 4px solid #dd6b20; padding: 8px 12px; margin: 8px 0; }
+.tldr { background: #ebf8ff; border-left: 4px solid #2b6cb0; padding: 10px 14px; margin: 10px 0; }
+table { border-collapse: collapse; width: 100%; margin: 10px 0; font-size: 13px; }
+th, td { border: 1px solid #ddd; padding: 6px 9px; text-align: left; }
+th { background: #f0f4f8; }
+.en { color: #666; font-style: italic; font-size: 0.93em; }
+ul li { margin: 4px 0; }
+</style>
+</head>
+<body>
+
+<h1>Fast-WAM QLoRA Inference Debug & 验证清单 <span class="en">(Inference Debug & Validation Checklist)</span></h1>
+
+<div class="tldr">
+<b>TL;DR (2026-05-18 noon final · 🔴 Fast-WAM QLoRA 失败，pivot OpenVLA)</b>
+<br><br>
+<b>最终结论：</b>修了 <b>4 个接口 bug</b>（server normalization / image scale / action_horizon / lambda_video）+ loss reweight rescue 全部到位后，step_008000 eval 仍失败，机械臂收起来微抖不动。原因不是 bug 而是 <b>结构不匹配</b>：5B video DiT + 39M LoRA on 50 demo = 严重 overfit memorize 训练帧，eval 时 joint 1 输出 -170°（训练 min -100° 都不到）= 严重 extrapolate。详见 §7 + §8。
+<br><br>
+<b>对照表（server log raw 输出，3 个 ckpt 几乎一样）：</b>
+<table>
+<tr><th>Joint</th><th>step_002200</th><th>step_006500</th><th>step_008000</th><th>训练 range</th></tr>
+<tr><td>1</td><td>-178</td><td>-178</td><td>-170</td><td>[-100, +64]</td></tr>
+<tr><td>2</td><td>+142</td><td>+142</td><td>+141</td><td>[-99, +99]</td></tr>
+<tr><td>5 (grip)</td><td>-17</td><td>-16</td><td>-3.7</td><td>[+0.6, +91]</td></tr>
+</table>
+training action_loss=0.0025（5° per joint memorize）↔ eval 输出超 80° 偏移 = 经典 overfit。
+<br><br>
+<b>Pivot 决策：</b>转 <b>OpenVLA-7B + LoRA r=32</b>（task #97 server scaffold 已有，task #93 写 train.sh）。OpenVLA 离散 action token + 无 video subtask，应避免 Fast-WAM 这两个 pathology。详见 §8.7。
+<br><br>
+<span class="en">FINAL: Fast-WAM QLoRA fails despite 4 interface bug fixes + loss reweight rescue. step_008000 outputs identical to step_002200 (joint 1 = -170°, out of training range [-100, 64]) — model overfits 50 demos (train action_loss=0.0025) but extrapolates wildly at eval. Pivoting to OpenVLA-7B LoRA after compact.</span>
+</div>
+
+<h2>1. 已确认的故障表现 <span class="en">(Confirmed Failure Mode)</span></h2>
+
+<div class="bad">
+Isaac Sim GUI eval (step_004000 LoRA): 爪子朝天不动。Server log:
+<pre>action5=[16253028.0, -24746494.0, 8283850.5, -6396413.5, 2071037.625] grip=-278921216.0</pre>
+正常 SO-101 joint delta 应该在 <code>[-π/4, π/4]</code> 弧度 ≈ <code>[-0.78, 0.78]</code> 内。模型输出 vs 期望 <b>大 8 个数量级</b>。
+</div>
+
+<h2>2. Root cause 链路 <span class="en">(Root Cause Chain)</span></h2>
+
+<ol>
+<li>训练时 model 有多 alias attribute 指向相同 submodule：
+<ul>
+<li><code>self.mot</code> ← 主</li>
+<li><code>self.dit = self.mot</code></li>
+<li><code>self.action_expert</code> = <code>mot.mixtures.action</code></li>
+<li><code>self.video_expert</code> = <code>mot.mixtures.video</code></li>
+</ul>
+</li>
+<li><code>accelerate.save_state</code> → safetensors dedupes shared tensors → 同一权重只在一个 alias 路径下保存。saved state_dict 8324 keys 分布混乱：action_expert 2839 / video_expert 2835 / mot 1226 / dit 1226 / vae 196.</li>
+<li><b>关键洞察：</b><code>action_encoder</code> / <code>action_head</code> / <code>proprio_encoder</code> 三个 SO-101 specific 的 6-D 小 Linear 在训练开始时是 <b>random init</b>（Wan2.2 5B base 里不存在这些 6-D 形状），它们的学到的权重 <b>必须</b>从 ckpt 恢复，无法 fresh reproduce。</li>
+<li>当前 inference 路线 A (fresh build + LoRA wrap + NF4 quant + load_state_dict all keys)：<code>missing=5218</code> <code>unexpected=5517</code>，三个小层的 bnb 量化权重在 alias 错位下没正确 load。</li>
+<li>当前 inference 路线 B (filter out bnb buffers, load only LoRA + bf16 small layers)：三个小层的 bnb-packed uint8 weight 被我误当 bnb base 跳过，结果它们保留 fresh random quantize → garbage output。</li>
+</ol>
+
+<h2>3. 修复路线 <span class="en">(Repair Paths)</span> — codex 建议</h2>
+
+<h3>路线 C：现有 ckpt 救援（立即可做）</h3>
+<p>Fresh build (<b>bf16, 不量化</b>) → LoRA wrap → 把 ckpt 里的 bnb 4bit packed weight <b>手动 dequantize 回 bf16</b> → load_state_dict 进 bf16 model</p>
+
+<pre>from bitsandbytes.functional import QuantState, dequantize_4bit
+from safetensors.torch import load_file
+
+def dequant_bnb_in_state_dict(sd):
+    """Walk sd, find each bnb-saved 4bit weight, dequant to bf16, return clean sd."""
+    BNB_META = (".absmax", ".nested_absmax", ".nested_quant_map",
+                ".quant_map", ".quant_state.bitsandbytes__nf4")
+    # Find base keys (those with quant_state metadata)
+    base_keys = set()
+    for k in sd:
+        if k.endswith(".quant_state.bitsandbytes__nf4"):
+            base_keys.add(k[: -len(".quant_state.bitsandbytes__nf4")])
+
+    out = {}
+    for k, v in sd.items():
+        if any(k.endswith(suf) for suf in BNB_META):
+            continue  # consumed below
+        if k in base_keys:
+            # Reassemble qs_dict for QuantState.from_dict.
+            # bnb expects keys WITHOUT the parameter prefix.
+            qs_dict = {}
+            for suf in BNB_META:
+                if k + suf in sd:
+                    qs_dict[k + suf] = sd[k + suf]
+            qs = QuantState.from_dict(qs_dict, device="cuda")
+            packed = v.to("cuda")
+            bf16 = dequantize_4bit(packed, qs).to("cpu", dtype=torch.bfloat16)
+            out[k] = bf16
+        else:
+            out[k] = v
+    return out
+
+# Usage:
+sd = load_file(ckpt_path, device="cpu")
+sd = dequant_bnb_in_state_dict(sd)
+model = build_fastwam(bf16, no_quant=True)
+apply_lora(model)
+missing, unexpected = model.load_state_dict(sd, strict=False)</pre>
+
+<div class="warn">
+<b>Pitfalls:</b>
+<ul>
+<li>QuantState.from_dict 期望 qs_dict 的 key 是 <i>剥掉模型 prefix 的</i> short keys (<code>"absmax"</code>, <code>"quant_state.bitsandbytes__nf4"</code> 等)，源码里 <code>qs_dict.pop(first_qs_key)</code> 然后 <code>k.split(".")[-1]</code> 处理 — 注意 key 格式</li>
+<li>多 alias dedupe 意味着同一 tensor 在不同 alias 路径下都要恢复（load_state_dict 会自动通过共享内存解决，<b>但</b> alias 必须都被 model.state_dict() 暴露）</li>
+<li>显存：bf16 inference ~13GB（vs NF4 推理 ~5GB），4090 24GB 仍 fit</li>
+</ul>
+</div>
+
+<h3>路线 D：训练时另存干净 LoRA 文件（防范未来）</h3>
+<p>训练 hook 里另存 <code>adapter_small_layers.safetensors</code>，只包含 LoRA + 小层 bf16，跟 accelerate 的 bnb-毒-state_dict 解耦：</p>
+
+<pre>SAVE_PREFIXES = ("action_encoder.", "action_head.", "proprio_encoder.")
+
+def export_adapter_and_small_layers(model, path):
+    sd = model.state_dict()
+    out = {}
+    seen = set()  # dedupe by tensor id (multi-alias)
+    for k, v in sd.items():
+        if id(v) in seen: continue
+        ck = k.split(".", 1)[1] if k.startswith(("mot.", "dit.")) else k  # canonicalize
+        is_lora = ".lora_A." in ck or ".lora_B." in ck
+        is_small = any(p in ck for p in SAVE_PREFIXES)
+        if not (is_lora or is_small): continue
+        seen.add(id(v))
+        out[ck] = v.detach().cpu().to(torch.bfloat16)
+    safetensors.torch.save_file(out, path)
+
+# Wire via accelerator.register_save_state_pre_hook
+def hook(models, weights, input_dir):
+    export_adapter_and_small_layers(
+        accelerator.unwrap_model(models[0]),
+        Path(input_dir) / "adapter_small_layers.safetensors"
+    )
+accelerator.register_save_state_pre_hook(hook)</pre>
+
+<h3>路线 E：导出 LoRA-merged bf16（发布最稳）</h3>
+<p>把 LoRA 合并进 base，导出单一 bf16 ckpt，inference 时不依赖 bnb：</p>
+
+<pre>@torch.no_grad()
+def merge_manual_lora(m):
+    scale = m.alpha / m.r
+    delta = (m.lora_B.weight @ m.lora_A.weight) * scale
+    m.base_layer.weight.add_(delta.to(m.base_layer.weight.dtype))
+    return m.base_layer
+
+for name, mod in list(model.named_modules()):
+    if isinstance(mod, ManualLoraLinear):
+        parent_name, leaf = name.rsplit(".", 1)
+        setattr(model.get_submodule(parent_name), leaf, merge_manual_lora(mod))
+safetensors.torch.save_file(model.state_dict(), "fastwam_merged_bf16.safetensors")</pre>
+
+<h2>4. 待验证清单 <span class="en">(Convergence Validation Checklist)</span></h2>
+
+<p>当前我们只有 train loss 在降这一个信号，不足以证明模型在学。需要补充独立验证：</p>
+
+<table>
+<tr><th>#</th><th>验证项</th><th>方法</th><th>预期/合格线</th></tr>
+<tr><td>1</td><td><b>Offline action MSE</b><br>独立的 hold-out 数据集 eval</td>
+<td>训练数据 60 episode 留 5 个做 hold-out，跑 model.forward，对比 GT action</td>
+<td>action MSE &lt; 0.1（弧度单位）<br>动作方向 cosine sim &gt; 0.5</td></tr>
+<tr><td>2</td><td><b>Inference 数值 sanity</b></td><td>预测 action delta 看分布</td>
+<td>L2 norm per-step &lt; 1.0；max abs &lt; π/2</td></tr>
+<tr><td>3</td><td><b>LoRA adapter 健康</b></td><td>追踪 lora_A.weight.norm() / lora_B.weight.norm() 在训练过程中演变</td>
+<td>norm 单调增长但不爆炸（&lt; 10）<br>没有 NaN/Inf</td></tr>
+<tr><td>4</td><td><b>Loss 分量分解</b></td><td>已有：loss_action + loss_video 分别 log</td>
+<td>两者都降；任何一个 stall/explode 都是 red flag</td></tr>
+<tr><td>5</td><td><b>训练-推理一致性</b></td><td>训练第一个 batch 的 (front, wrist, state, prompt) cache 到磁盘；inference 时同样输入复现，对比 action_pred</td>
+<td>byte-wise 不必一致（dropout/stochastic），但 action 量级和方向应该一致</td></tr>
+<tr><td>6</td><td><b>Activation 探针</b></td><td>训练 step 中段 hook 几个 transformer block 的输出</td>
+<td>activation norm 稳定，无 NaN，跟 step 0 量级相近（数倍内）</td></tr>
+<tr><td>7</td><td><b>Behavior 退化测试</b></td><td>给训练里看过的图像，看预测 action 是否能"复读"训练 trajectory</td>
+<td>开头几步 action 误差 &lt; 0.05 rad（已学到 demos）</td></tr>
+</table>
+
+<h2>5. 行动顺序</h2>
+
+<ol>
+<li><b>立即：</b>实现路线 C，对 step_004000 ckpt 做 dequant，跑 inference 看数值 sanity (验证项 #2)。<i>如果 sane 就 Isaac Sim eval 看行为</i>。</li>
+<li><b>训练并行：</b>恢复 5-phase 训练（已停在 phase 3 step 4040），继续到 step 10000。</li>
+<li><b>训练改造：</b>加路线 D hook，下次 save 时同时产出 <code>adapter_small_layers.safetensors</code>，未来 inference 直接吃干净文件。</li>
+<li><b>训练验证（编码完成路线 C 之后）：</b>跑验证项 #1 (offline action MSE on 5 hold-out episodes)。这是判断"训练是不是白训"的最直接证据。</li>
+<li><b>最终：</b>step 10000 完成后做 #1 + #2 + Isaac Sim eval。</li>
+</ol>
+
+<h2>6. 突破记录 <span class="en">(Breakthrough Log · 2026-05-17 evening — 注：第二天反转，见 §7)</span></h2>
+
+<div class="good">
+<b>结论先行：</b>原 1e7 garbage 不是路线 A/B 加载链路本身的问题，<b>而是训练过程中两个 patch 静默写坏了 ckpt 权重</b>。Revert 两个 patch + 从干净的 step_002000 重新训练 200 step，inference 立刻 sane。
+</div>
+
+<h3>7.1 验证证据 <span class="en">(Validation Evidence)</span></h3>
+
+<table>
+<tr><th>验证项</th><th>结果</th><th>判定</th></tr>
+<tr><td>Offline smoke test (server-side, step_002200)</td>
+<td>action stats: <code>min=-1.6406 max=1.6094 abs_mean=0.4348</code></td>
+<td>🟢 SANE — 全部在 [-π/2, π/2] 内</td></tr>
+<tr><td>Isaac Sim GUI eval (step_002200, 实物 SO-101 sim)</td>
+<td>用户原话："会动了，但动作非常生疏，爪子亲了几下橙子，就躺平微抖了"</td>
+<td>🟡 早期学习信号 — 模型确实在学 demos，但 2200 step 远未收敛</td></tr>
+<tr><td>对比：旧 step_004000 (被毒 ckpt)</td>
+<td><code>abs_max ≈ 1e9</code> grip <code>-2.8e8</code></td>
+<td>🔴 garbage — 已确认是 patch 造成的训练时污染</td></tr>
+</table>
+
+<h3>7.2 Root cause (修订版) <span class="en">(Updated Root Cause)</span></h3>
+
+<p>原 §2 root cause 链路（多 alias dedupe + bnb buffer 错位）<b>是次要</b>，真正吃掉权重的是训练侧两个 "好心办坏事" 的 patch：</p>
+
+<div class="bad">
+<b>毒患 A：<code>safetensors.load_file</code> strip bnb buffers</b><br>
+症状：phase 1 干净（loss 2.26→0.05），phase 2 一开始 loss 直接 1e21。<br>
+原因：resume 时把 <code>.absmax / .quant_state.bitsandbytes__nf4</code> 等 bnb 元数据当成"加载噪声"过滤掉了，结果 bnb Params4bit 反量化时拿不到 absmax，权重全归 0/inf。<br>
+修复：<b>删除 strip 逻辑</b>，让 bnb buffers 原样进 state_dict。
+</div>
+
+<div class="bad">
+<b>毒患 B：<code>Optimizer.load_state_dict = no-op</code></b><br>
+症状：resume 后 loss 从 0.5 急速爆到 290000，<b>不在第一步</b>，而是第 ~20 step。<br>
+原因：optimizer 没恢复 momentum/variance，相当于 cold-start Adam 但 LR 还是 warmed-up 后的值 → 第一波梯度直接把 LoRA 权重打飞。<br>
+修复：<b>恢复 load_state_dict</b>，并加 bf16→fp32 promotion wrapper（torch 2.5 strict dtype 要求 fp32 state）。
+</div>
+
+<h3>7.3 当前生效的 patches <span class="en">(Active Patches After Revert)</span></h3>
+
+<pre>qlora_utils.py · patch_trainer_for_qlora():
+  1. Trainer freeze override (LoRA-only trainable)
+  2. Optimizer.load_state_dict wrapper · bf16→fp32 promotion
+  3. AdamW · foreach=False fused=False (avoid cross-device tensor list bug)
+  4. bnb _get_tensor_stream try/except wrapper · ctypes.c_void_p(0) fallback
+     (workaround for torch 2.5 / bnb 0.45.5 CUDA stream API drift)
+
+REMOVED (harmful):
+  ✗ safetensors.load_file strip bnb buffers  ← caused 1e21 corruption
+  ✗ Optimizer.load_state_dict = no-op         ← caused 0.5→290000 explosion</pre>
+
+<h3>7.4 Inference 加载路线最终敲定 <span class="en">(Inference Path Finalized)</span></h3>
+
+<div class="good">
+<b>路线 C 通过：bf16 + manual dequant</b><br>
+- Build fastwam fresh in bf16 (no_quant=True), apply LoRA wrapper<br>
+- 用 <code>QuantState.from_dict</code> + <code>dequantize_4bit</code> 把 ckpt 里 bnb-packed 4bit weight 手动还原成 bf16<br>
+- <code>load_state_dict(strict=False)</code> 进 bf16 model<br>
+- 显存 ~13GB，4090 24GB 仍 fit；inference 全 bf16 不依赖 bnb runtime
+</div>
+
+<p>server 实现：<code>/home/david/work/isaaclab-experience/server/fastwam_leisaac/server_qlora.py</code><br>
+prompt 改成只用 cached（UMT5 在 CPU 上 4 分钟 / 次，re-encode 会让 ZMQ 死等）。</p>
+
+<h3>7.5 训练稳定性 <span class="en">(Training Stability)</span></h3>
+
+<p>之前 fastwam (unstable) env 频繁随机 SIGKILL/SIGSEGV，已切到 <code>fastwam_stable</code>：
+<code>torch 2.5.1+cu124 / bnb 0.45.5 / flash-attn 2.7.4.post1 / peft 0.13.2</code>。
+watchdog 已调 <code>save_every=50</code>（之前 100，crash 太频繁丢 step），<code>MAX_ATTEMPTS=30</code>。</p>
+
+<h3>7.6 收敛进度 <span class="en">(Convergence Progress)</span></h3>
+
+<table>
+<tr><th>Step</th><th>Loss</th><th>Inference 表现</th><th>Isaac Sim 行为</th></tr>
+<tr><td>0</td><td>2.26</td><td>(未测)</td><td>—</td></tr>
+<tr><td>2000 (phase1 end)</td><td>0.05</td><td>SANE [-1.64, 1.61]</td><td>—</td></tr>
+<tr><td>2200 (phase2 mid)</td><td>~0.04</td><td>SANE</td><td>🟡 会动 + 触橙 + 躺平</td></tr>
+<tr><td>10000 (目标)</td><td>?</td><td>(待 phase 5 完成)</td><td>目标：grasp success ≥ 1/3</td></tr>
+</table>
+
+<h3>7.7 教训与下一步 <span class="en">(Lessons & Next Steps)</span></h3>
+
+<ul>
+<li><b>"Loss 在降"不是真信号。</b>毒患 A 期间 loss 看起来挺好看，但权重已经被静默写坏；只有 offline smoke test 才能抓到。→ 把 §4 验证项 #1 (offline action MSE) 接入 watchdog，每个 phase 结束自动跑。</li>
+<li><b>判定 ckpt 健康看 phase 第一个 loss。</b>resume 后第一个 step loss 应该 ≈ 上次 save 时的 loss。如果飙到 10× 以上 = patch 写坏 state。</li>
+<li><b>Patch 写多了别合并测。</b>strip-bnb + no-op-optimizer 两个 patch 是分别加上去的，叠加后症状互相掩盖（一个让 loss 看起来"在收敛"，另一个写坏权重），合一起再 debug 就找不到了。下次每加一个 patch 都跑 200 step smoke 看 inference action range。</li>
+<li><b>剩下要做：</b>路线 D（训练时 hook 另存干净 adapter 文件，跟 bnb-毒-state_dict 解耦）；step 10000 后再做完整 Isaac Sim 横评。</li>
+</ul>
+
+<h2>7. 反转剧情 <span class="en">(Plot Twist · 2026-05-18 morning)</span></h2>
+
+<div class="bad">
+昨晚（§7）以为已经突破，今早 GUI eval 用户反馈：「机械臂收起来微抖，不接近橙子」。step_006500 跟 step_2200 同样退化。两个独立 root cause 叠加，互相掩盖。
+</div>
+
+<h3>8.1 根因 A：Server 端 normalization 完全缺失 <span class="en">(Missing Normalizer)</span></h3>
+
+<p>训练时 <code>fastwam_processor.py</code> 用 <code>LinearNormalizer</code> min/max 把 state/action 归一到 <code>[-1, 1]</code>：</p>
+
+<pre>scale = 2 / (max - min)
+offset = -1 - 2*min/(max-min)
+forward(x) = clamp(x * scale + offset, -5, 5)
+backward(x) = (x - offset) / scale</pre>
+
+<p>Dataset stats (degrees)：joint 2 范围 <code>[-99, +99]</code>，joint 1 范围 <code>[-100, +64]</code> 等。</p>
+
+<p>但原 <code>server_qlora.py</code> <b>完全跳过 normalize</b>：直接喂 raw degree state，model 看到 50° = 模型期望的 +0.5 但实际是 50（OOD 50×）；输出当 raw delta 用 <code>arm_delta_scale=0.05</code> hack 凑数。</p>
+
+<div class="good">
+<b>修复（commit pending）：</b>
+<ul>
+<li>启动时 load <code>dataset_stats.json</code>，建 <code>_state_scale/_state_offset</code> + <code>_action_scale/_action_offset</code></li>
+<li><code>predict_action</code> 第 1 步：<code>state_norm = clip(state * scale + offset, -5, 5)</code> 给模型</li>
+<li>model 输出后：<code>act_phys = (act_norm - offset) / scale</code></li>
+<li>砍掉 <code>arm_delta_scale</code> 和 <code>cumsum</code> hack（model 输出本来就是绝对关节位置，dataset 验证 <code>action.mean ≈ state.mean</code>）</li>
+</ul>
+</div>
+
+<p><b>修了之后 eval 仍失败</b> → normalize 是必要不充分。</p>
+
+<h3>8.2 根因 B：joint video+action loss 在小样本上的 pathology <span class="en">(Loss Imbalance Pathology)</span></h3>
+
+<p>Fast-WAM 是 <b>video + action 联合 diffusion</b> training：</p>
+
+<pre># fastwam_idm.py:222
+loss_total = self.loss_lambda_video * loss_video + self.loss_lambda_action * loss_action</pre>
+
+<p>默认 <code>lambda_video=lambda_action=1.0</code>。但：</p>
+
+<table>
+<tr><th>Token type</th><th>Token count / sample</th><th>Loss MSE</th><th>Effective gradient norm</th></tr>
+<tr><td>Video latents</td><td>33 frames × ~16 token/frame ≈ <b>528</b></td><td>0.28</td><td><b>22×</b></td></tr>
+<tr><td>Action latents</td><td>24</td><td>0.08</td><td>1×</td></tr>
+</table>
+
+<p>结果：<b>video diffusion 吃掉 LoRA 表达能力</b>，action head 学不到 visual → action 映射。Smoke test 看模型 raw output ±2 in normalized space (训练 target 是 <code>[-1, 1]</code>) → un-normalize 后超出物理可达 joint range → 机器人撞限位停在 "收起" 姿态。</p>
+
+<h3>8.3 为什么其他 baseline work，唯独 LoRA VLA 失败？</h3>
+
+<table>
+<tr><th>模型</th><th>训练方式</th><th>参数</th><th>结果</th></tr>
+<tr><td>ACT</td><td>full FT</td><td>80M</td><td>🟢 1/1</td></tr>
+<tr><td>DP</td><td>full FT</td><td>267M</td><td>🟡 0-3/3</td></tr>
+<tr><td>SmolVLA</td><td>full FT 30k step</td><td>450M</td><td>🟡 2/5</td></tr>
+<tr><td><b>π0.5 MLX+LoRA</b></td><td><b>LoRA</b></td><td>3.4B + 5M</td><td>🔴 0/3</td></tr>
+<tr><td><b>Fast-WAM QLoRA</b></td><td><b>QLoRA</b></td><td>5B + 39M</td><td>🔴 0/N</td></tr>
+<tr><td>GR00T N1.5</td><td>(已有 ckpt)</td><td>—</td><td>🟢 1/1</td></tr>
+</table>
+
+<div class="warn">
+<b>注意：</b>π0.5 失败和 Fast-WAM 失败 <b>不是同因</b>。π0.5 是纯 action-VLA (无 video subtask)，失败原因可能是 MLX backend 或 LoRA rank 不够。Fast-WAM 的 video loss pathology 是 multimodal joint training 特有。
+<br><br>
+→ <b>OpenVLA / X-VLA / LingBot-VLA 这种纯 vision→action 无 video subtask 的 VLA 不应有此 pathology</b>，LoRA 在小样本上仍有希望。
+</div>
+
+<h3>8.4 Rescue 方案（按 ROI 排序）<span class="en">(Recovery Options Ranked by ROI)</span></h3>
+
+<table>
+<tr><th>#</th><th>方案</th><th>改动量</th><th>预期</th><th>状态</th></tr>
+<tr><td>1</td><td><b>lambda_video=0.0</b> 强 reweight</td><td>1 行 config</td><td>action 梯度独占，1500 step 内 action_loss 应明显下降</td><td>🟡 正在试</td></tr>
+<tr><td>2</td><td>LoRA r=16 → r=64 + target='all-linear' (含 FFN)</td><td>qlora_utils.py 5 行</td><td>trainable 39M → 200M，容量 5×</td><td>⏸ 备用</td></tr>
+<tr><td>3</td><td>完全 freeze video DiT 参数 (forward 也不跑)</td><td>trainer 加 freeze hook</td><td>compute 减半，彻底消除 video 干扰</td><td>⏸ 备用</td></tr>
+<tr><td>4</td><td>action head clamp output 到 tanh [-1, 1]</td><td>action_head 加 tanh</td><td>治标，避免超出物理 range</td><td>⏸ 临时</td></tr>
+</table>
+
+<h3>8.5 当前进展 <span class="en">(Current Status · 2026-05-18 10:40)</span></h3>
+
+<ul>
+<li>已 patch <code>configs/model/fastwam_qlora.yaml</code>: <code>lambda_video: 0.0</code></li>
+<li>已 patch <code>server_qlora.py</code>: 加 <code>_load_normalizer_stats</code> + 修 <code>predict_action</code></li>
+<li>已加 prompt context cache (<code>~/.cache/fastwam_leisaac/prompt_ctx/*.pt</code>)，下次 server 启动 < 1 sec（vs 之前 4 min UMT5 CPU encode）</li>
+<li>已开 tmux session <code>codex_consult</code> 让 GPT-5.5 做 second opinion（异步）</li>
+<li>即将从 step_006500 续训 → step_008000（1500 step），观察 action_loss 是否解锁</li>
+</ul>
+
+<h3>8.6 第 3-4 个接口 bug + 最终 eval 仍失败 <span class="en">(More Interface Bugs Found, Eval Still Fails)</span></h3>
+
+<p>codex (GPT-5.5) second opinion 提醒查 5 项接口（action horizon / joint 顺序 / 夹爪尺度 / camera crop / temporal smoothing），实际 audit 又发现 2 个 bug：</p>
+
+<table>
+<tr><th>#</th><th>Bug</th><th>训练 vs Server</th><th>状态</th></tr>
+<tr><td>3</td><td>action_horizon mismatch</td><td>训练 32 (硬约束 num_frames-1 整除) vs server 24</td><td>✅ 改 32</td></tr>
+<tr><td>4</td><td>image normalization 路径 (false alarm)</td><td>训练 ToTensor + Normalize(0.5,0.5) = server <code>×2/255-1</code></td><td>✅ 等价</td></tr>
+</table>
+
+<p><b>所有接口 bug 修完后</b>从 step_006500 续训 1500 step → step_008000，启 server (action_horizon=32) + Isaac Sim eval。用户实测：「机械臂收起来微抖，不接近橙子，跟之前一样」。Server log 看模型 raw 输出基本没变。</p>
+
+<div class="bad">
+<b>训练 loss 速降 ≠ 模型在学：</b>action_loss 在 lambda_video=0 后从 0.08 暴跌到 0.0025，看起来「在学」。但 0.0025 在 normalized [-1,1] 空间 = 5° 每 joint，是<b>训练数据上</b>的精度。Eval 时模型给出 joint 1 = -170°（训练 min 是 -100°），严重 extrapolate。<b>训练 loss 测量的是 memorization，不是 generalization。</b>
+</div>
+
+<h3>8.7 Pivot 决策与 OpenVLA 路线 <span class="en">(Pivot to OpenVLA)</span></h3>
+
+<p>结论：<b>Fast-WAM QLoRA 在 50-demo SO-101 上结构性不适配</b>。继续投入 ROI 极低。</p>
+
+<table>
+<tr><th>问题</th><th>Fast-WAM 5B + 39M LoRA</th><th>OpenVLA-7B + LoRA r=32 (~110M)</th></tr>
+<tr><td>架构</td><td>video DiT + action expert joint training</td><td>纯 vision→action discrete token</td></tr>
+<tr><td>video loss pathology</td><td>🔴 22× 梯度污染</td><td>🟢 不存在（无 video subtask）</td></tr>
+<tr><td>action 表示</td><td>连续 flow-matching → 易超 range</td><td>离散 token (256 bins / DOF) → 强制 bounded</td></tr>
+<tr><td>50 demo 适配</td><td>🔴 严重 overfit</td><td>🟡 + Open X-Embodiment 预训练（970k traj 跨 22 个 robot）</td></tr>
+<tr><td>4090 24GB 训练</td><td>已实证 fit</td><td>需 batch=4 + gradient_checkpointing</td></tr>
+<tr><td>实时性</td><td>action chunk → 1.07s / chunk</td><td>autoregressive 6 token / action → ~480ms per action @ bf16</td></tr>
+</table>
+
+<p>OpenVLA 的实时性是新风险点（每 sim step ~480ms vs 30Hz 要求 33ms）。缓解：</p>
+<ul>
+<li>降 sim step_hz 到 10Hz（dataset 30Hz vs eval 10Hz 有 distribution shift 但其他模型也这么用）</li>
+<li>4-bit 量化 inference 加速 2-3×</li>
+<li>必要时上 vLLM / TensorRT 部署</li>
+</ul>
+
+<p>下一步（compact 后接续）：</p>
+<ol>
+<li>(task #93) 写 <code>LeIsaac/scripts/finetune/openvla/train.sh</code>（LoRA r=32, target=q_proj+v_proj, batch=4, lr=5e-5, max_steps=10000）</li>
+<li>(task #94) 启动 OpenVLA 训练 8-12h，watchdog + auto-prune 复用 [[feedback-training-save-policy]]</li>
+<li>训练中：跑 ACT/GR00T baseline 横评 verify env 正常</li>
+<li>OpenVLA 收敛后 server 启动 + Isaac Sim eval（server scaffold 已 done task #104）</li>
+</ol>
+
+<h3>8.8 教训 <span class="en">(Lessons)</span></h3>
+
+<ul>
+<li><b>多个 bug 互相掩盖时，loss 在降是假信号。</b>video loss 即使带着崩坏 LoRA 也照样降，不代表 action 在学。</li>
+<li><b>Train 和 serve 必须 byte-exact match preprocessing chain。</b>少一个 normalize step 就是 OOD 50×。一次 audit 5 项才发现 4 个 bug。</li>
+<li><b>Joint multi-task loss 必须按 token count 重新计算 effective weight。</b>看 lambda=1.0 ≠ 实际 1:1，要看 grad norm。</li>
+<li><b>"LoRA 在小样本失败"是过早结论。</b>是 Fast-WAM 的 joint training 特有 pathology，不能推到 OpenVLA / X-VLA。但 <b>"Fast-WAM 5B + 39M LoRA 不适合 50-demo BC"是站得住的结论</b>。</li>
+<li><b>训练 loss 降 ≠ 模型在学：</b>0.0025 训练 loss 看似收敛，但在 normalized 空间是「在训练数据上的 5° per joint memorize」，eval 时直接 extrapolate 80°+ 出训练 range。<b>看泛化必须 offline action MSE on hold-out 或 Isaac Sim eval，不能信训练 loss。</b></li>
+<li><b>当多个 fix 都加完仍失败，承认架构不适配，不要无穷调参。</b>本次 6+h 调试 / 训练 6h 后转向 OpenVLA，比继续硬撑 r=64 / freeze video 风险低。</li>
+<li><b>所有 patch 都要留原因（why+how to apply），便于 compact 后接续。</b>否则下次重新研究 6h。</li>
+</ul>
+
+<h2>8. 关联文档</h2>
+<ul>
+<li><a href="fastwam_finetune_plan.html">fastwam_finetune_plan.html</a> — 原始 QLoRA 设计</li>
+<li><a href="fastwam_lora_vs_qlora_24gb.html">fastwam_lora_vs_qlora_24gb.html</a> — 24GB 显存账</li>
+<li><code>/home/david/.claude/projects/.../memory/fastwam-qlora-finetune.md</code> — 训练 patches 记录</li>
+<li><code>/home/david/work/isaaclab-experience/server/fastwam_leisaac/server_qlora.py</code> — 当前 inference server（待路线 C 改造）</li>
+</ul>
+
+</body>
+</html>
