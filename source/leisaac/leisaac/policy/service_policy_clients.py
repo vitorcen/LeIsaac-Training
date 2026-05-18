@@ -358,17 +358,15 @@ class LeRobotServicePolicyClient(Policy):
             }
         """
         self.latest_action_step += 1
-        # must_go=True bypasses the server's "Observation too similar" dedup
-        # filter. Upstream lerobot's threaded RobotClient flips this on only
-        # when its local action queue drains; LeIsaac runs one obs per sim
-        # step synchronously and re-sends after each action chunk is
-        # consumed, so every observation is effectively "queue-empty" — set
-        # must_go always to avoid getting filtered into a deadlock.
+        # DEBUG: must_go=False experimental — testing if must_go=True forces DP
+        # to see near-identical post-grasp obs frames at every step, defeating
+        # its n_obs_steps history conditioning and trapping it in a hold-pose
+        # attractor. Will revert if DP doesn't recover.
         observation = TimedObservation(
             timestamp=time.time(),
             observation=raw_observation,
             timestep=self.latest_action_step,
-            must_go=True,
+            must_go=False,
         )
 
         # send observation to policy server
