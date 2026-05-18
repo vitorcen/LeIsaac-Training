@@ -43,24 +43,43 @@ _Directory layout follows semantic split:_
 ### 2. PickOrange 多策略横评
 _PickOrange multi-policy benchmark_
 
-把 `LeIsaac-SO101-PickOrange-v0` 当 benchmark，统一 eval harness 跑多个 policy family。最新结果：
-_Treating `LeIsaac-SO101-PickOrange-v0` as a benchmark and evaluating multiple policy families through the same harness:_
+把 `LeIsaac-SO101-PickOrange-v0` 当 benchmark，统一 eval harness 跑 7 个 baseline，3 round × 每 round 3 颗橙子 = 共 9 颗。
+_Treating `LeIsaac-SO101-PickOrange-v0` as a benchmark; 7 baselines × 3 rounds × 3 oranges = 9 oranges total per policy._
 
-| Policy | Params | `config.type` | 结果 / Result | 备注 / Notes |
-| --- | --- | --- | --- | --- |
-| [`LightwheelAI/leisaac-pick-orange-v0`](https://huggingface.co/LightwheelAI/leisaac-pick-orange-v0) | ~3B | `gr00t_n1_5` | ✅ 3/3 within 30s | upstream 官方 ckpt — SOTA |
-| [`shadowHokage/act_policy`](https://huggingface.co/shadowHokage/act_policy) | ~80M | `act` | ✅ 1/1 within 60s | from-scratch, 10k step, batch 8 — 我们的复刻参考 |
-| **[`wsagi/ACT-PickOrange`](https://huggingface.co/wsagi/ACT-PickOrange) （自训 / ours）** | ~80M | `act` | ✅ **1/1 @ horizon=32** | 复刻 shadowHokage 配方，10k step；horizon=16 卡死 2nd 颗 |
-| **[`wsagi/DiffusionPolicy-PickOrange`](https://huggingface.co/wsagi/DiffusionPolicy-PickOrange) （自训 / ours）** | ~267M | `diffusion` | ⚠️ 1-2/3 | UNet 1D + ResNet18，DDIM 32-step inference hot-swap |
-| [`edge-inference/smolvla-so101-pick-orange`](https://huggingface.co/edge-inference/smolvla-so101-pick-orange) | ~450M | `smolvla` | ❌ 0/3 @ 60s | 第三方 SmolVLA v1 fine-tune |
-| 本地 `smolvla2-leisaac-pick-orange` *(命名误称，实际 `config.type=smolvla` v1)* | ~450M | `smolvla` | 🟡 2/5 @ horizon=50, 5×120s | 30k step, batch 8, schema-free base |
+**Eval config**: `eval_rounds=3`, `episode_length_s=120s` (sim time), `max_round_wall_s=180s` (wall-clock cap), step_hz=30 except GR00T family which uses step_hz=60 (per [§step_hz hypothesis](#-关键-inference-配置--policy_action_horizon32))。Eval 复现：`bash scripts/benchmark/run_all_baselines.sh`，详见 [`scripts/benchmark/`](../scripts/benchmark/)。
+
+**Success criteria — 双口径** (snapshot 2026-05-18):
+- **Strict ✅** = 全 3 颗 sticky `put_orange_to_plate` 至少捕到一帧（要求 EE-near + gripper-open + xy-in-plate 同时满足）— 严格下界，可能漏 <33ms 瞬态。
+- **🍊 (n/9)** = sticky 累计计数，部分功劳。
+- **Env (env-only)** = `task_done` (orange xyz in plate box + arm rest)，可能假成功（橙子被碰到盘边桌面、高度仍 ≈plate 时误判）。
+
+_Sort: strict Rounds DESC → 🍊 DESC → time ASC._
+
+| Policy | Params | `config.type` | Strict ✅ | 🍊 (n/9) | Pick rate | Avg round | Peak VRAM | GPU util | Per-round detail |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| **[`hi-space/GR00T-N1.6-3B-Pick-Orange`](https://huggingface.co/hi-space/GR00T-N1.6-3B-Pick-Orange) (step_hz=60)** 🥇 | ~3B | `gr00t_n1_6` | **2/3** | **6/9** | **66.7%** | 96s | 17.3 GB | 31.1% | 3🍊@39s✅ / 0🍊@180s / 3🍊@68s✅ |
+| [`wsagi/SmolVLA-PickOrange`](https://huggingface.co/wsagi/SmolVLA-PickOrange) **(自训 / ours)** 🥈 | ~450M | `smolvla` | 1/3 | 5/9 | 55.6% | 355s | 10.0 GB | 23.0% | 3🍊@158s✅ / 0🍊@552s / 2🍊@355s |
+| [`LightwheelAI/leisaac-pick-orange-v0`](https://huggingface.co/LightwheelAI/leisaac-pick-orange-v0) **(step_hz=60)** 🥉 | ~3B | `gr00t_n1_5` | 0/3 | 4/9 | 44.4% | 105s | 16.2 GB | 36.1% | 1🍊@180s / 1🍊@55s / 2🍊@79s |
+| [`wsagi/DiffusionPolicy-PickOrange`](https://huggingface.co/wsagi/DiffusionPolicy-PickOrange) **(自训 / ours)** | ~267M | `diffusion` | 0/3 | 2/9 | 22.2% | 108s | 10.6 GB | 22.3% | 0🍊@159s / 2🍊@105s / 0🍊@60s |
+| [`wsagi/ACT-PickOrange`](https://huggingface.co/wsagi/ACT-PickOrange) **(自训 / ours)** | ~80M | `act` | 0/3 | 2/9 | 22.2% | 130s | 10.4 GB | 24.7% | 0🍊@106s / 0🍊@180s / 2🍊@103s |
+| [`shadowHokage/act_policy`](https://huggingface.co/shadowHokage/act_policy) (h=16) | ~80M | `act` | 0/3 | 1/9 | 11.1% | 127s | 8.6 GB | 24.6% | 0🍊@157s / 1🍊@77s / 0🍊@146s |
+| [`edge-inference/smolvla-so101-pick-orange`](https://huggingface.co/edge-inference/smolvla-so101-pick-orange) | ~450M | `smolvla` | 0/3 | 0/9 | 0.0% | 168s | 10.2 GB | 23.4% | 0🍊@180s / 0🍊@167s / 0🍊@157s |
+| π0.5 **(自训 / ours)** — pt-v3 final_lora.npz | 3.36B + 5M LoRA | `pi05` | 0/3 | 0/9 | 0.0% | 180s | 18.7 GB | 25.2% | 0🍊@180s / 0🍊@180s / 0🍊@180s |
+
+> 历史快照在 [`results/benchmark/snapshots/`](../results/benchmark/snapshots/) — 包含 round 1 (step_hz=30 全部) / round 2 (sticky-strict + GR00T step_hz=60 fix)。原始 JSON + 1Hz GPU CSV 都在内。
 
 **核心结论 / Headlines**：
 
-- 在 60-episode × 36k frames 的小数据规模下，**专精 visuomotor 的小模型（ACT 80M）追平 SOTA 大 VLA（GR00T 3B）**，远超 SmolVLA 这种大参数 VLM。
-  _At 60-episode × 36k-frame data scale, small visuomotor-specialised models (ACT 80M) match SOTA large VLAs (GR00T 3B) and significantly outperform large VLM-based policies (SmolVLA)._
-- **三个独立架构（ACT 回归 / DP 扩散 / SmolVLA VLM）共同 OOD on 3rd orange**：dataset 60 ep × 每集 1 次"放最后一颗"演示 → 全 family 在第 3 颗变难。**不是模型问题，是数据问题。**
-  _Three independent architectures (ACT regression / DP diffusion / SmolVLA VLM) share an OOD bottleneck on the 3rd orange — caused by the dataset providing only one "place last orange" demo per episode. **Data problem, not model problem.**_
+- 🥇 **GR00T N1.6 是当前 SOTA** — 2/3 strict, 6/9 🍊, avg 96s/round。N1.5 仅 4/9 — 同 family 但 N1.6 强 1.5×。
+- ⚙️ **step_hz=60 对 GR00T 系列关键**：N1.5 step_hz=30 → 1🍊；step_hz=60 → 4🍊（4x boost）。dataset 是 30fps 但 GR00T 的 chunk action 输出预计高于 30Hz 应用以达自然速度。ACT/SmolVLA/DP 在 30Hz 表现一致，未做 60Hz sweep。
+- 🟡 **SmolVLA (self) 数据上限 5/9** ≫ SmolVLA (other) 0/9 — 同架构差异完全来自训练（local 30k step vs edge-inference 早期 ckpt）。
+- ⚠️ **80M ACT 当前 0/3** — 但记忆里 horizon=32 配合曾经 1/1。回归疑似来自 `sim_warmup_steps=30` 默认值变化（commit 1e1bae6）— 仍在 diagnose。
+- 🍊 **第 3 颗橙子普遍卡** — dataset 60 ep × 每集 1 次"放最后一颗"演示导致；与历史结论一致（**数据问题，不是模型问题**）。
+
+详细 debug / hypothesis tracking：
+- step_hz=30 vs 60 对 GR00T 的影响 — see [`docs/training/policy_step_hz_postmortem.html`](docs/training/) (TBD)
+- sticky vs env.task_done 双口径 — see [`scripts/benchmark/aggregate.py`](../scripts/benchmark/aggregate.py)
+- 完整 reproducer：[`scripts/benchmark/run_all_baselines.sh`](../scripts/benchmark/run_all_baselines.sh)
 
 更详细的 round-by-round eval 数据 + DiT / SmolVLA2 / Octo / RDT 后续 priority 见 [`docs/finetune/policy_comparison_priorities.html`](docs/finetune/policy_comparison_priorities.html)。
 

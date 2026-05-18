@@ -201,6 +201,7 @@ class LeRobotServicePolicyClient(Policy):
         device: str = "cuda",
         camera_feature_names: dict[str, str] | None = None,
         empty_camera_feats: list[tuple[str, tuple[int, int, int]]] | None = None,
+        must_go: bool | None = None,
     ):
         """
         Args:
@@ -276,6 +277,16 @@ class LeRobotServicePolicyClient(Policy):
 
         self.latest_action_step = 0
         self.skip_send_observation = False
+        # Per-policy must_go: short-chunk policies (DP, chunk=8) output hold-pose
+        # when obs is static (e.g. after grasp), and must_go=True forces server
+        # to keep returning that same hold-pose chunk → grasp-and-freeze attractor.
+        # must_go=False lets server's dedup pause us briefly (200ms retry),
+        # gives physics time to settle → next obs has micro-variance → DP breaks
+        # out of the hold loop and emits release. Long-chunk policies (ACT 100,
+        # SmolVLA 50) traverse meaningfully between chunks so dedup never fires.
+        if must_go is None:
+            must_go = (policy_type != "diffusion")
+        self.must_go = bool(must_go)
 
         self._init_service()
 
@@ -358,15 +369,16 @@ class LeRobotServicePolicyClient(Policy):
             }
         """
         self.latest_action_step += 1
-        # DEBUG: must_go=False experimental — testing if must_go=True forces DP
-        # to see near-identical post-grasp obs frames at every step, defeating
-        # its n_obs_steps history conditioning and trapping it in a hold-pose
-        # attractor. Will revert if DP doesn't recover.
+        # must_go is per-policy (set in __init__). True for long-chunk policies
+        # (ACT 100, SmolVLA 50, GR00T 16 with macro-motion) so server never
+        # dedups out our obs → no client-side deadlock. False for short-chunk
+        # policies (DP 8) where dedup is the only mechanism that breaks the
+        # post-grasp hold-pose attractor.
         observation = TimedObservation(
             timestamp=time.time(),
             observation=raw_observation,
             timestep=self.latest_action_step,
-            must_go=False,
+            must_go=self.must_go,
         )
 
         # send observation to policy server

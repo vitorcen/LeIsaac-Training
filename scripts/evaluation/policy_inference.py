@@ -38,6 +38,45 @@ parser.add_argument("--policy_action_horizon", type=int, default=16, help="Actio
 parser.add_argument("--policy_language_instruction", type=str, default=None, help="Language instruction of the policy.")
 parser.add_argument("--policy_checkpoint_path", type=str, default=None, help="Checkpoint path of the policy.")
 parser.add_argument(
+    "--metrics_out",
+    type=str,
+    default=None,
+    help="If set, dump per-round metrics (oranges_placed / duration_s / success) as JSON to this path.",
+)
+parser.add_argument(
+    "--metrics_label",
+    type=str,
+    default=None,
+    help="Display label for the policy in the metrics JSON (e.g. 'ACT (self) — wsagi/ACT-PickOrange').",
+)
+parser.add_argument(
+    "--max_round_wall_s",
+    type=float,
+    default=0.0,
+    help=(
+        "Hard wall-clock cap per round (seconds, 0 disables). When exceeded the "
+        "round is recorded as failed/skipped with whatever placed_flags accumulated "
+        "and the eval moves on. Separate from episode_length_s (which is sim-time)."
+    ),
+)
+parser.add_argument(
+    "--stuck_window_s",
+    type=float,
+    default=30.0,
+    help=(
+        "Detect 'shaking attractor' failure mode: if every joint's position range "
+        "(max-min) over the last N wall-clock seconds is below stuck_eps_rad, "
+        "skip the round as a failed-stuck (chunk-policy obs invariance trap). "
+        "0 disables."
+    ),
+)
+parser.add_argument(
+    "--stuck_eps_rad",
+    type=float,
+    default=0.05,
+    help="Max-min threshold (radians, all joints) for the stuck detector. Default 0.05 ≈ 2.9°.",
+)
+parser.add_argument(
     "--sim_warmup_steps",
     type=int,
     default=30,
@@ -357,16 +396,139 @@ def main():
 
     # record the results
     success_count, episode_count = 0, 1
+    per_round_metrics: list[dict] = []
+    # "sticky" per-orange placed flag for the current round.
+    # subtask_terms.put_orangeNNN_to_plate is true only at the *moment of release*
+    # (gripper-open + EE-near + orange-in-plate-region simultaneously). Once the
+    # arm moves on to the next orange that bit flips back to False, so we OR
+    # over the whole round to get "was it ever placed".
+    placed_flags = [False, False, False]
+
+    def _read_subtask_flags(od):
+        """Returns 3-tuple of bools (place1, place2, place3) for current step.
+
+        Uses the env's strict put_orange_to_plate observation (EE-near +
+        gripper-open + xy-in-plate) as a primary signal. Falls back to a
+        looser placement check via direct scene query (orange xy in plate
+        ±10cm AND z within plate height ±7cm, same box as task_done) — this
+        catches policies that release fast then retract EE (e.g. DP), where
+        the strict EE-near check misses the transient release moment.
+        """
+        # Primary: strict subtask_terms read
+        primary = [False, False, False]
+        try:
+            st = od["subtask_terms"]
+        except (KeyError, TypeError):
+            st = None
+        if st is not None:
+            for i, k in enumerate(("put_orange001_to_plate", "put_orange002_to_plate", "put_orange003_to_plate")):
+                v = st.get(k)
+                if v is not None:
+                    try:
+                        primary[i] = bool(v[0].item()) if hasattr(v, "shape") else bool(v)
+                    except Exception:
+                        pass
+        # Fallback (loose): direct scene query — orange in plate xy ±10cm AND z ±7cm.
+        # Anchored to plate position so it tracks the actual scene; matches
+        # task_done's box exactly (minus the arm-rest requirement).
+        loose = [False, False, False]
+        try:
+            plate = env.scene["Plate"]
+            plate_xyz = plate.data.root_pos_w[0] - env.scene.env_origins[0]
+            for i, name in enumerate(("Orange001", "Orange002", "Orange003")):
+                orange = env.scene[name]
+                oxyz = orange.data.root_pos_w[0] - env.scene.env_origins[0]
+                dx = (oxyz[0] - plate_xyz[0]).item()
+                dy = (oxyz[1] - plate_xyz[1]).item()
+                dz = (oxyz[2] - plate_xyz[2]).item()
+                if abs(dx) < 0.10 and abs(dy) < 0.10 and abs(dz) < 0.07:
+                    loose[i] = True
+        except Exception:
+            pass
+        return (
+            primary[0] or loose[0],
+            primary[1] or loose[1],
+            primary[2] or loose[2],
+        )
+
+    round_start_t = time.time()
+
+    # File-trigger so the operator can force "next round = fail" from CLI when
+    # Isaac Sim viewport doesn't have keyboard focus (the R-key path in
+    # Controller depends on carb.input which only fires when the viewport is
+    # focused). Create the file: `touch <metrics_dir>/.skip_round` — the loop
+    # picks it up at the next inner-step boundary, records partial flags, and
+    # advances to the next episode.
+    import os as _os
+    _skip_dir = (
+        _os.path.dirname(_os.path.abspath(args_cli.metrics_out))
+        if args_cli.metrics_out
+        else _os.getcwd()
+    )
+    _skip_path = _os.path.join(_skip_dir, ".skip_round")
+    if _os.path.exists(_skip_path):
+        _os.remove(_skip_path)
+
+    def _skip_requested():
+        return _os.path.exists(_skip_path)
+
+    def _consume_skip():
+        try:
+            _os.remove(_skip_path)
+        except FileNotFoundError:
+            pass
 
     # simulate environment
     while max_episode_count <= 0 or episode_count <= max_episode_count:
         print(f"[Evaluation] Evaluating episode {episode_count}...")
         success, time_out = False, False
+        placed_flags = [False, False, False]
+        round_start_t = time.time()
+        # Stuck detector: rolling (timestamp, joint_pos_tensor) buffer over last stuck_window_s seconds
+        joint_history: list[tuple[float, torch.Tensor]] = []
         while simulation_app.is_running():
             # run everything in inference mode
             with torch.inference_mode():
-                if controller.reset_state:
+                wall_elapsed = time.time() - round_start_t
+                wall_capped = (
+                    args_cli.max_round_wall_s > 0
+                    and wall_elapsed >= args_cli.max_round_wall_s
+                )
+                # Stuck-detector check: only after we have ≥ stuck_window_s of history.
+                stuck = False
+                if args_cli.stuck_window_s > 0 and joint_history:
+                    cutoff = time.time() - args_cli.stuck_window_s
+                    if joint_history[0][0] <= cutoff:
+                        window = torch.stack([jp for ts, jp in joint_history if ts >= cutoff], dim=0)
+                        # window shape: (T, n_joints). Check each joint range < eps.
+                        if window.shape[0] >= 10:
+                            ranges = window.max(dim=0).values - window.min(dim=0).values
+                            if ranges.max().item() < args_cli.stuck_eps_rad:
+                                stuck = True
+                if controller.reset_state or _skip_requested() or wall_capped or stuck:
+                    reason = "wall_cap" if wall_capped else (
+                        "stuck" if stuck else (
+                            "file_skip" if _skip_requested() else "key_R"
+                        )
+                    )
+                    if _skip_requested():
+                        _consume_skip()
                     controller.reset()
+                    duration_s = wall_elapsed
+                    oranges_n = sum(placed_flags)
+                    print(
+                        f"[Evaluation] Episode {episode_count} skipped ({reason})! "
+                        f"oranges={oranges_n}/3 t={duration_s:.1f}s placed={placed_flags}"
+                    )
+                    per_round_metrics.append({
+                        "episode": episode_count,
+                        "success": False,
+                        "skipped": True,
+                        "skip_reason": reason,
+                        "oranges_placed": oranges_n,
+                        "placed_flags": list(placed_flags),
+                        "duration_s": round(duration_s, 2),
+                    })
                     obs_dict, _ = env.reset()
                     obs_dict = _sim_warmup(obs_dict)
                     episode_count += 1
@@ -379,33 +541,118 @@ def main():
                     if env.cfg.dynamic_reset_gripper_effort_limit:
                         dynamic_reset_gripper_effort_limit_sim(env, task_type)
                     obs_dict, _, reset_terminated, reset_time_outs, _ = env.step(action)
+                    f1, f2, f3 = _read_subtask_flags(obs_dict)
+                    if f1: placed_flags[0] = True
+                    if f2: placed_flags[1] = True
+                    if f3: placed_flags[2] = True
                     if reset_terminated[0]:
                         success = True
                         break
                     if reset_time_outs[0]:
                         time_out = True
                         break
+                    # record joint state for stuck detector (env 0 only, single-env eval)
+                    if args_cli.stuck_window_s > 0:
+                        try:
+                            jp = obs_dict["policy"]["joint_pos"][0].detach().cpu().clone()
+                            now_t = time.time()
+                            joint_history.append((now_t, jp))
+                            # Trim entries older than 2 × window (kept generous so the
+                            # range check upstream sees enough headroom)
+                            cutoff = now_t - 2 * args_cli.stuck_window_s
+                            while joint_history and joint_history[0][0] < cutoff:
+                                joint_history.pop(0)
+                        except (KeyError, TypeError, IndexError):
+                            pass
+                    # mid-chunk responsiveness: check wall-cap / skip / R every step
+                    wall_now = time.time() - round_start_t
+                    if (
+                        (args_cli.max_round_wall_s > 0 and wall_now >= args_cli.max_round_wall_s)
+                        or _skip_requested()
+                        or controller.reset_state
+                    ):
+                        break
                     if rate_limiter:
                         rate_limiter.sleep(env)
             if success:
-                print(f"[Evaluation] Episode {episode_count} is successful!")
+                duration_s = time.time() - round_start_t
+                # env.task_done implies all 3 + arm rest; cross-check with sticky
+                # flags so a buggy/transient success can't silently inflate.
+                oranges_n = sum(placed_flags)
+                mismatch = oranges_n < 3
+                if mismatch:
+                    print(
+                        f"[Evaluation] WARN episode {episode_count} env→success but "
+                        f"sticky placed_flags={placed_flags} (oranges={oranges_n}/3); "
+                        f"recording sticky count, not 3."
+                    )
+                print(
+                    f"[Evaluation] Episode {episode_count} is successful! "
+                    f"oranges={oranges_n}/3 t={duration_s:.1f}s placed={placed_flags}"
+                )
+                per_round_metrics.append({
+                    "episode": episode_count,
+                    "success": True,
+                    "oranges_placed": oranges_n,
+                    "placed_flags": list(placed_flags),
+                    "duration_s": round(duration_s, 2),
+                    "env_success_sticky_mismatch": mismatch,
+                })
                 episode_count += 1
                 success_count += 1
                 obs_dict = _sim_warmup(obs_dict)
                 break
             if time_out:
-                print(f"[Evaluation] Episode {episode_count} timed out!")
+                duration_s = time.time() - round_start_t
+                oranges_n = sum(placed_flags)
+                print(f"[Evaluation] Episode {episode_count} timed out! oranges={oranges_n}/3 t={duration_s:.1f}s placed={placed_flags}")
+                per_round_metrics.append({
+                    "episode": episode_count,
+                    "success": False,
+                    "oranges_placed": oranges_n,
+                    "placed_flags": list(placed_flags),
+                    "duration_s": round(duration_s, 2),
+                })
                 episode_count += 1
                 obs_dict = _sim_warmup(obs_dict)
                 break
+        total_oranges = sum(m["oranges_placed"] for m in per_round_metrics)
+        max_oranges = 3 * len(per_round_metrics) if per_round_metrics else 1
         print(
             f"[Evaluation] now success rate: {success_count / (episode_count - 1)} "
-            f" [{success_count}/{episode_count - 1}]"
+            f" [{success_count}/{episode_count - 1}], oranges: {total_oranges}/{max_oranges}"
         )
+    total_oranges = sum(m["oranges_placed"] for m in per_round_metrics)
+    max_oranges = 3 * max_episode_count
+    avg_round_s = (sum(m["duration_s"] for m in per_round_metrics) / max(len(per_round_metrics), 1))
     print(
         f"[Evaluation] Final success rate: {success_count / max_episode_count:.3f} "
-        f" [{success_count}/{max_episode_count}]"
+        f" [{success_count}/{max_episode_count}], oranges: {total_oranges}/{max_oranges}, "
+        f"avg_round_s: {avg_round_s:.1f}"
     )
+
+    # Dump per-round metrics JSON for the orchestrator to aggregate.
+    if args_cli.metrics_out:
+        import json
+        import os
+        out = {
+            "label": args_cli.metrics_label,
+            "policy_type": args_cli.policy_type,
+            "policy_checkpoint_path": args_cli.policy_checkpoint_path,
+            "policy_action_horizon": args_cli.policy_action_horizon,
+            "step_hz": args_cli.step_hz,
+            "episode_length_s": args_cli.episode_length_s,
+            "rounds": max_episode_count,
+            "rounds_success": success_count,
+            "oranges_placed_total": total_oranges,
+            "oranges_max_total": max_oranges,
+            "avg_round_s": round(avg_round_s, 2),
+            "per_round": per_round_metrics,
+        }
+        os.makedirs(os.path.dirname(os.path.abspath(args_cli.metrics_out)) or ".", exist_ok=True)
+        with open(args_cli.metrics_out, "w") as f:
+            json.dump(out, f, indent=2)
+        print(f"[Evaluation] metrics → {args_cli.metrics_out}")
 
     # close the simulator
     env.close()
