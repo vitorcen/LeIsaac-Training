@@ -37,7 +37,13 @@
 <body>
 
 <h1>X-VLA QLoRA 微调计划</h1>
-<p class="meta">SO-101 PickOrange · 第 6 个 baseline · pivot from OpenVLA / OFT / LingBot · 2026-05-18</p>
+<p class="meta">SO-101 PickOrange · 第 6 个 baseline · pivot from OpenVLA / OFT / LingBot · 2026-05-18 (v2) → 2026-05-19 (v3 实录)</p>
+
+<div class="callout good">
+<b>📌 v3 status (2026-05-19 08:50)</b> — 训练已落地，迎来首次 placed 突破。<br/>
+<b>路线（实际走的）</b>：action_mode <code>auto</code> → 失败（codex 🔴 #4 应验，10k/20k 均 0/9 placed，gripper 抖动）→ <b>新写 <code>SingleArmSO101ActionSpace</code> 子类</b>（REAL_DIM=6, gripper_idx=(5,), GRIPPER_SCALE=3.0）→ 10k step fresh 训练 → <b>placed = 1/9（episode 1: [F, F, True]）</b>，loss 0.146 → 0.022 (6.6× 下降)。<br/>
+<b>当前 Phase A</b>：resume 10k → 40k，save_freq=5k，中途 eval 20k/30k/40k。三家模型评审（Codex gpt-5.4 / Opencode deepseek-v4-pro / Opus）<b>共识：纯增训练步数是 #1 选项</b>。详见 §11。
+</div>
 <p class="en">Cross-embodiment soft-prompted Transformer with 0.9B params, natively integrated into LeRobot.
 Replaces OpenVLA-OFT and LingBot-VLA on the roadmap because of dramatically lower engineering cost
 and a more direct architectural fit for SO-101 single-arm pick-and-place.</p>
@@ -493,16 +499,17 @@ exec conda run -n "$CONDA_ENV" --no-capture-output \
 <tr><td>🟢 训练 crash</td><td>低</td><td>低</td><td>不用 bnb → 无 vanilla 那 4 类 flaky bug</td></tr>
 </table>
 
-<h2>8. 预期 benchmark 表现</h2>
+<h2>8. 预期 vs 实测 benchmark 表现</h2>
 
 <table>
-<tr><th>指标</th><th>vanilla OpenVLA-7B（ckpt-2000，预测 ckpt-10000）</th><th>X-VLA QLoRA（目标）</th></tr>
-<tr><td>Strict Rounds 完成数</td><td>0/3 ~ 1/3</td><td><b>1/3 ~ 2/3</b></td></tr>
-<tr><td>橙子完成数</td><td>~2/9</td><td><b>4/9 ~ 6/9</b></td></tr>
-<tr><td>step_hz</td><td>5 Hz</td><td><b>30 Hz</b></td></tr>
-<tr><td>Latency / chunk</td><td>240 ms / 1 action</td><td><b>~30-50 ms / 32 actions = ~1.5 ms 等效</b></td></tr>
-<tr><td>Peak VRAM</td><td>~18 GB</td><td><b>~7-9 GB</b></td></tr>
-<tr><td>训练时间</td><td>~7h (10k step + crashes)</td><td><b>~2-3h</b></td></tr>
+<tr><th>指标</th><th>vanilla OpenVLA-7B (ckpt-5000)</th><th>X-VLA so101_single (ckpt-10k, 实测)</th><th>X-VLA Phase A 目标 (40k)</th></tr>
+<tr><td>Strict Rounds 完成数</td><td>0/3（gripper 差一点）</td><td><b>0/3</b>（ep1 placed 1 橙子但未完成全 round）</td><td>1/3 ~ 2/3</td></tr>
+<tr><td>橙子完成数 (placed/total)</td><td>0/9</td><td><b>1/9</b> 🎉</td><td>4/9 ~ 6/9</td></tr>
+<tr><td>step_hz</td><td>5 Hz</td><td><b>30 Hz</b></td><td>30 Hz</td></tr>
+<tr><td>Latency / inference</td><td>240 ms</td><td><b>20-50 ms</b>（chunk_gen 30-50 ms / 1 of 8 calls; popleft &lt;5 ms 其余）</td><td>同</td></tr>
+<tr><td>Peak VRAM (train)</td><td>~22 GB (QLoRA NF4)</td><td><b>~6 GB</b> (bf16 全精度)</td><td>同</td></tr>
+<tr><td>Peak VRAM (inference)</td><td>~5 GB</td><td><b>1.76 GB</b></td><td>同</td></tr>
+<tr><td>训练时间 (10k step)</td><td>~7h（多次 bnb 崩 + watchdog resume）</td><td><b>11 min</b>（attempt 1 cleanly）</td><td>~33 min (10→40k)</td></tr>
 </table>
 
 <h2>9. Pivot 与备份策略</h2>
@@ -517,6 +524,93 @@ exec conda run -n "$CONDA_ENV" --no-capture-output \
 </li>
 <li><b>X-VLA 完成后</b>：OFT 留为长期 R&D，LingBot 同样降级</li>
 </ol>
+
+<h2>11. 执行实录（v3 · 2026-05-19）</h2>
+
+<h3>11.1 CLI / config 校正（实际跑通后整理）</h3>
+
+<p>v2 plan 写的 CLI 又有不完全准的地方，实际跑通后再修正：</p>
+
+<table>
+<tr><th>v2 plan</th><th>实际生效</th><th>原因</th></tr>
+<tr><td><code>--policy.path=lerobot/xvla-base</code> 单独用</td><td>fresh 用 <code>--policy.path</code>；<b>resume 用 <code>--config_path</code></b></td><td>lerobot <code>validate()</code> 把 <code>--policy.path</code> 和 <code>--resume=true</code> 走的是不同分支，同传时 optimizer config 丢失 (<code>ValueError: Optimizer config is required</code>)</td></tr>
+<tr><td><code>normalization_mapping.STATE=MEAN_STD ACTION=MIN_MAX</code> 点路径</td><td><b>inline JSON</b>：<code>'--policy.normalization_mapping={"STATE":"MEAN_STD","ACTION":"MIN_MAX"}'</code></td><td>draccus 接受 inline JSON/YAML；dot-path 在 outer argparse 层就被拒</td></tr>
+<tr><td>没提 <code>--rename_map</code></td><td><b>必加</b>：<code>'--rename_map={"observation.images.front":"observation.images.image","observation.images.wrist":"observation.images.image2"}'</code></td><td>pretrained 期望 <code>image / image2 / image3</code>，我们 dataset 是 <code>front / wrist</code>。image3 由 <code>empty_cameras=1</code> 自动 padding</td></tr>
+<tr><td><code>max_state_dim=32</code></td><td><b>=20</b></td><td>xvla-base config.json 实际 <code>max_state_dim=20</code>；v2 沿用类默认 32 会触发 strict load 报错</td></tr>
+<tr><td>没提 <code>--policy.push_to_hub=false</code></td><td><b>必加</b></td><td><code>push_to_hub</code> 默认 True，没填 repo_id 会 ValueError</td></tr>
+<tr><td><code>--policy.type=xvla</code> + <code>--policy.path</code></td><td><b>不能同传</b>，只用 <code>--policy.path</code></td><td>lerobot 报 <code>Cannot specify both --policy.path and --policy.type</code></td></tr>
+</table>
+
+<h3>11.2 action_mode 实验：auto vs so101_single</h3>
+
+<table>
+<tr><th>实验</th><th>action_mode</th><th>step</th><th>loss</th><th>quant placed</th><th>qualitative</th></tr>
+<tr><td>1</td><td>auto (real_dim=6→pad 20)</td><td>10k</td><td>0.006</td><td>0/9</td><td>抓住橙子但不放盘子（mode collapse on place）</td></tr>
+<tr><td>2</td><td>auto</td><td>20k</td><td>0.005</td><td>0/9</td><td>更不稳，gripper 开合抖动；ep2 卡死 skipped</td></tr>
+<tr><td>3</td><td>auto (推理 n_action_steps=1 override)</td><td>20k</td><td>—</td><td>0/9</td><td>"夹一下、张开、半空"，jitter。<b>排除 chunk staleness 是主因</b></td></tr>
+<tr><td><b>4</b></td><td><b>so101_single</b></td><td><b>10k</b></td><td><b>0.146→0.022</b></td><td><b>1/9 (ep1: [F,F,True])</b></td><td>🎉 <b>首次 placed 突破</b></td></tr>
+</table>
+
+<p><b>结论</b>：codex v2 评审里 🔴 #4 "AutoActionSpace 偷偷改协议" 完全应验。<code>auto</code> 用 14 个 zero dummy 通道污染了预训练 head 的 channel semantics；专门的 <code>so101_single</code> 子类 + 加重 gripper loss 是关键。</p>
+
+<h3>11.3 SingleArmSO101ActionSpace 实现要点</h3>
+
+<pre>@register_action("so101_single")
+class SingleArmSO101ActionSpace(BaseActionSpace):
+    dim_action  = 20            # 模型面 dim（pretrained head shape）
+    REAL_DIM    = 6             # 真实控制 dim
+    gripper_idx = (5,)          # 末位为 gripper
+    JOINTS_IDX  = (0, 1, 2, 3, 4)
+    GRIPPER_SCALE = 3.0         # 加重 gripper loss（关键）
+    JOINTS_SCALE  = 1.0
+
+    def compute_loss(self, pred, target):
+        pred   = self._pad_to_model_dim(pred)   # 6 → 20 (zero-fill last 14)
+        target = self._pad_to_model_dim(target)
+        joints_loss  = self.mse(pred[..., self.JOINTS_IDX],  target[..., self.JOINTS_IDX])  * self.JOINTS_SCALE
+        gripper_loss = self.mse(pred[..., self.gripper_idx], target[..., self.gripper_idx]) * self.GRIPPER_SCALE
+        return {"joints_loss": joints_loss, "gripper_loss": gripper_loss}
+
+    def postprocess(self, action):
+        return action[..., : self.REAL_DIM]     # 推理 20 → 6 trim
+</pre>
+
+<p><b>注册到</b> <code>lerobot/src/lerobot/policies/xvla/action_hub.py</code>，BimanualSO101 之后；train.sh 改 <code>--policy.action_mode=so101_single</code>。</p>
+
+<h3>11.4 三家模型评审合成（Phase A 决策依据）</h3>
+
+<p>ckpt-10k 出 1/3 placed 后，让 <b>Codex (gpt-5.4 high)</b> + <b>Opencode (deepseek-v4-pro)</b> + <b>Opus</b> 三家独立给训练扩展建议。</p>
+
+<table>
+<tr><th>建议</th><th>Codex</th><th>Opencode</th><th>Opus</th><th>共识强度</th></tr>
+<tr><td>训练更长 (40k+)</td><td>✅ #1</td><td>✅ #1</td><td>✅ #1</td><td><b>🟢 强共识</b></td></tr>
+<tr><td>n_obs_steps 1→2~3</td><td>✅ #2</td><td>✅ #2</td><td>✅ #2</td><td><b>🟢 强共识</b></td></tr>
+<tr><td>GRIPPER_SCALE 3→5</td><td>✅ #3</td><td>✅ #3</td><td>✅ #3</td><td><b>🟢 强共识</b></td></tr>
+<tr><td>batch_size 4→8</td><td>✅ #5</td><td>✅ #4</td><td>✅ #4</td><td>🟢 强共识</td></tr>
+<tr><td>n_action_steps 8→4</td><td>✅ #4</td><td>❌ 别动</td><td>🟡 中性</td><td>🟡 分歧</td></tr>
+<tr><td>chunk_size 32→16</td><td>❌ 别动</td><td>❌ 别动</td><td>🟡 备选</td><td>🔴 反对 2:1</td></tr>
+<tr><td>解冻 encoder</td><td>❌ 别</td><td>❌ 60 demo 过拟合</td><td>🟡 最后</td><td>🔴 强反对</td></tr>
+<tr><td>Episode-balanced sampling / 数据增强</td><td>✅ #7</td><td>🟡 卡死时</td><td>—</td><td>🟡 Phase C 备选</td></tr>
+</table>
+
+<h3>11.5 Phase A / B / C 执行序列</h3>
+
+<table>
+<tr><th>Phase</th><th>动作</th><th>预期</th><th>成本</th><th>触发条件</th></tr>
+<tr><td><b>A</b></td><td>resume 10k → 40k，save_freq=5k，eval 20/30/40k；<b>0 配置变化</b></td><td>loss 还在降，纯欠拟合 → 2~3/3 placed</td><td>~33 min 训练 + 3 次 eval</td><td>现在 (in_progress)</td></tr>
+<tr><td><b>B</b></td><td>n_obs_steps 1→2 + GRIPPER_SCALE 3→5 + batch 4→8，重训 fresh 20k</td><td>时间上下文 + 更果断 gripper</td><td>~25 min</td><td>Phase A 卡 ≤2/3</td></tr>
+<tr><td><b>C</b></td><td>n_action_steps 8→4 / 数据增强（hue/brightness/crop）/ episode-balanced sampling</td><td>place 模式过采样、视觉鲁棒</td><td>~1h</td><td>Phase B 还卡</td></tr>
+</table>
+
+<h3>11.6 推理 server 实录</h3>
+
+<p><code>server/xvla_leisaac/server.py</code> 用 <code>XVLAPolicy.from_pretrained</code> + <code>make_pre_post_processors</code>（lerobot 官方 pipeline，加载训练时保存的 normalization stats）+ ZMQ wire-compat 给 <code>Pi05ServicePolicyClient</code>。</p>
+
+<ul>
+<li><b>Latency 实测</b>：~20-50 ms / inference call。每 8 步走 1 次完整 10-step denoising chunk（chunk-gen 30-50 ms），其余 7 次纯 popleft (&lt;5 ms)。</li>
+<li><b>GPU 占用</b>：1.76 GB（bf16，0.9B params，frozen Florence2 + 训练后 transformer body）。</li>
+<li><b>--n-action-steps override</b>：诊断用，强制每步重规划（chunk staleness 测试）。结论：把 8→1 反而抖，证明问题不在 chunk。</li>
+</ul>
 
 <h2>10. 关联记忆</h2>
 <ul>

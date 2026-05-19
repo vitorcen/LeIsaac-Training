@@ -40,6 +40,9 @@ NUM_WORKERS="${NUM_WORKERS:-4}"
 SAVE_FREQ="${SAVE_FREQ:-500}"
 DOMAIN_ID="${DOMAIN_ID:-0}"
 RESUME="${RESUME:-false}"
+# Episode subset for training.  Default: '[0..49]' so 50-59 stay as a true held-out
+# val set for offline_action_mse.  Pass empty string to use all 60 episodes (old behavior).
+EPISODES_TRAIN="${EPISODES_TRAIN:-[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49]}"
 
 if [[ ! -d "$DATASET_DIR" ]]; then
     echo "[xvla-train] ERROR: dataset not found: $DATASET_DIR" >&2
@@ -67,8 +70,13 @@ if [[ "$RESUME" == "true" ]]; then
     # On resume, lerobot loads the FULL TrainPipelineConfig from disk
     # (incl. optimizer, scheduler, policy, dataset).  We only override
     # the few knobs we want to change on the next segment.
+    # NOTE: train_entry.py is our thin wrapper that registers SingleArmSO101
+    # action_space into lerobot before invoking lerobot.scripts.lerobot_train,
+    # so the lerobot submodule stays patch-free.
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    export PYTHONPATH="$SCRIPT_DIR:${PYTHONPATH:-}"
     exec conda run -n "$CONDA_ENV" --no-capture-output \
-        python -u -m lerobot.scripts.lerobot_train \
+        python -u -m train_entry \
             --config_path="$CFG_PATH" \
             --resume=true \
             --steps="$MAX_STEPS" \
@@ -79,15 +87,19 @@ if [[ "$RESUME" == "true" ]]; then
 else
     # Fresh start.  Note: --policy.type is auto-inferred from the pretrained
     # config when --policy.path is given; passing both raises an error.
+    # train_entry wraps lerobot_train and registers SingleArmSO101 first.
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    export PYTHONPATH="$SCRIPT_DIR:${PYTHONPATH:-}"
     exec conda run -n "$CONDA_ENV" --no-capture-output \
-        python -u -m lerobot.scripts.lerobot_train \
+        python -u -m train_entry \
             --policy.path="$BASE_CKPT" \
-            --policy.action_mode=auto \
+            --policy.action_mode=so101_single \
             --policy.max_state_dim=20 \
             --policy.max_action_dim=20 \
             --policy.empty_cameras=1 \
             --policy.chunk_size=32 \
             --policy.n_action_steps=8 \
+            --policy.n_obs_steps=2 \
             --policy.use_proprio=true \
             --policy.freeze_vision_encoder=true \
             --policy.freeze_language_encoder=true \
@@ -104,6 +116,7 @@ else
             --policy.push_to_hub=false \
             --dataset.repo_id=leisaac/pick-orange \
             --dataset.root="$DATASET_DIR" \
+            --dataset.episodes="$EPISODES_TRAIN" \
             '--rename_map={"observation.images.front":"observation.images.image","observation.images.wrist":"observation.images.image2"}' \
             --output_dir="$OUTPUT_DIR" \
             --resume=false \
