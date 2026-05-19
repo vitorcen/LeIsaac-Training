@@ -1,0 +1,643 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>VLA 提升方法待验证清单 — 用 X-VLA 做试验台</title>
+<style>
+  :root {
+    --bg: #fafafa; --fg: #1a1a1a; --muted: #555;
+    --accent: #1f6feb; --warn: #d29922; --bad: #cf222e; --good: #1a7f37;
+    --code-bg: #f3f3f3; --border: #d0d7de;
+  }
+  body { font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+         background: var(--bg); color: var(--fg);
+         max-width: 1100px; margin: 28px auto; padding: 0 22px; line-height: 1.6; }
+  h1 { border-bottom: 2px solid var(--fg); padding-bottom: 6px; }
+  h2 { margin-top: 36px; border-left: 4px solid var(--accent); padding-left: 10px; }
+  h3 { margin-top: 24px; color: var(--accent); }
+  .en { color: var(--muted); font-style: italic; font-size: 0.92em; }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0; font-size: 0.92em; }
+  th, td { border: 1px solid var(--border); padding: 6px 9px; text-align: left; vertical-align: top; }
+  th { background: #f0f3f6; }
+  code, pre { font-family: "JetBrains Mono", Menlo, Consolas, monospace; }
+  pre { background: var(--code-bg); padding: 12px; border-radius: 4px; overflow-x: auto; font-size: 0.86em; }
+  code { background: var(--code-bg); padding: 1px 5px; border-radius: 3px; }
+  .tag-good { color: var(--good); font-weight: 600; }
+  .tag-warn { color: var(--warn); font-weight: 600; }
+  .tag-bad  { color: var(--bad); font-weight: 600; }
+  .pri-1 { background: #d4edda; }
+  .pri-2 { background: #fff3cd; }
+  .pri-3 { background: #f8d7da; }
+  .callout { border-left: 4px solid var(--warn); background: #fff8e6; padding: 10px 14px; margin: 14px 0; }
+  .callout.bad { border-color: var(--bad); background: #ffeef0; }
+  .callout.good { border-color: var(--good); background: #e6f4ea; }
+  .callout.info { border-color: var(--accent); background: #ddf4ff; }
+  svg { display: block; margin: 14px auto; }
+  ul { padding-left: 22px; }
+  li { margin: 4px 0; }
+  .meta { color: var(--muted); font-size: 0.9em; }
+  .status-todo { color: var(--muted); }
+  .status-running { color: var(--warn); }
+  .status-done { color: var(--good); }
+</style>
+</head>
+<body>
+
+<h1>VLA 提升方法 — 待验证清单</h1>
+<p class="meta">用 X-VLA 做实验台 · 2026-05-19 · 三模型协作（Opus 4.7 / Codex gpt-5.4 / Opencode deepseek-v4-pro）</p>
+
+<div class="callout info">
+<b>📌 核心思路 / The pitch</b><br/>
+X-VLA 在 4090 上 <b>10k step ≈ 17 min</b>（batch=8, n_obs=2），是当前所有 VLA 中最快的训练-到-eval 循环（OpenVLA-7B ≈ 4h, GR00T ≈ 2h, π0.5 ≈ 1.5h）。<br/>
+👉 <b>用 X-VLA 当实验试验台</b>，快速筛选哪些方法真有效，再迁移到大模型上少走弯路。
+<br/><br/>
+<b>当前 baseline (Path 1, GRIPPER=5 + n_obs=2 + batch=8)</b>：7k ckpt = <b>1/9 oranges</b> (3 round)。<br/>
+<b>2026-05-19 update</b>：Path 2 Body-desc prompt 经 Phase A+B 系统对比 <b>已证伪</b>，详见 §2 已证伪。Phase A 看到的 2/6 是 single-round variance。
+</div>
+
+<div class="callout bad">
+<b>⚠️ 方法学教训（2026-05-19）</b>：<b>单 round eval 数据不可信</b>。X-VLA + RF action head + 7k 训练 = 高方差推理，初始姿态决定 episode 命运比 model capacity 影响更大。所有后续实验必须 ≥3 完整 round 且不按 R 才算数。
+</div>
+
+<h2>0. TL;DR</h2>
+
+<div class="callout">
+<b>本文目的</b>：列出可在 X-VLA 上 ≤2h 验证的所有 VLA 提升方法，每条带预期增益、实现成本、迁移性。Path 2 phase B 训练完成后逐条筛选执行。
+<br/><br/>
+<b>排序原则</b>：<code>(预期 closed-loop 增益) × (迁移到其他 VLA 的潜力) / (实现成本)</code> 降序
+<br/><br/>
+<b>方法学根基</b>：
+<ul>
+<li>val_loss 不预测 closed-loop（已多次证伪，见 <code>compact-resume-2026-05-19</code> 记忆）→ <b>所有方法只能用 closed-loop sweep 验证</b></li>
+<li>X-VLA 学习曲线 narrow sweet spot (~1k step 宽)→ <b>每种方法必须做 sweep，不能单点评估</b></li>
+<li>3 个模型独立调研后交叉验证 → 减少单模型 hallucination 风险</li>
+</ul>
+</div>
+
+<h2>1. Validation 优先级总表</h2>
+
+<p>P1 = 高增益 / 低成本，必做；P2 = 中等；P3 = 高成本或低证据，待筛。状态由三模型 sweep 后填写。</p>
+
+<table>
+<tr>
+  <th>P</th><th>方法</th><th>类别</th><th>论文/出处</th><th>报告增益</th><th>X-VLA 实现成本</th><th>迁移性</th><th>验证状态</th>
+</tr>
+
+<tr class="pri-1">
+  <td>P1</td><td><b>Image augmentation（ColorJitter + RandomCrop）</b></td><td>数据</td>
+  <td>ALOHA (Zhao 2023, 2304.13705) · DP (Chi 2023, 2303.04137)</td>
+  <td>+10–20% closed-loop</td>
+  <td>~2h (lerobot transform hook)</td>
+  <td>极高（所有 VLA 通用）</td>
+  <td class="status-todo">⏳ pending</td>
+</tr>
+
+<tr class="pri-1">
+  <td>P1</td><td><b>Action chunk 长度 sweep (n_action_steps)</b></td><td>推理</td>
+  <td>ALOHA, π0.5</td>
+  <td>±15% by horizon (8/16/32)</td>
+  <td>~30 min (改 env, 不需重训)</td>
+  <td>高</td>
+  <td class="status-todo">⏳ pending</td>
+</tr>
+
+<tr class="pri-1">
+  <td>P1</td><td><b>Temporal Action Ensembling (TAE)</b></td><td>推理</td>
+  <td>ALOHA (Zhao 2023, 2304.13705) §4.3</td>
+  <td>+10–15% smoothness 减抖动</td>
+  <td>~3h (server 加 exp-blend 缓冲)</td>
+  <td>极高</td>
+  <td class="status-todo">⏳ pending</td>
+</tr>
+
+<tr class="pri-3">
+  <td>P3</td><td><b><span class="tag-bad">❌ Body-desc prompt retrain</span></b></td><td>语言</td>
+  <td>本项目 + RT-2 (Brohan 2023, 2307.15818)</td>
+  <td>本项目实测 <b>已证伪</b>（Phase A 2/6 = variance, Phase B retrain 12k 各组合均 ≤ 1/9 baseline）</td>
+  <td>已完成验证</td>
+  <td>低</td>
+  <td class="status-done">❌ abandoned (见 §2)</td>
+</tr>
+
+<tr class="pri-2">
+  <td>P2</td><td><b>FAST action tokenizer</b></td><td>动作表示</td>
+  <td>FAST (Pertsch 2025, 2501.09747)</td>
+  <td>+33% on bimanual long-horizon</td>
+  <td>~1 day（替换 RF head）</td>
+  <td>低（X-VLA 是 RF 不是 discrete）</td>
+  <td class="status-todo">⏳ pending</td>
+</tr>
+
+<tr class="pri-2">
+  <td>P2</td><td><b>Per-channel loss weight sweep</b></td><td>训练</td>
+  <td>本项目（GRIPPER_SCALE 3→5 已做）</td>
+  <td>本项目实测：sweet spot 10k→7k 左移</td>
+  <td>~5 min（改 action_spaces.py）</td>
+  <td>极高（所有 VLA 通用）</td>
+  <td class="status-done">✅ GRIPPER=5 已做</td>
+</tr>
+
+<tr class="pri-2">
+  <td>P2</td><td><b>Action noise injection 训练</b></td><td>数据</td>
+  <td>BC-Z (Jang 2021, 2202.02005) · Diffusion Policy</td>
+  <td>+5–10% rare-mode</td>
+  <td>~2h（dataloader transform）</td>
+  <td>高</td>
+  <td class="status-todo">⏳ pending</td>
+</tr>
+
+<tr class="pri-2">
+  <td>P2</td><td><b>Larger denoising steps (10→20)</b></td><td>推理</td>
+  <td>π0.5 ablation</td>
+  <td>±5% 准确度 ↔ 2× latency</td>
+  <td>~5 min（改 config）</td>
+  <td>高（RF 类通用）</td>
+  <td class="status-todo">⏳ pending</td>
+</tr>
+
+<tr class="pri-2">
+  <td>P2</td><td><b>Wrist-cam attention 权重提升</b></td><td>架构</td>
+  <td>RT-1 ablation (Brohan 2022)</td>
+  <td>+8% on dexterous</td>
+  <td>~半天（policy_transformer 加 mask scale）</td>
+  <td>中</td>
+  <td class="status-todo">⏳ pending</td>
+</tr>
+
+<tr class="pri-3">
+  <td>P3</td><td><b>DAgger / DAgger-on-sim</b></td><td>数据</td>
+  <td>Ross & Bagnell 2010 · HG-DAgger 2018</td>
+  <td>+20% on closed-loop, 需要 expert label</td>
+  <td>~3 day（接 Isaac Sim teleoperator）</td>
+  <td>极高（黄金通用）</td>
+  <td class="status-todo">⏳ pending（成本高）</td>
+</tr>
+
+<tr class="pri-3">
+  <td>P3</td><td><b>RL fine-tune (PPO / IDQL)</b></td><td>训练</td>
+  <td>IDQL (Hansen-Estruch 2023) · ReFineDP</td>
+  <td>+30% but needs reward</td>
+  <td>~1 week</td>
+  <td>低（reward engineering 难）</td>
+  <td class="status-todo">⏳ pending</td>
+</tr>
+
+<tr class="pri-3">
+  <td>P3</td><td><b>Pretrain mix with OpenX/DROID</b></td><td>数据</td>
+  <td>RT-X (Open X-Embodiment 2023, 2310.08864)</td>
+  <td>+15% generalization</td>
+  <td>~2 day（混 dataset，X-VLA 已部分在 OpenX 上训）</td>
+  <td>低</td>
+  <td class="status-todo">⏳ pending</td>
+</tr>
+
+<tr class="pri-3">
+  <td>P3</td><td><b>Retrieval-augmented prompting</b></td><td>语言</td>
+  <td>RACER (2024)</td>
+  <td>+10–20% in-context</td>
+  <td>~3 day</td>
+  <td>中</td>
+  <td class="status-todo">⏳ pending</td>
+</tr>
+
+</table>
+
+<h2>2. 已完成 / 已证伪</h2>
+<table>
+<tr><th>实验</th><th>结果</th><th>结论</th></tr>
+<tr>
+  <td>GRIPPER_SCALE 3→5 + n_obs 1→2 + batch 4→8 (Path 1)</td>
+  <td>sweet spot 10k→7k 左移，天花板仍 1/3</td>
+  <td>step 数提早，单 round 上限未破</td>
+</tr>
+<tr>
+  <td>Offline action-MSE eval v3 (teacher-forced + gripper timing)</td>
+  <td>v3 best ckpt = GUI 0/3，GUI best ckpt = v3 中位</td>
+  <td><b>val_loss / offline MSE 不预测 closed-loop</b>（多次证伪）</td>
+</tr>
+<tr>
+  <td>Auto closed-loop sweep (Path 4)</td>
+  <td>10 ckpt × 3 round × 60s</td>
+  <td><b>唯一可靠 ckpt 选择手段</b>，但每 ckpt ~5 min wall</td>
+</tr>
+<tr>
+  <td>Body-desc inference-time prompt (Phase A, 7k ckpt)</td>
+  <td>2/6 oranges, 单 round 2 颗</td>
+  <td>看似突破，但 <b>Phase B retrain 不能复现 → 是 variance</b></td>
+</tr>
+<tr>
+  <td><span class="tag-bad">❌ Body-desc 进 dataset task field retrain</span> (Path 2 Phase B, 12k ckpts × 短/长 prompt inference)</td>
+  <td>各组合均无突破 baseline 1/9</td>
+  <td><b>已证伪</b>：Florence2 language encoder freeze 下，长 prompt 只是 token embedding 微扰，不改变 action conditioning 分布。详见 <code>memory/xvla-bodydesc-negative.md</code></td>
+</tr>
+</table>
+
+<h2>3. 三模型调研（pending sync）</h2>
+
+<h3>3.1 Opus 4.7 调研（本节）</h3>
+<p>见 §1 总表前 13 行。基于 Jan 2026 训练截止知识。</p>
+
+<h3>3.2 Codex gpt-5.4 调研（已完成）</h3>
+<p class="meta">15 个方法，全带 arxiv ID。Codex 直言："若 X-VLA 现在没做每步重查询 + temporal ensemble + jerk smoothing，那代码就是垃圾，先补。"</p>
+
+<table>
+<tr><th>Method</th><th>Paper / arxiv</th><th>Gain</th><th>Hours</th><th>Transfer</th><th>Notes</th></tr>
+
+<tr class="pri-1">
+  <td><b>OFT recipe for VLA fine-tuning</b></td>
+  <td>Fine-Tuning VLA: Optimizing Speed and Success (2025) · <a href="https://arxiv.org/abs/2502.19645"><code>2502.19645</code></a></td>
+  <td>OpenVLA LIBERO 76.5%→97.1% (+20.6 abs); real +15 abs</td>
+  <td>6-12</td>
+  <td>High</td>
+  <td>连续动作 + 并行解码 + action chunking + L1 回归。最该先抄的配方。</td>
+</tr>
+
+<tr class="pri-1">
+  <td><b>Synthetic DAgger / failure-state aug</b></td>
+  <td>Diffusion Meets DAgger (2024) · <a href="https://arxiv.org/abs/2402.17768"><code>2402.17768</code></a></td>
+  <td>Pushing 20→80% (+60), Stacking 40→92% (+52) with 8 demos</td>
+  <td>8-16</td>
+  <td>Medium</td>
+  <td>小样本闭环最常死于 covariate shift。用 rollout 采失败状态 → teacher relabel。</td>
+</tr>
+
+<tr class="pri-1">
+  <td><b>MAP-VLA: 检索 soft prompts</b></td>
+  <td>MAP-VLA (2025) · <a href="https://arxiv.org/abs/2511.09516"><code>2511.09516</code></a></td>
+  <td>Real +25 abs, sim +7 abs</td>
+  <td>8-16</td>
+  <td>Medium</td>
+  <td>X-VLA 本身已有 soft prompts → 顺手。对 3 颗橙子长时程对症。</td>
+</tr>
+
+<tr class="pri-1">
+  <td><b>Physically-based lighting augmentation</b></td>
+  <td>Physically-based Lighting Gen (2025) · <a href="https://arxiv.org/abs/2508.01442"><code>2508.01442</code></a></td>
+  <td>Unseen lighting +38.75%</td>
+  <td>8-20</td>
+  <td>High</td>
+  <td>50-demo 数据易过拟合光照。扩视觉分布常比换大模型更值。</td>
+</tr>
+
+<tr class="pri-2">
+  <td><b>In-domain robot pretraining (DROID/MCR)</b></td>
+  <td>Robots Pre-train Robots (2024) · <a href="https://arxiv.org/abs/2410.22325"><code>2410.22325</code></a>; DROID · <a href="https://arxiv.org/abs/2403.12945"><code>2403.12945</code></a></td>
+  <td>MCR real +76.9%; sim +14.8 abs</td>
+  <td>16-32</td>
+  <td>Medium</td>
+  <td>机器人域内预训练 &gt; 人类视频预训练。混入相近单臂抓放数据靠谱。</td>
+</tr>
+
+<tr class="pri-2">
+  <td><b>Co-training / mix-in 相邻 manipulation 数据</b></td>
+  <td>Mobile ALOHA (2024) · <a href="https://arxiv.org/abs/2401.02117"><code>2401.02117</code></a>; Co-training study (2026) · <a href="https://arxiv.org/abs/2602.01067"><code>2602.01067</code></a></td>
+  <td>50 demos/task 可 +90 abs</td>
+  <td>8-24</td>
+  <td>Medium</td>
+  <td>有相近桌面 pick-place 数据直接混训。比反复过拟合 50 demos 强。</td>
+</tr>
+
+<tr class="pri-1">
+  <td><b>Temporal Action Selection</b></td>
+  <td>TAS for Action Chunking (2025) · <a href="https://arxiv.org/abs/2511.04421"><code>2511.04421</code></a></td>
+  <td>Up to +73.3 abs success</td>
+  <td>10-20</td>
+  <td>Medium</td>
+  <td>缓存多时刻 chunk，选当前最稳的。"抓起抖动、放置偏移" 闭环毛病专治。</td>
+</tr>
+
+<tr class="pri-1">
+  <td><b>Mixture of Horizons (MoH)</b></td>
+  <td>MoH in Action Chunking (2025) · <a href="https://arxiv.org/abs/2511.19433"><code>2511.19433</code></a></td>
+  <td>π0.5+MoH = 99% LIBERO; 2.5× throughput</td>
+  <td>8-16</td>
+  <td>High</td>
+  <td><b>X-VLA 的 RF action head 最契合</b>。长短 horizon 混合。</td>
+</tr>
+
+<tr class="pri-2">
+  <td><b>Top-k action sampling + verifier (RoboMonkey)</b></td>
+  <td>RoboMonkey (2025) · <a href="https://arxiv.org/abs/2506.17811"><code>2506.17811</code></a></td>
+  <td>OOD +25 abs, ID +9 abs; verifier +7</td>
+  <td>12-24</td>
+  <td>Medium</td>
+  <td>Test-time 多采样 + 轻量 verifier。代价是慢。</td>
+</tr>
+
+<tr class="pri-1">
+  <td><b>Velocity-aware loss reweighting (AttenA+)</b></td>
+  <td>AttenA+ (2026) · <a href="https://arxiv.org/abs/2605.13548"><code>2605.13548</code></a></td>
+  <td>OpenVLA-OFT +1.5 abs; FastWAM +0.6 abs</td>
+  <td>2-4</td>
+  <td>High</td>
+  <td><b>最便宜的训练 trick</b>。低速段加权，高速段降权。抓取闭合 / 放置接触瞬间专治。</td>
+</tr>
+
+<tr class="pri-3">
+  <td>FAST / FAST+ action tokenizer</td>
+  <td>FAST (2025) · <a href="https://arxiv.org/abs/2501.09747"><code>2501.09747</code></a></td>
+  <td>高频 dexterous "discretization fails"; FAST 5× faster training</td>
+  <td>12-24</td>
+  <td>Low-Med</td>
+  <td>把 X-VLA flow head 换成离散/AR。侵入性大，不是当前最短路径。</td>
+</tr>
+
+<tr class="pri-3">
+  <td>Online RL fine-tune (VLA-RL)</td>
+  <td>VLA-RL (2025) · <a href="https://arxiv.org/abs/2505.18719"><code>2505.18719</code></a></td>
+  <td>+4.5 abs over best fine-tune (40 LIBERO)</td>
+  <td>24-72</td>
+  <td>Medium</td>
+  <td>工程量大，不该是第一刀。</td>
+</tr>
+
+<tr class="pri-1">
+  <td><b>Action chunking + TAE 基本盘</b></td>
+  <td>ALOHA (2023) · <a href="https://arxiv.org/abs/2304.13705"><code>2304.13705</code></a>; BAKU (2024) · <a href="https://arxiv.org/abs/2406.07539"><code>2406.07539</code></a></td>
+  <td>ACT 80-90% real; BAKU +36 abs LIBERO</td>
+  <td>4-10</td>
+  <td>High</td>
+  <td>该有的基本盘。X-VLA 没做就先补。</td>
+</tr>
+
+<tr class="pri-3">
+  <td>Embodiment transfer learning</td>
+  <td>(2025) · <a href="https://arxiv.org/abs/2511.01224"><code>2511.01224</code></a></td>
+  <td>+53.2% over OpenVLA on 6 real tasks</td>
+  <td>24-48</td>
+  <td>Low</td>
+  <td>"body description / embodiment conditioning" 最近最正结果，但主解跨 embodiment，对单臂抓放不直接。</td>
+</tr>
+
+<tr class="pri-3">
+  <td><span class="tag-bad">❌ Explicit CoT 已证伪</span></td>
+  <td>Co-training study (2026) · <a href="https://arxiv.org/abs/2602.01067"><code>2602.01067</code></a></td>
+  <td>报告 <b>no improvement</b> in sim</td>
+  <td>4-12</td>
+  <td>Low</td>
+  <td><b>重要负面结论</b>：别砸时间在"让模型思考更久"。检索记忆 + 动作稳定化 &gt; 显式 CoT。</td>
+</tr>
+
+</table>
+
+<h3>3.3 Opencode deepseek-v4-pro 调研（已完成）</h3>
+<p class="meta">33 个方法，composite score = (gain × transferability) / hours。Transfer 权重：HIGH=3, MED-HIGH=2.5, MED=2, LOW-MED=1.5, LOW=1。完整文件：<code>vla_survey.md</code>。</p>
+
+<h4>Top 10 by ROI（score ≥ 8）</h4>
+<table>
+<tr><th>#</th><th>Score</th><th>Method</th><th>Paper / arxiv</th><th>Gain</th><th>Hours</th><th>Notes</th></tr>
+<tr class="pri-1"><td>1</td><td>46.9</td><td><b>Receding-horizon action chunks</b></td><td>Diffusion Policy · <a href="https://arxiv.org/abs/2303.04137"><code>2303.04137</code></a></td><td>+46.9% avg</td><td>2-4</td><td>Tune chunk length + receding horizon。Universal, no arch change。</td></tr>
+<tr class="pri-1"><td>2</td><td>45.0</td><td><b>Action smoothing (EMA)</b></td><td>—</td><td>+5-10%</td><td>0.5</td><td>5 行代码改。瞬间杀 jitter。</td></tr>
+<tr class="pri-1"><td>3</td><td>45.0</td><td><b>Embodiment description in prompt</b></td><td>—</td><td>+5-10%</td><td>0.5</td><td><b>本项目 Path 2 phase A/B 正在验证 ✅</b></td></tr>
+<tr class="pri-1"><td>4</td><td>22.5</td><td><b>Per-channel action loss weighting</b></td><td>—</td><td>+5-10%</td><td>1</td><td><b>本项目 Path 1 GRIPPER=5 已做 ✅</b></td></tr>
+<tr class="pri-1"><td>5</td><td>20.0</td><td><b>Standard visuomotor augmentation</b></td><td>—</td><td>+5-15%</td><td>1-2</td><td>Crop + color jitter。所有 VLA 论文必做。</td></tr>
+<tr class="pri-1"><td>6</td><td>20.0</td><td><b>Temporal ensembling</b></td><td>ALOHA · <a href="https://arxiv.org/abs/2304.13705"><code>2304.13705</code></a></td><td>+5-15%</td><td>1-2</td><td>Average overlap windows。</td></tr>
+<tr class="pri-2"><td>7</td><td>18.8</td><td>LoRA fine-tuning</td><td>Hu et al. · <a href="https://arxiv.org/abs/2106.09685"><code>2106.09685</code></a></td><td>Matches FT on small data</td><td>1-3</td><td>X-VLA 当前是 full FT，加 LoRA 可省显存留预训练权重。</td></tr>
+<tr class="pri-2"><td>8</td><td>10.0</td><td>Variable-speed teaching-playback</td><td>Masuya · <a href="https://arxiv.org/abs/2412.03252"><code>2412.03252</code></a></td><td>+8-12%</td><td>2-4</td><td>Re-record demos varied speeds，零代码改。</td></tr>
+<tr class="pri-2"><td>9</td><td>10.0</td><td>Multi-frame / temporal history</td><td>—</td><td>+10-15%</td><td>3-6</td><td><b>本项目 n_obs_steps 1→2 已做 ✅</b>，可再升 →4</td></tr>
+<tr class="pri-2"><td>10</td><td>9.0</td><td>OFT / Orthogonal FT</td><td>OpenVLA-OFT · <a href="https://arxiv.org/abs/2306.07280"><code>2306.07280</code></a></td><td>+10-20% over FT</td><td>3-6</td><td>对 Florence2 backbone 加 OFT 约束。</td></tr>
+</table>
+
+<h4>Category Summary（Opencode）</h4>
+<table>
+<tr><th>Category</th><th>Count</th><th>Median</th><th>Best (score)</th></tr>
+<tr><td>Action Representations</td><td>7</td><td>2.3</td><td>Diffusion Policy chunking (46.9)</td></tr>
+<tr><td>Data Augmentation</td><td>6</td><td>3.7</td><td>Standard visuomotor aug (20.0)</td></tr>
+<tr><td>Loss / Training Tricks</td><td>5</td><td>1.7</td><td>Per-channel loss weighting (22.5)</td></tr>
+<tr><td>Inference-Time</td><td>4</td><td>2.6</td><td>Action smoothing (45.0)</td></tr>
+<tr><td>Prompt / Language</td><td>6</td><td>3.1</td><td>Embodiment description (45.0)</td></tr>
+<tr><td>Pretraining / Data Curation</td><td>5</td><td>0.3</td><td>DROID curation (1.2)</td></tr>
+</table>
+<p><b>Opencode 关键洞见</b>：低成本+高迁移 dominate ROI。Pretrain 和 RL 因成本 40-80× 高而排末位。</p>
+
+<h3>3.4 三模型交叉验证（共识）</h3>
+
+<div class="callout good">
+<b>三家一致同意（高置信度，应立即做）</b>：
+<ol>
+<li><b>Action chunking horizon tuning</b>（Opus P1 + Codex 提及基本盘 + Opencode #1, score 46.9）</li>
+<li><b>Temporal Ensembling / Action Smoothing</b>（Opus P1 + Codex 基本盘 + Opencode #2 + #6）</li>
+<li><b>Body description prompt</b>（Opus P1 + Codex Embodiment Transfer + Opencode #3, score 45）→ <b>本项目正在做</b></li>
+<li><b>Per-channel loss weighting</b>（Opus P2 已做 + Codex AttenA+ + Opencode #4, score 22.5）→ <b>本项目 GRIPPER=5 已做</b></li>
+<li><b>Visuomotor / lighting aug</b>（Opus P1 + Codex 38.75% + Opencode #5）</li>
+</ol>
+</div>
+
+<div class="callout bad">
+<b>三家一致避免</b>：
+<ul>
+<li>❌ Explicit CoT for action（Codex 2602.01067 报告 no improvement; Opencode score 2.5）</li>
+<li>❌ FAST tokenizer 替换 RF head（Codex Low-Med 迁移；Opencode score 2.9，侵入性大）</li>
+<li>❌ Online RL fine-tune（Codex 24-72h; Opencode VLA-RL score 0.1, RL-100 score 1.7）</li>
+<li>❌ Pretrain from scratch on OXE/DROID（Codex Medium; Opencode 40-80h, score 0.8）</li>
+</ul>
+</div>
+
+<div class="callout">
+<b>仅 1 家强烈推荐（中置信度，待 sweep 验证）</b>：
+<ul>
+<li>🟡 <b>Mixture of Horizons (Codex 2511.19433)</b>: π0.5 + MoH = 99% LIBERO，与 X-VLA RF head 最契合；Opencode 没列。值得 8-16h 试。</li>
+<li>🟡 <b>Diffusion-DAgger (Codex 2402.17768)</b>: 8 demos 20→80%，但需要 Isaac Sim 接 teleop。Opencode 列 Diff-DAgger score 2.1（成本太高）。</li>
+<li>🟡 <b>MAP-VLA 检索 (Codex 2511.09516)</b>: X-VLA soft prompt 顺手；Opencode 列 Retrieval-aug score 1.0（迁移性 MED）。</li>
+<li>🟡 <b>LoRA fine-tuning (Opencode #7 score 18.8)</b>: Codex 没单独列。X-VLA 当前 full FT，加 LoRA 可保留预训练权重防过拟合。</li>
+</ul>
+</div>
+
+<h2>4. 验证流程（每个方法）</h2>
+
+<svg width="900" height="280" viewBox="0 0 900 280" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#1f6feb" />
+    </marker>
+  </defs>
+  <rect x="20" y="100" width="160" height="60" rx="6" fill="#ddf4ff" stroke="#1f6feb"/>
+  <text x="100" y="125" text-anchor="middle" font-size="14" font-weight="600">选方法</text>
+  <text x="100" y="145" text-anchor="middle" font-size="11">从清单 P1 起</text>
+
+  <rect x="220" y="100" width="160" height="60" rx="6" fill="#fff8e6" stroke="#d29922"/>
+  <text x="300" y="120" text-anchor="middle" font-size="14" font-weight="600">实现</text>
+  <text x="300" y="138" text-anchor="middle" font-size="11">≤2h budget</text>
+  <text x="300" y="152" text-anchor="middle" font-size="11">超时 → 降级</text>
+
+  <rect x="420" y="100" width="160" height="60" rx="6" fill="#fff8e6" stroke="#d29922"/>
+  <text x="500" y="120" text-anchor="middle" font-size="14" font-weight="600">训练 X-VLA</text>
+  <text x="500" y="138" text-anchor="middle" font-size="11">~17 min / 10k step</text>
+  <text x="500" y="152" text-anchor="middle" font-size="11">同基准超参</text>
+
+  <rect x="620" y="100" width="160" height="60" rx="6" fill="#e6f4ea" stroke="#1a7f37"/>
+  <text x="700" y="120" text-anchor="middle" font-size="14" font-weight="600">Closed-loop sweep</text>
+  <text x="700" y="138" text-anchor="middle" font-size="11">~5 min/ckpt × N</text>
+  <text x="700" y="152" text-anchor="middle" font-size="11">不用 val_loss！</text>
+
+  <rect x="220" y="200" width="160" height="60" rx="6" fill="#ffeef0" stroke="#cf222e"/>
+  <text x="300" y="222" text-anchor="middle" font-size="13" font-weight="600">证伪 → 丢弃</text>
+  <text x="300" y="240" text-anchor="middle" font-size="11">写入 §2</text>
+
+  <rect x="540" y="200" width="200" height="60" rx="6" fill="#d4edda" stroke="#1a7f37"/>
+  <text x="640" y="222" text-anchor="middle" font-size="13" font-weight="600">证实 → 迁移其他 VLA</text>
+  <text x="640" y="240" text-anchor="middle" font-size="11">下一个 baseline 复用</text>
+
+  <line x1="180" y1="130" x2="220" y2="130" stroke="#1f6feb" marker-end="url(#arr)"/>
+  <line x1="380" y1="130" x2="420" y2="130" stroke="#1f6feb" marker-end="url(#arr)"/>
+  <line x1="580" y1="130" x2="620" y2="130" stroke="#1f6feb" marker-end="url(#arr)"/>
+  <line x1="650" y1="160" x2="350" y2="200" stroke="#cf222e" stroke-dasharray="4 4" marker-end="url(#arr)"/>
+  <line x1="700" y1="160" x2="640" y2="200" stroke="#1a7f37" marker-end="url(#arr)"/>
+</svg>
+
+<p><b>关键约束</b>：</p>
+<ul>
+<li>每方法只动 1 变量（vs Path 1 同时改 3 个的反面教训）</li>
+<li>必须 sweep 全 ckpt 范围，不能单点（narrow sweet spot 现象）</li>
+<li>每方法跑 3 round 完整 60s，不能 ep1 提前 R 跳</li>
+<li>baseline 与新方法用同种子（dataset.episodes 一致, val split 一致）</li>
+</ul>
+
+<h2>5. 实验队列 — Opus+Codex 合并优先级</h2>
+
+<p>排序原则：<b>低成本 P1 先做（先剪枝再投入）</b>。Codex 的发现：<code>velocity-reweight</code> 和 <code>TAE</code> 是最便宜的两条，应紧接 Phase B sweep。</p>
+
+<table>
+<tr><th>#</th><th>实验</th><th>预期增益</th><th>时间预算</th><th>依赖</th></tr>
+<tr>
+  <td>1</td>
+  <td><b>Phase B sweep</b>（body-desc retrain ckpts 4k-8k）</td>
+  <td>验证 Phase A 2/6 信号是否 retrain 后稳定</td>
+  <td>~25 min</td>
+  <td>无 ✅ 训练完毕</td>
+</tr>
+<tr>
+  <td>2</td>
+  <td><b>Action chunking horizon sweep</b>（n_action_steps ∈ {4, 8, 16, 32}，在最好 ckpt 上 inference）</td>
+  <td>±15% by horizon</td>
+  <td>1h（无 retrain）</td>
+  <td>取 Phase B 最佳 ckpt</td>
+</tr>
+<tr>
+  <td>3</td>
+  <td><b>Velocity-aware loss reweighting (AttenA+, <a href="https://arxiv.org/abs/2605.13548">2605.13548</a>)</b></td>
+  <td>+1-2% but 极便宜</td>
+  <td>2-4h 改 action_spaces.py + 17 min retrain + 25 min sweep</td>
+  <td>从 dataset 算 velocity 阈值</td>
+</tr>
+<tr>
+  <td>4</td>
+  <td><b>TAE (Temporal Action Ensembling, <a href="https://arxiv.org/abs/2304.13705">2304.13705</a>)</b></td>
+  <td>+10-15% smoothness</td>
+  <td>3h server 端 exp-blend buffer + 25 min sweep</td>
+  <td>无 retrain</td>
+</tr>
+<tr>
+  <td>5</td>
+  <td><b>Mixture of Horizons (MoH, <a href="https://arxiv.org/abs/2511.19433">2511.19433</a>)</b></td>
+  <td>π0.5 + MoH = 99% LIBERO；对 RF head 最契合</td>
+  <td>8-16h</td>
+  <td>实现 dynamic chunk length</td>
+</tr>
+<tr>
+  <td>6</td>
+  <td><b>Lighting/image aug (<a href="https://arxiv.org/abs/2508.01442">2508.01442</a>)</b></td>
+  <td>+38% unseen lighting</td>
+  <td>8h aug pipeline + retrain + sweep ≈ 10h</td>
+  <td>无</td>
+</tr>
+<tr>
+  <td>7</td>
+  <td><b>TAS (Temporal Action Selection, <a href="https://arxiv.org/abs/2511.04421">2511.04421</a>)</b></td>
+  <td>+73 abs success（如果真）</td>
+  <td>10-20h</td>
+  <td>需多时刻 chunk cache + selector net</td>
+</tr>
+<tr>
+  <td>8</td>
+  <td><b>Synthetic DAgger (<a href="https://arxiv.org/abs/2402.17768">2402.17768</a>)</b></td>
+  <td>Pushing 20→80% with 8 demos</td>
+  <td>8-16h</td>
+  <td>Isaac Sim teleop + relabel pipeline</td>
+</tr>
+<tr>
+  <td>9</td>
+  <td><b>MAP-VLA retrieval (<a href="https://arxiv.org/abs/2511.09516">2511.09516</a>)</b></td>
+  <td>Real +25, sim +7</td>
+  <td>8-16h</td>
+  <td>X-VLA soft prompt 改 memory bank</td>
+</tr>
+<tr>
+  <td>10</td>
+  <td><b>DROID co-training (<a href="https://arxiv.org/abs/2403.12945">2403.12945</a>)</b></td>
+  <td>+14.8 abs sim</td>
+  <td>16-32h</td>
+  <td>DROID dataset 下载 + 筛选相近 task</td>
+</tr>
+</table>
+
+<div class="callout bad">
+<b>⚠️ 不要做（已证伪 / 性价比低）</b>：
+<ul>
+<li>❌ Explicit CoT for action（<a href="https://arxiv.org/abs/2602.01067">2602.01067</a> 报告 no improvement）</li>
+<li>❌ FAST tokenizer 替换 RF head（侵入性大，不是当前 X-VLA 路径）</li>
+<li>❌ Online RL fine-tune（工程量 24-72h, +4.5 abs 性价比差）</li>
+<li>❌ Offline action-MSE eval（本项目多次证伪）</li>
+</ul>
+</div>
+
+<h2>6. 复用到其他 VLA 的对应表</h2>
+
+<table>
+<tr><th>X-VLA 验证的方法</th><th>迁到 OpenVLA-7B</th><th>迁到 GR00T-N1.6</th><th>迁到 π0.5</th></tr>
+<tr>
+  <td>Image aug</td>
+  <td>✅ 同 lerobot transform</td>
+  <td>✅ groot dataset_pipeline</td>
+  <td>✅ openpi data aug</td>
+</tr>
+<tr>
+  <td>Action chunking sweep</td>
+  <td>⚠️ OpenVLA 默认 1 step，需先加 chunk</td>
+  <td>✅ groot 原生 chunk</td>
+  <td>✅ π0.5 原生 chunk</td>
+</tr>
+<tr>
+  <td>TAE inference</td>
+  <td>✅ server 侧通用</td>
+  <td>✅</td>
+  <td>✅</td>
+</tr>
+<tr>
+  <td>Body-desc prompt</td>
+  <td>✅ instruction 长度限制需注意</td>
+  <td>✅</td>
+  <td>✅</td>
+</tr>
+<tr>
+  <td>Per-channel loss weight</td>
+  <td>⚠️ OpenVLA discrete token，需先 detokenize</td>
+  <td>✅</td>
+  <td>✅</td>
+</tr>
+</table>
+
+<h2>7. 引用一览</h2>
+<ul>
+<li>ALOHA: Zhao et al., 2023. <code>arXiv:2304.13705</code> — TAE, action chunking</li>
+<li>Diffusion Policy: Chi et al., 2023. <code>arXiv:2303.04137</code> — image aug ablation</li>
+<li>RT-2: Brohan et al., 2023. <code>arXiv:2307.15818</code> — VLA prompt engineering</li>
+<li>FAST: Pertsch et al., 2025. <code>arXiv:2501.09747</code> — action tokenizer +33%</li>
+<li>RT-X / Open X-Embodiment: Padalkar et al., 2023. <code>arXiv:2310.08864</code></li>
+<li>X-VLA: 本项目当前 baseline，原 paper 待查</li>
+<li>IDQL: Hansen-Estruch et al., 2023</li>
+<li>HG-DAgger: Kelly et al., 2018</li>
+<li>RACER: 2024</li>
+</ul>
+
+<h2>8. 变更记录</h2>
+<ul>
+<li><b>2026-05-19 v1</b>：Opus 4.7 起草 13 方法清单 + 框架。Codex / Opencode 调研后台运行，待合并。</li>
+<li><b>2026-05-19 v2</b>：Codex gpt-5.4 完成（15 方法 + arxiv ID），合并到 §3.2 + §5 重排实施队列。</li>
+<li><b>2026-05-19 v3</b>：Opencode deepseek-v4-pro 完成（33 方法 + composite score ranking），合并到 §3.3 + §3.4 三模型共识。<br/>
+<b>共识结论</b>：5 个方法三家都推（chunking horizon / TAE / body desc / per-channel weight / image aug），4 个方法三家都避（CoT / FAST / RL / pretrain-from-scratch）。</li>
+<li><b>2026-05-19 v4</b>：<b>Body-desc prompt 已证伪</b>。Phase A 看似突破 (2/6) 经 Phase B 12k retrain × 短/长 prompt 4-way 对比无法复现 → 单 round variance。§1/§2/§5 已更新。下一步从 <b>Action chunking horizon sweep + EMA + TAE</b> 起步（全是 inference-only，无需 retrain）。</li>
+</ul>
+
+</body>
+</html>
