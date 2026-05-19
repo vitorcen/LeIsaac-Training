@@ -45,6 +45,42 @@ from transformers import (
     Trainer,
     TrainingArguments,
 )
+import transformers.modeling_utils as _mu
+import accelerate.utils.modeling as _am
+import accelerate.utils as _au
+import transformers.integrations.bitsandbytes as _tb
+
+# Root-cause fix for two related _named_members tuple-unpack crash classes:
+#
+#   (1) Mid-training, from Trainer.log:
+#       Trainer.log -> model.floating_point_ops -> num_parameters
+#       -> named_parameters -> _named_members -> ValueError
+#
+#   (2) At model load, from bnb 4-bit quantizer:
+#       quantizer_bnb_4bit.preprocess_model -> get_keys_to_not_convert
+#       -> accelerate.find_tied_parameters -> model.named_parameters
+#       -> _named_members -> ValueError
+#
+# Both crash inside torch's _named_members iterating bnb Linear4bit's
+# _parameters proxy under PEFT wrapping (malformed tuple yield).
+#
+# (1) floating_point_ops -> 0 — only loses the cosmetic TFLOPS log column.
+# (2) find_tied_parameters -> [] — declares "no tied params"; for OpenVLA
+#     this means bnb will quantize lm_head, which is fine because OpenVLA
+#     emits action tokens (not text) and inference already runs with the
+#     quantized head.
+# Watchdog stays as belt-and-braces for the remaining segfault class.
+_mu.PreTrainedModel.floating_point_ops = lambda self, inputs, exclude_embeddings=True: 0
+_noop_tied = lambda *a, **kw: []
+_am.find_tied_parameters = _noop_tied
+_au.find_tied_parameters = _noop_tied  # re-export in accelerate.utils
+_tb.find_tied_parameters = _noop_tied  # local copy already imported by bnb integration
+
+# (3) bnb 0.46.x removed MatmulLtState.memory_efficient_backward but PEFT 0.11.x
+#     still references it during PeftModel.from_pretrained for 8-bit quantized
+#     bases.  Patch attr at class level so all instances have it (default False).
+from bitsandbytes.autograd._functions import MatmulLtState as _MatmulLtState
+_MatmulLtState.memory_efficient_backward = False
 
 # Allow `python -m openvla.train` after PYTHONPATH=$LEISAAC/scripts/finetune
 from openvla.dataset import (
@@ -63,6 +99,12 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--dataset", required=True, help="LeRobot v3.0 dataset root")
     ap.add_argument("--output_dir", required=True)
     ap.add_argument("--resume", default=None, help="resume from checkpoint dir")
+    ap.add_argument("--load_lora", default=None,
+                    help="Path to a checkpoint dir to seed LoRA weights ONLY "
+                         "(adapter_model.safetensors).  Skips Trainer auto-resume, "
+                         "fresh AdamW + step=0.  Use to recover LoRA progress "
+                         "across precision/optimizer changes without dragging "
+                         "the stale optimizer.pt / trainer_state.json baggage.")
     # LoRA
     ap.add_argument("--lora_rank", type=int, default=32)
     ap.add_argument("--lora_alpha", type=int, default=16)
@@ -82,6 +124,12 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--no_grad_ckpt", action="store_true",
                     help="Disable gradient checkpointing (24GB has headroom; "
                          "ckpt + accelerate hooks have flaky bnb interactions).")
+    ap.add_argument("--quant", choices=["4bit", "8bit", "bf16"], default="8bit",
+                    help="Base precision. 4bit=NF4 QLoRA (CRASH-PRONE on torch 2.3 "
+                         "+ PEFT due to Params4bit.__tensor_flatten__ bug, see "
+                         "openvla_crash_diagnosis.html). 8bit=Linear8bit_lt LoRA "
+                         "(default; ~7GB base, no tensor-subclass bug). bf16=no "
+                         "bnb at all (~14GB base, slowest, zero quant risk).")
     return ap.parse_args()
 
 
@@ -125,35 +173,50 @@ def main() -> None:
         print(f"  canonical_prompt={canonical_prompt!r}", flush=True)
 
     # --------------------------------------------------------------------- #
-    # Model + processor (4-bit base, bf16 compute)
+    # Model + processor.  --quant selects base precision:
+    #   4bit  → NF4 QLoRA (Params4bit, CRASH-PRONE — see crash_diagnosis HTML)
+    #   8bit  → Linear8bit_lt LoRA (default; no tensor-subclass bug)
+    #   bf16  → no bnb at all
     # --------------------------------------------------------------------- #
-    bnb_cfg = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.bfloat16,
-        bnb_4bit_use_double_quant=True,
-    )
-    print(f"[openvla-train] loading 4-bit NF4 {args.model}...", flush=True)
+    if args.quant == "4bit":
+        bnb_cfg = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=True,
+        )
+    elif args.quant == "8bit":
+        bnb_cfg = BitsAndBytesConfig(load_in_8bit=True)
+    else:  # bf16
+        bnb_cfg = None
+    print(f"[openvla-train] loading {args.quant} {args.model}...", flush=True)
     processor = AutoProcessor.from_pretrained(args.model, trust_remote_code=True)
-    model = AutoModelForVision2Seq.from_pretrained(
-        args.model,
-        quantization_config=bnb_cfg,
+    model_kwargs = dict(
         device_map={"": 0},
         low_cpu_mem_usage=True,
         trust_remote_code=True,
         torch_dtype=torch.bfloat16,
     )
+    if bnb_cfg is not None:
+        model_kwargs["quantization_config"] = bnb_cfg
+    model = AutoModelForVision2Seq.from_pretrained(args.model, **model_kwargs)
     print(f"[openvla-train] base loaded; GPU={torch.cuda.memory_allocated()/1e9:.2f}GB", flush=True)
 
     # --------------------------------------------------------------------- #
     # LoRA wrap (q_proj + v_proj on the Llama backbone only)
     # --------------------------------------------------------------------- #
     use_grad_ckpt = not args.no_grad_ckpt
-    model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=use_grad_ckpt)
-    if not use_grad_ckpt:
-        # prepare_model_for_kbit_training skips enable_input_require_grads when
-        # checkpointing is off, but for 4-bit training the embeddings still need
-        # gradients enabled so backward can flow through Linear4bit.
+    if args.quant in ("4bit", "8bit"):
+        model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=use_grad_ckpt)
+        if not use_grad_ckpt:
+            # prepare_model_for_kbit_training skips enable_input_require_grads
+            # when checkpointing is off, but embeddings still need grad-enabled
+            # for backward to flow through bnb quantized layers.
+            if hasattr(model, "enable_input_require_grads"):
+                model.enable_input_require_grads()
+    else:  # bf16 — no kbit prep needed
+        if use_grad_ckpt:
+            model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
         if hasattr(model, "enable_input_require_grads"):
             model.enable_input_require_grads()
     lora_cfg = LoraConfig(
@@ -166,6 +229,45 @@ def main() -> None:
     )
     model = get_peft_model(model, lora_cfg)
     model.print_trainable_parameters()
+
+    # If --load_lora is set BUT output_dir already has a more recent complete
+    # ckpt (e.g. watchdog retry after first chunk partially saved), prefer
+    # auto-resume over seeded LoRA.  Otherwise we'd silently redo work and lose
+    # post-seed training progress on every crash.
+    if args.load_lora:
+        _existing = sorted(
+            Path(args.output_dir).glob("checkpoint-*"),
+            key=lambda p: int(p.name.split("-")[1]) if p.name.split("-")[1].isdigit() else -1,
+        )
+        for cand in reversed(_existing):
+            required = ["trainer_state.json", "optimizer.pt", "scheduler.pt", "rng_state.pth"]
+            has_weights = (cand / "adapter_model.safetensors").exists() or (cand / "adapter_model.bin").exists()
+            if has_weights and all((cand / f).exists() for f in required):
+                print(f"[openvla-train] --load_lora overridden: output_dir has newer "
+                      f"complete ckpt {cand.name} → using Trainer auto-resume instead "
+                      f"(load_lora was for first-chunk seed only)", flush=True)
+                args.load_lora = None
+                break
+
+    # Optional: seed LoRA weights from an existing checkpoint without dragging
+    # the stale optimizer/scheduler/trainer_state.  Useful when changing base
+    # precision (4bit → 8bit) — adapter weights transfer fine but optimizer
+    # state would be invalidated.
+    if args.load_lora:
+        from safetensors.torch import load_file as _safe_load
+        from peft.utils import set_peft_model_state_dict
+        lora_path = Path(args.load_lora)
+        weights_file = lora_path / "adapter_model.safetensors"
+        if not weights_file.exists():
+            raise FileNotFoundError(f"--load_lora: missing {weights_file}")
+        lora_sd = _safe_load(str(weights_file))
+        result = set_peft_model_state_dict(model, lora_sd)
+        n_loaded = len([k for k in lora_sd if "lora_" in k])
+        print(f"[openvla-train] seeded LoRA from {weights_file}: {n_loaded} tensors", flush=True)
+        if hasattr(result, "missing_keys") and result.missing_keys:
+            print(f"[openvla-train]   missing: {len(result.missing_keys)}", flush=True)
+        if hasattr(result, "unexpected_keys") and result.unexpected_keys:
+            print(f"[openvla-train]   unexpected: {len(result.unexpected_keys)}", flush=True)
 
     # --------------------------------------------------------------------- #
     # Dataset + collator
@@ -238,7 +340,13 @@ def main() -> None:
         return has_weights and all((d / f).exists() for f in required)
 
     resume_target = args.resume
-    if resume_target is None:
+    if args.load_lora:
+        # --load_lora forces a fresh-optimizer restart: LoRA weights already
+        # seeded above, Trainer must NOT load optimizer.pt / trainer_state.
+        resume_target = None
+        print("[openvla-train] --load_lora set → skipping Trainer auto-resume "
+              "(fresh AdamW, step=0)", flush=True)
+    elif resume_target is None:
         ckpts = sorted(Path(args.output_dir).glob("checkpoint-*"),
                        key=lambda p: int(p.name.split("-")[1]) if p.name.split("-")[1].isdigit() else -1)
         while ckpts:
@@ -250,10 +358,35 @@ def main() -> None:
             print(f"[openvla-train] skipping torn ckpt {cand}", flush=True)
             ckpts.pop()
 
+    # Override save_steps in resumed trainer_state.  Trainer prefers state-file
+    # value over CLI, so resume from ckpt-5200 with save_steps=200 always saves
+    # next at 5400 — but bnb/CUDA segfaults reliably ~120 steps post-resume
+    # (i.e. step 5320), so 5400 is never reached.  Shorter save interval lets
+    # each watchdog attempt make permanent progress before the next crash.
+    if resume_target:
+        state_file = Path(resume_target) / "trainer_state.json"
+        if state_file.exists():
+            st = json.loads(state_file.read_text())
+            if st.get("save_steps") != args.save_steps:
+                old = st.get("save_steps")
+                st["save_steps"] = args.save_steps
+                state_file.write_text(json.dumps(st, indent=2))
+                print(f"[openvla-train] override save_steps in trainer_state: {old} -> {args.save_steps}", flush=True)
+
     print("[openvla-train] starting train loop", flush=True)
     trainer.train(resume_from_checkpoint=resume_target)
-    print("[openvla-train] training complete; saving final adapter", flush=True)
 
+    # Force a checkpoint at the exact max_steps boundary.  Trainer respects
+    # trainer_state.json's save_steps (e.g. 200) over CLI's --save_steps so
+    # the natural saves land at 5200/5400 — but the chunked loop expects
+    # checkpoint-$MAX_STEPS to exist.  This guarantees it.
+    end_step = trainer.state.global_step
+    end_ckpt = out_dir / f"checkpoint-{end_step}"
+    if not end_ckpt.exists():
+        print(f"[openvla-train] saving boundary ckpt at step {end_step}", flush=True)
+        trainer._save_checkpoint(model, trial=None)  # writes checkpoint-{global_step}
+
+    print("[openvla-train] training complete; saving final adapter", flush=True)
     final_dir = out_dir / "final"
     final_dir.mkdir(exist_ok=True)
     model.save_pretrained(final_dir)

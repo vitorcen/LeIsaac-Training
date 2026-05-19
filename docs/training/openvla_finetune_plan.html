@@ -365,7 +365,8 @@
 </ul>
 
 <h3>Phase 4 — QLoRA 微调（已实测，2026-05-18）</h3>
-<p>位置：<code>LeIsaac/scripts/finetune/openvla/{dataset.py, train.py, train.sh, smoke.py}</code>。conda env <code>openvla</code>（transformers 4.40.1 / peft 0.11.1 / bnb 0.43.1 / torch 2.3.1+cu121）。</p>
+<p>位置：<code>LeIsaac/scripts/finetune/openvla/{dataset.py, train.py, train.sh, smoke.py}</code>。conda env <code>openvla</code>（transformers 4.40.1 / peft 0.11.1 / <b>bnb 0.46.1</b> / torch 2.3.1+cu121）。<br/>
+<b>⚠️ bnb 必须 ≥ 0.46.1</b>，老版本 0.43.1 在 Linear4bit + PEFT 包装下随机内存破坏（详见 §"踩坑根治"）。</p>
 
 <table>
 <tr><th>实测项 (smoke.py)</th><th>值</th></tr>
@@ -392,11 +393,72 @@
 <div class="callout">
 <b>必须的工程 trick：</b>
 <ul>
+<li><b>pip install bitsandbytes==0.46.1</b> — 0.43.1 在 Linear4bit + PEFT 包装下随机崩（详见 §"踩坑根治"），HF transformers 主线最小要求已经是 0.46.1</li>
 <li><code>import torchgen.model as _torchgen_model</code> 放 train.py 顶部 — 否则 accelerate.find_tied_parameters 触发 enum lazy init 崩溃（FastWAM 原坑）</li>
 <li><code>prepare_model_for_kbit_training</code> 必须 BEFORE <code>get_peft_model</code></li>
 <li><code>pixel_values</code> 保持 float32 — vision backbone 是 timm fp32，只 Llama 是 bf16</li>
 <li><code>gradient_checkpointing_kwargs={"use_reentrant": False}</code> 必带</li>
 </ul>
+</div>
+
+<h3>踩坑根治 · Memory-corruption fix (2026-05-19)</h3>
+
+<div class="callout bad">
+<b>症状 · Symptoms (bnb 0.43.1)：</b>训练随机崩，3 种不同的 traceback 都指向同一根因 = 4-bit Linear / PEFT 包装下 <code>_named_members</code> tuple 解包失败：
+<ol>
+<li><code>ValueError: too many/not enough values to unpack (expected N, got 2)</code> 触发于 Trainer.log → <code>floating_point_ops</code> → <code>num_parameters</code> → <code>named_parameters</code> → <code>_named_members</code></li>
+<li>同一类 ValueError 触发于 bnb 4-bit 量化器加载阶段 → <code>find_tied_parameters</code> → <code>named_parameters</code> → <code>_named_members</code></li>
+<li>纯 SIGSEGV / "段错误（核心已转储）"，无 Python traceback</li>
+</ol>
+ValueError 甚至会飘到完全无关的 <code>sre_compile</code>（regex 编译）和 <code>pandas</code> import — 因为 C 扩展层踩 Python 堆，破坏的 tuple 在哪个迭代器解包都炸。
+</div>
+
+<div class="callout good">
+<b>根治 · Root-cause fix：</b>
+<pre>pip install bitsandbytes==0.46.1   # 把 0.43.1 升上来，其他包不动</pre>
+<b>同时把 optimizer 改成 <code>adamw_torch</code></b>（已是 train.py 默认），避免叠加 8-bit AdamW 这条第二条敏感 bnb 内核路径。<br/><br/>
+
+效果对比（本机 4090，<code>save_steps=100</code> + 20-retry watchdog）：
+<table>
+<tr><th>指标</th><th>bnb 0.43.1</th><th>bnb 0.46.1</th></tr>
+<tr><td>5500→6000 chunk 1h 进度</td><td>5500 卡死</td><td><b>5700 saved + 5730 still running</b></td></tr>
+<tr><td>每次 attempt 崩点</td><td>5527-5578（save 之前）</td><td>5721（已过 save 边界）</td></tr>
+<tr><td>新 ckpt 落地数</td><td>0</td><td>2+（5600, 5700, ...）</td></tr>
+</table>
+
+<b>belt-and-braces patch（留在 <code>train.py</code> + <code>server/openvla_leisaac/server.py</code> 顶部）：</b>
+<pre>import transformers.modeling_utils as _mu
+import accelerate.utils.modeling as _am
+import accelerate.utils as _au
+import transformers.integrations.bitsandbytes as _tb
+_mu.PreTrainedModel.floating_point_ops = lambda self, inputs, exclude_embeddings=True: 0
+_noop_tied = lambda *a, **kw: []
+_am.find_tied_parameters = _noop_tied
+_au.find_tied_parameters = _noop_tied
+_tb.find_tied_parameters = _noop_tied</pre>
+A 行屏蔽 Trainer FLOP 估算（日志 TFLOPS 列归零，无功能影响）。B 行让 bnb 4-bit 加载跳过 tie-weights 检测（对 OpenVLA 无影响，它生成 action token 不是 text）。<br/><br/>
+<b>train.py 还需做的：</b>resume 前覆写 <code>trainer_state.json["save_steps"] = args.save_steps</code>（Trainer 优先用 state-file 值不是 CLI），让 100-step save 真的生效；<code>trainer.train()</code> 返回后强制 <code>trainer._save_checkpoint(model, trial=None)</code> 保证 <code>checkpoint-$MAX_STEPS</code> 落盘。
+</div>
+
+<div class="callout">
+<b>不要再试 · Anti-list (codex gpt-5.4 review)：</b>
+<ul>
+<li>❌ 继续给 Python 层打 monkey patch — 同一根因，换地方再崩</li>
+<li>❌ 开 gradient checkpointing — 与 bnb 4-bit 量化态机互踩，2026 还有公开 issue</li>
+<li>❌ 训练用 <code>device_map="auto"</code> — HF 文档明确仅 inference 用</li>
+<li>❌ <code>torch.cuda.empty_cache()</code> 治本 — PyTorch 文档明确说不会增加可用显存</li>
+<li>❌ 期望 <code>CUDA_LAUNCH_BLOCKING=1</code> 修崩 — 只是 debug 工具，会把异步问题变同步</li>
+</ul>
+</div>
+
+<div class="callout">
+<b>如果 0.46.1 还崩：</b>
+<ol>
+<li>先升 bnb 0.46.1 → 0.47.0（FSDP2 + 大 block size 修补）</li>
+<li>再退到 8-bit base + LoRA + torch AdamW（绕开 Linear4bit）</li>
+<li>最后跑 <code>compute-sanitizer --tool memcheck python train.py ...</code> 抓非法内存访问</li>
+</ol>
+来源：<a href="https://github.com/bitsandbytes-foundation/bitsandbytes/releases">bnb 0.46.1 / 0.47.0 release notes</a>、<a href="https://github.com/bitsandbytes-foundation/bitsandbytes/pull/1719">PR #1719 Params4bit fix</a>、<a href="https://github.com/bitsandbytes-foundation/bitsandbytes/pull/1866">PR #1866 state_dict fix</a>、<a href="https://huggingface.co/docs/transformers/quantization/bitsandbytes">HF transformers bnb docs</a>。
 </div>
 
 <h3>Phase 5 — Eval + benchmark (~2h)</h3>

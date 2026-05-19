@@ -23,6 +23,11 @@ DATASET_DIR="${DATASET_DIR:-$LEISAAC_ROOT/datasets/raw/leisaac-pick-orange}"
 OUTPUT_DIR="${OUTPUT_DIR:-$LEISAAC_ROOT/outputs/openvla-leisaac-pick-orange}"
 MAX_STEPS="${MAX_STEPS:-10000}"
 LORA_TARGETS="${LORA_TARGETS:-q_proj,v_proj}"
+LORA_RANK="${LORA_RANK:-32}"
+LORA_ALPHA="${LORA_ALPHA:-16}"
+QUANT="${QUANT:-8bit}"   # 4bit (QLoRA, crash-prone), 8bit (default, stable), bf16 (no bnb)
+BATCH="${BATCH:-2}"      # per-device batch.  8-bit base+grad_ckpt fits batch=2 @ ~13 GB on 4090
+GRAD_ACCUM="${GRAD_ACCUM:-4}"   # effective batch = BATCH × GRAD_ACCUM
 RESUME="${RESUME:-}"
 
 if [[ ! -d "$DATASET_DIR" ]]; then
@@ -47,7 +52,8 @@ fi
 
 echo "[openvla-train] launching:"
 echo "  env=$CONDA_ENV  dataset=$DATASET_DIR  output=$OUTPUT_DIR"
-echo "  max_steps=$MAX_STEPS  lora_targets=$LORA_TARGETS  log=$LOG_FILE"
+echo "  max_steps=$MAX_STEPS  lora_targets=$LORA_TARGETS  quant=$QUANT"
+echo "  batch=$BATCH  grad_accum=$GRAD_ACCUM  eff_batch=$((BATCH * GRAD_ACCUM))  log=$LOG_FILE"
 
 exec conda run -n "$CONDA_ENV" --no-capture-output \
     python -u -m openvla.train \
@@ -55,5 +61,10 @@ exec conda run -n "$CONDA_ENV" --no-capture-output \
         --output_dir "$OUTPUT_DIR" \
         --max_steps "$MAX_STEPS" \
         --lora_targets "$LORA_TARGETS" \
+        --lora_rank "$LORA_RANK" \
+        --lora_alpha "$LORA_ALPHA" \
+        --quant "$QUANT" \
+        --batch_size "$BATCH" \
+        --grad_accum "$GRAD_ACCUM" \
         "${EXTRA[@]}" "$@" \
         2>&1 | tee "$LOG_FILE"
