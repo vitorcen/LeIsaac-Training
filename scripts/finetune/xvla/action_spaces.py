@@ -15,10 +15,25 @@ both ``import action_spaces  # noqa: F401`` near the top.
 """
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn as nn
 
 from lerobot.policies.xvla.action_hub import BaseActionSpace, register_action
+
+# Velocity-aware loss reweighting (AttenA+, 2605.13548).  Toggle via env var
+# `XVLA_VELOCITY_REWEIGHT=1` so we don't need a separate registry entry.
+# beta controls strength: w = exp(-beta * v/v_max).  Higher beta = more emphasis
+# on low-velocity (precise / contact) frames.
+_VEL_REWEIGHT = os.environ.get("XVLA_VELOCITY_REWEIGHT", "0") == "1"
+_VEL_BETA = float(os.environ.get("XVLA_VELOCITY_BETA", "2.0"))
+
+# OFT-lite (Fine-Tuning VLA 2502.19645): L1 regression on continuous actions
+# instead of MSE.  OpenVLA-OFT showed +20.6 abs on LIBERO.
+# Toggle via env var `XVLA_L1_LOSS=1`.  Mutually exclusive with velocity-reweight
+# in compute_loss (L1 path takes precedence if both set).
+_L1_LOSS = os.environ.get("XVLA_L1_LOSS", "0") == "1"
 
 
 @register_action("so101_single")
@@ -48,10 +63,21 @@ class SingleArmSO101ActionSpace(BaseActionSpace):
     JOINTS_IDX = (0, 1, 2, 3, 4)
     GRIPPER_SCALE = 5.0  # bumped 3→5 per codex/opencode review
     JOINTS_SCALE = 1.0
+    VELOCITY_REWEIGHT = _VEL_REWEIGHT
+    VEL_BETA = _VEL_BETA
+    L1_LOSS = _L1_LOSS
 
     def __init__(self):
         super().__init__()
         self.mse = nn.MSELoss()
+        self.l1 = nn.L1Loss()
+        if self.VELOCITY_REWEIGHT:
+            print(
+                f"[so101_single] velocity-reweight ON, beta={self.VEL_BETA}",
+                flush=True,
+            )
+        if self.L1_LOSS:
+            print("[so101_single] L1 loss ON (OFT-lite)", flush=True)
 
     def _pad_to_model_dim(self, x: torch.Tensor) -> torch.Tensor:
         """6D → 20D zero-pad (or pass-through if already 20D)."""
@@ -78,25 +104,48 @@ class SingleArmSO101ActionSpace(BaseActionSpace):
             f"SingleArmSO101 shape mismatch: pred {pred.shape} vs target {target.shape}"
         )
 
-        joints_loss = (
-            self.mse(
-                pred[:, :, list(self.JOINTS_IDX)],
-                target[:, :, list(self.JOINTS_IDX)],
+        if not self.VELOCITY_REWEIGHT:
+            loss_fn = self.l1 if self.L1_LOSS else self.mse
+            joints_loss = (
+                loss_fn(
+                    pred[:, :, list(self.JOINTS_IDX)],
+                    target[:, :, list(self.JOINTS_IDX)],
+                )
+                * self.JOINTS_SCALE
             )
-            * self.JOINTS_SCALE
-        )
-        gripper_loss = (
-            self.mse(
-                pred[:, :, list(self.gripper_idx)],
-                target[:, :, list(self.gripper_idx)],
+            gripper_loss = (
+                loss_fn(
+                    pred[:, :, list(self.gripper_idx)],
+                    target[:, :, list(self.gripper_idx)],
+                )
+                * self.GRIPPER_SCALE
             )
-            * self.GRIPPER_SCALE
-        )
+            return {"joints_loss": joints_loss, "gripper_loss": gripper_loss}
 
-        return {
-            "joints_loss": joints_loss,
-            "gripper_loss": gripper_loss,
-        }
+        # Velocity-aware reweighting (AttenA+, 2605.13548).
+        # target shape: (B, T, dim_action).  Compute per-step velocity from
+        # target joints (excludes gripper which has its own scaling).
+        tj = target[..., list(self.JOINTS_IDX)]  # (B, T, |joints|)
+        vel = torch.zeros(target.shape[:2], device=target.device, dtype=target.dtype)
+        vel[:, 1:] = (tj[:, 1:] - tj[:, :-1]).norm(dim=-1)  # (B, T)
+        # Per-batch-element normalization → weights independent of absolute scale.
+        vel_max = vel.amax(dim=1, keepdim=True).clamp(min=1e-6)
+        w = torch.exp(-self.VEL_BETA * vel / vel_max)  # (B, T), low vel = high w
+        # Normalize so weighted average = unweighted average on uniform-velocity inputs.
+        w = w / w.mean(dim=1, keepdim=True).clamp(min=1e-6)
+
+        # Per-step joints squared error, weighted average.
+        pj = pred[..., list(self.JOINTS_IDX)]
+        sq_j = (pj - tj).pow(2).mean(dim=-1)  # (B, T)
+        joints_loss = (sq_j * w).mean() * self.JOINTS_SCALE
+
+        # Same weighting on gripper.
+        tg = target[..., list(self.gripper_idx)]
+        pg = pred[..., list(self.gripper_idx)]
+        sq_g = (pg - tg).pow(2).mean(dim=-1)  # (B, T)
+        gripper_loss = (sq_g * w).mean() * self.GRIPPER_SCALE
+
+        return {"joints_loss": joints_loss, "gripper_loss": gripper_loss}
 
     def preprocess(self, proprio, action, mode="train"):
         # No special preprocessing — model sees zero-padded 20D directly.
