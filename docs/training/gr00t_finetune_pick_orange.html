@@ -37,9 +37,9 @@
 <body>
 
 <h1>GR00T N1.5 / N1.6 微调计划</h1>
-<p class="meta">SO-101 PickOrange · LeIsaac benchmark champion (N1.6 🥇 2/3) · 2026-05-18</p>
+<p class="meta">SO-101 PickOrange · LeIsaac benchmark champion (N1.6 🥇 2/3) · 2026-05-18 · 2026-05-20 v2 (X-VLA 经验回灌 + Isaac-GR00T native path 锁定)</p>
 <p class="en">NVIDIA Isaac GR00T N1.5/N1.6 — Eagle2 VLM + multi-embodiment flow-matching DiT action head, ~3B params.
-Already top of the leaderboard via the LightwheelAI public ckpt; the next obvious lever is in-house LoRA / QLoRA finetune to push from 6/9 to 8/9 oranges.</p>
+Already top of the leaderboard via the LightwheelAI public ckpt; the next obvious lever is in-house finetune to push from 6/9 to 8/9 oranges.</p>
 
 <h2>0. TL;DR</h2>
 <div class="callout good">
@@ -47,7 +47,21 @@ Already top of the leaderboard via the LightwheelAI public ckpt; the next obviou
 架构：<b>Eagle2-VLM (~2.4B, frozen) + Flow-matching Action DiT (~600M, trainable)</b>，3B 总参数。
 N1.5 是上一代（0/3, 4/9，但已 commit 落盘 8 颗其中 4 strict）；N1.6 用更新的 Eagle2.5 backbone + 优化 action head。
 <br/><br/>
-<b>下一步</b>：自己跑 LoRA / QLoRA 微调（lerobot config 原生支持 <code>lora_rank</code>），从 <code>nvidia/GR00T-N1.6-3B</code> base 出发，预期能从 2/3 → 3/3。
+<b>路径决策（2026-05-20 v2）</b>：用 <b>Isaac-GR00T native <code>launch_finetune.py</code></b>，<b>不</b>走 lerobot groot wrapper。
+理由：lerobot wrapper 硬编码了 <code>GR00TN15</code>（N1.6 不兼容）；native 路径是 LightwheelAI SOTA ckpt 的同款 pipeline；推理直接复用 <code>server/start_server.sh --gr00t-only</code> + <code>nvidia/GR00T-N1.6-3B</code>，0 协议改动。
+<br/><br/>
+<b>下一步</b>：N1.6 base 单 4090 全参 bf16 微调（trainable = projector + DiT + top4 LLM layers ≈ 600M），save_steps=500，自动 6-round eval-on-save，预期 2/3 → 3/3。<b>不上 LoRA</b>（Isaac-GR00T native 不暴露 lora_rank；显存够，不必）。
+</div>
+
+<div class="callout">
+<b>📌 X-VLA session 五条普适经验已回灌到本 doc</b>（详见 §3.2 推理 / §3.3 训练 / §5 Phases）：
+<ol>
+<li><b>Prompt 锁死 "Pick up the orange and put it in the plate"</b>（避开 "Grasp" / "all" / "on the plate"）</li>
+<li><b>训练不加外置 aug</b>（N1.6 自带 color_jitter + albumentations + crop；X-VLA 50-demo 加 aug 普遍 -10%）</li>
+<li><b>EMA / TAE 不要做</b>（X-VLA RF head 上全部证伪，GR00T 同为 flow-matching DiT，预期同样无效）</li>
+<li><b>n_action_steps sweep 而非锁定</b>（X-VLA 默认 8 → 0/18 灾难；GR00T chunk=50，sweep {8, 16, 25, 50}）</li>
+<li><b>Eval 必须 ≥6-round (18 ep)</b>，决策需 ≥12-round (≥36 ep)；3-round 方差 ±15-30%</li>
+</ol>
 </div>
 
 <h2>1. 架构核心</h2>
@@ -232,85 +246,168 @@ N1.5 是上一代（0/3, 4/9，但已 commit 落盘 8 颗其中 4 strict）；N1
 
 <p>N1.6 是 <b>leaderboard 🥇</b>，但显然 6/9 不是天花板 —— 还差 3 颗。下一步该自训。</p>
 
-<h2>3. 微调计划 — LoRA / QLoRA from N1.6 base</h2>
+<h2>3. 微调计划 — Isaac-GR00T native finetune from N1.6 base</h2>
 
 <div class="callout good">
-<b>为什么 LoRA + N1.6 base 是合理下一步</b>：
+<b>为什么 Isaac-GR00T native 是合理下一步</b>：
 <ul>
-<li>N1.6 公开 ckpt 已 2/3 → 离 3/3 只差关键样本细节</li>
-<li>lerobot 原生支持 LoRA（<code>configuration_groot.py</code> 有 <code>lora_rank/lora_alpha/lora_dropout</code> 字段）</li>
-<li>Eagle2 backbone frozen 不动 → 只训 projector + DiT 几百 M params</li>
-<li>预期：从 multi-embodiment generalist → SO-101 specialist，6/9 → 8/9 是合理目标</li>
+<li>N1.6 公开 ckpt 已 2/3 → 离 3/3 只差关键样本细节（SO-101 specialist tuning）</li>
+<li><code>launch_finetune.py</code> 是 LightwheelAI 6/9 SOTA ckpt 的同款 pipeline，已验证</li>
+<li><code>~/work/Isaac-GR00T/examples/SO100/</code> 提供 SO-101 兼容模板（同 5+1=6D arm+gripper）</li>
+<li>推理直接复用 <code>server/start_server.sh --gr00t-only</code>（已 zero-modify 接入 LeIsaac client）</li>
+<li>预期：从 multi-embodiment generalist → SO-101 specialist，6/9 → 8/9 合理目标</li>
 </ul>
 </div>
 
-<h3>3.1 推荐配方：bf16 LoRA</h3>
+<div class="callout bad">
+<b>❌ 为什么不用 lerobot groot wrapper（之前 v1 草稿的错误方向）</b>：
+<ul>
+<li><code>lerobot/policies/groot/modeling_groot.py:85</code> 硬编码 <code>GR00TN15.from_pretrained</code>，N1.6 base 不能加载（Eagle2 vs Eagle2.5 schema 不匹配）</li>
+<li>lerobot config <code>max_state_dim=64, max_action_dim=32</code> 与 N1.6 base <code>128/128</code> 不一致，需要 patch lerobot submodule</li>
+<li>原 v1 推荐的 <code>lora_rank=32</code> 也只在 lerobot wrapper 暴露；native path 不支持 LoRA（也不需要）</li>
+</ul>
+</div>
+
+<h3>3.1 推荐配方：bf16 全参（projector + DiT + top4 LLM）</h3>
 
 <table>
-<tr><th>config 字段</th><th>推荐值</th><th>理由</th></tr>
-<tr><td><code>base_model_path</code></td><td><code>nvidia/GR00T-N1.6-3B</code></td><td>当前 SOTA base，比 N1.5 强一档</td></tr>
-<tr><td><code>chunk_size</code></td><td>50</td><td>保留默认（dataset 30Hz × 1.67s 训练上下文）</td></tr>
-<tr><td><code>n_action_steps</code></td><td><b>16</b>（不要 50）</td><td>消费前 16 步重 query：267ms 重规划周期，避免 1.67s open-loop 错过抓握时机</td></tr>
-<tr><td><code>tune_llm</code></td><td><b>False</b></td><td>2.4B Eagle decoder 全冻</td></tr>
-<tr><td><code>tune_visual</code></td><td><b>False</b></td><td>vision encoder 全冻</td></tr>
-<tr><td><code>tune_projector</code></td><td><b>True</b></td><td>~10M，必须训以适配 SO-101</td></tr>
-<tr><td><code>tune_diffusion_model</code></td><td><b>True</b></td><td>~500M action head，主要 trainable</td></tr>
-<tr><td><code>lora_rank</code></td><td><b>32</b></td><td>0 = 全参微调（更准但 VRAM 紧），32 = LoRA on DiT cross-attn q/v（节省 VRAM）</td></tr>
-<tr><td><code>lora_alpha</code></td><td>16</td><td>默认 r=32 alpha=16，scale=0.5</td></tr>
-<tr><td><code>lora_dropout</code></td><td>0.1</td><td>默认</td></tr>
-<tr><td><code>lora_full_model</code></td><td>False</td><td>仅挂 DiT 不挂 VLM</td></tr>
-<tr><td><code>embodiment_tag</code></td><td><code>"new_embodiment"</code></td><td>自动分配新 cat_id；不要复用预训练 embodiment（会偏向其他机器人）</td></tr>
-<tr><td><code>max_state_dim</code></td><td>64</td><td>默认；我们 6D state pad → 64</td></tr>
-<tr><td><code>max_action_dim</code></td><td>32</td><td>默认；我们 6D action pad → 32</td></tr>
-<tr><td><code>use_bf16</code></td><td>True</td><td></td></tr>
-<tr><td><code>optimizer_lr</code></td><td>1e-4 (LoRA) / 2e-5 (full)</td><td>LoRA 可大学习率</td></tr>
-<tr><td><code>warmup_ratio</code></td><td>0.05</td><td>默认</td></tr>
+<tr><th>CLI flag</th><th>推荐值</th><th>理由</th></tr>
+<tr><td><code>--base_model_path</code></td><td><code>nvidia/GR00T-N1.6-3B</code></td><td>当前 SOTA base，比 N1.5 强一档</td></tr>
+<tr><td><code>--dataset_path</code></td><td><code>LeIsaac/datasets/raw/leisaac-pick-orange</code></td><td>50 train + 10 val split（保持与其他 baseline 一致）</td></tr>
+<tr><td><code>--modality_config_path</code></td><td><code>LeIsaac/scripts/finetune/gr00t/leisaac_config.py</code></td><td>复用 SO100 模板（同 5+1=6D 单臂 + gripper）</td></tr>
+<tr><td><code>--embodiment_tag</code></td><td><code>NEW_EMBODIMENT</code></td><td>自动分配 cat_id；不复用预训练 tag 防偏置</td></tr>
+<tr><td><code>--tune_llm</code></td><td>false</td><td>2.4B Eagle decoder 主体 frozen；N1.6 内部仍有 <code>tune_top_llm_layers=4</code> 微调最上 4 层</td></tr>
+<tr><td><code>--tune_visual</code></td><td>false</td><td>vision encoder frozen</td></tr>
+<tr><td><code>--tune_projector</code></td><td>true</td><td>~10M，必须训以适配 SO-101</td></tr>
+<tr><td><code>--tune_diffusion_model</code></td><td>true</td><td>~500M action head，主要 trainable</td></tr>
+<tr><td><code>--global_batch_size</code></td><td><b>32</b></td><td>单 4090 sweet spot（实例 batch=8 × grad_accum=4 = 32）</td></tr>
+<tr><td><code>--learning_rate</code></td><td>1e-4</td><td>同 SO100 + LIBERO 配方</td></tr>
+<tr><td><code>--warmup_ratio</code></td><td>0.05</td><td>默认</td></tr>
+<tr><td><code>--weight_decay</code></td><td>1e-5</td><td>默认</td></tr>
+<tr><td><code>--max_steps</code></td><td>10000</td><td>50-demo 数据集，估计 6-8k step 收敛（同 X-VLA 经验）</td></tr>
+<tr><td><code>--save_steps</code></td><td><b>500</b></td><td><b>X-VLA 经验：save_freq=500 + auto-eval-on-save 是 sweet spot</b></td></tr>
+<tr><td><code>--save_total_limit</code></td><td><b>20</b></td><td>覆盖 10k step 全程（10k/500=20）；watchdog prune 由 auto-sweep 接管</td></tr>
+<tr><td><code>--state_dropout_prob</code></td><td><b>0.0</b>（默认）</td><td>SO100 默认 0；不要照搬 LIBERO 的 0.8（多 robot 适配场景才需要）</td></tr>
+<tr><td><code>--color_jitter_params</code></td><td><b>不传</b>（用模型自带默认）</td><td><b>X-VLA 经验</b>：50-demo 加外置 jitter 普遍 -10% per-ep；N1.6 自带 <code>color_jitter_params={"brightness":0.1,"contrast":0.1,"hue":0.1,"saturation":0.1}</code> + albumentations + 0.95 crop 已够</td></tr>
+<tr><td><code>--random_rotation_angle</code></td><td>不传（默认 None）</td><td>同上</td></tr>
+<tr><td><code>--dataloader_num_workers</code></td><td>4</td><td>4090 SSD 配置 4 worker 不饿 GPU</td></tr>
+<tr><td><code>--num_gpus</code></td><td>1</td><td>单 4090</td></tr>
+<tr><td><code>--use_wandb</code></td><td>false</td><td>本地训练，watchdog stdout 已够</td></tr>
 </table>
 
-<h3>3.2 GPU 资源估算（4090 24GB）</h3>
+<h3>3.2 推理配置（同上 X-VLA 教训）</h3>
 
 <table>
-<tr><th>项</th><th>bf16 LoRA (推荐)</th><th>QLoRA NF4 (备选)</th><th>全参 bf16 (拒)</th></tr>
-<tr><td>Eagle2 base (frozen)</td><td>~4.8 GB</td><td>~1.3 GB</td><td>~4.8 GB</td></tr>
-<tr><td>DiT action head (trainable)</td><td>~1.0 GB</td><td>~1.0 GB</td><td>~1.0 GB</td></tr>
-<tr><td>LoRA params (r=32)</td><td>~0.05 GB</td><td>~0.05 GB</td><td>—（全参）</td></tr>
-<tr><td>Optimizer (LoRA only)</td><td>~0.2 GB</td><td>~0.2 GB</td><td>~6 GB</td></tr>
-<tr><td>Activations (batch=4, chunk=50)</td><td>~8-10 GB</td><td>~8-10 GB</td><td>~12 GB</td></tr>
-<tr><td><b>合计</b></td><td><b>~14-16 GB</b> <span class="tag-good">✅</span></td><td><b>~10-12 GB</b> <span class="tag-good">✅</span></td><td><b>~24 GB</b> <span class="tag-bad">❌ OOM</span></td></tr>
+<tr><th>knob</th><th>推荐</th><th>理由</th></tr>
+<tr><td>Prompt</td><td><code>"Pick up the orange and put it in the plate"</code></td><td><b>X-VLA 锁定 prompt</b>：≥36 ep 上 best per-ep；避开 "Grasp" / "all" / "on/onto"</td></tr>
+<tr><td><code>chunk_size</code></td><td>50（base 默认）</td><td>训练时 30Hz × 1.67s 上下文</td></tr>
+<tr><td>n_action_steps / horizon</td><td><b>初值 16，sweep {8, 16, 25, 50}</b></td><td><b>X-VLA 教训</b>：default chunk_step=8 在 X-VLA 上 0/18；整 chunk reuse h=32 = 8/18。GR00T chunk=50 全 reuse 是 1.67s open-loop，太长；16 步 ≈ 533ms 重规划是合理初值；sweep 后再 lock</td></tr>
+<tr><td>EMA / TAE</td><td><b>不做</b></td><td>X-VLA RF head 上全部证伪（EMA α=0.3 单 ep outlier，12-round retest 2/18；TAE K∈{2,4,8} 全 ≤1/9）</td></tr>
+<tr><td><code>num_inference_timesteps</code></td><td>4（N1.6 base 默认）</td><td>N1.6 已优化到 4 步 denoising（vs N1.5 的 10），不要改</td></tr>
 </table>
 
-<p><b>推荐：bf16 LoRA</b>。QLoRA 不必要（base 4.8 GB，bf16 头顶 16 GB 还安全）；QLoRA 反而会引入 bnb flaky 问题（vanilla OpenVLA 那 4 类 crash）。</p>
+<h3>3.3 GPU 资源估算（单 4090 24GB）</h3>
 
-<h3>3.3 训练 launcher 草稿</h3>
+<table>
+<tr><th>项</th><th>bf16 全参（推荐）</th><th>~8-bit base + bf16 train（不建议）</th></tr>
+<tr><td>Eagle2.5 base (≈2.0B frozen + top4 LLM layers trainable)</td><td>~4.0 GB params + ~0.5 GB grads</td><td>~2.0 GB (8-bit) + 0.5 GB grads</td></tr>
+<tr><td>DiT action head + projector (≈500M trainable)</td><td>~1.0 GB params + ~1.0 GB grads</td><td>~1.0 + 1.0</td></tr>
+<tr><td>Adam optim (trainable ≈600M × 8 bytes)</td><td>~4.8 GB</td><td>~4.8 GB</td></tr>
+<tr><td>Activations (batch=2, chunk=50, bf16)</td><td>~3-4 GB</td><td>~3 GB</td></tr>
+<tr><td><b>合计 (per-step batch=2)</b></td><td><b>~13-15 GB</b> <span class="tag-good">✅ 4090 安全</span></td><td><b>~11-13 GB</b> <span class="tag-warn">⚠️ bnb flaky</span></td></tr>
+</table>
+
+<div class="callout bad">
+<b>⚠️ 实测显存校准 4 次 OOM + 1 次成功 (2026-05-20 实战)</b>：
+<table>
+<tr><th>尝试</th><th>per_step</th><th>grad_ckpt</th><th>bb_fp32</th><th>optim</th><th>结果</th></tr>
+<tr><td>1</td><td>8</td><td>✗</td><td>✓</td><td>adamw_torch</td><td>OOM 22.35GB ❌</td></tr>
+<tr><td>2</td><td>2</td><td>✗</td><td>✓</td><td>adamw_torch</td><td>OOM 22.35GB ❌</td></tr>
+<tr><td>3</td><td>4</td><td>✓</td><td>✓</td><td>adamw_torch</td><td>OOM 22.35GB ❌</td></tr>
+<tr><td>4</td><td>2</td><td>✓</td><td>✗</td><td>adamw_torch</td><td>OOM 22.36GB ❌</td></tr>
+<tr><td><b>5</b></td><td><b>2</b></td><td><b>✓</b></td><td><b>✗</b></td><td><b>paged_adamw_8bit</b></td><td>✅ <b>loss 1.07→0.21</b> over 500 step；峰值 24000 MiB</td></tr>
+</table>
+<b>关键发现</b>：N1.6 静态显存（Eagle 2.4B + DiT 600M trainable + bf16 master + Adam state）≈ 22 GB。激活根本不是瓶颈（per_step=8 和 2 都 OOM 在同一个 22.35 GB）。<b>唯一能救的是 8-bit optim state</b>（paged_adamw_8bit, bitsandbytes 0.49.2），把 32-bit Adam (~4.8 GB on 600M trainable) 压成 8-bit (~1.2 GB)，省 ~3 GB 给激活。
+</div>
+
+<h3>3.3.1 最终敲定配方（2026-05-20 v3）</h3>
+
+<pre># LeIsaac/scripts/finetune/gr00t/launch_finetune_ckpt.py 中固定写入：
+config.model.backbone_trainable_params_fp32 = False  # save ~3 GB master fp32
+config.training.gradient_checkpointing       = True  # save ~half activations
+config.training.optim                        = "paged_adamw_8bit"  # save ~3 GB
+
+# train.sh env：
+GLOBAL_BATCH=16
+GRAD_ACCUM=8                # per-step = 2
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+</pre>
+
+<p><b>显存预算</b>（实测峰值 24000 MiB / 24 GB）：</p>
+<ul>
+<li>Eagle bf16 base (frozen, ~2.4B): ~4.8 GB</li>
+<li>top4 LLM layers + DiT trainable bf16 (~600M): ~1.2 GB params + ~1.2 GB grads</li>
+<li>paged_adamw_8bit state (~600M × 1 byte × 2): ~1.2 GB</li>
+<li>Activations (grad-ckpt halved, per_step=2, chunk=50, 448×448): ~14-15 GB</li>
+<li><b>合计 ≈ 22.4 GB</b>，4090 上跑得动但留白小（建议训练时不要开其他 GPU 进程）</li>
+</ul>
+
+<div class="callout">
+<b>📌 注意</b>：训练时 4090 几乎打满（24000 MiB / 24576 MiB），<b>不能并行跑 GR00T 推理 server 做 auto-eval</b>。下游 closed-loop eval 必须等训练完成后串行跑（与 X-VLA workflow 一致）。
+</div>
+
+<div class="callout bad">
+<b>⚠️ exit 139 偶发 SIGSEGV</b>：尝试 5 在 ckpt-500 save 完后进程 exit 139（无 Python traceback）。怀疑是 bnb 0.49.2 在 24GB 峰值时 paged 分配的 cuda kernel 偶发崩。HF Trainer auto-resume 完美兼容：删 ckpt 之外的孤儿文件后重启 train.sh，会自动从 latest checkpoint-N 续。
+<br/>对应策略：把 train.sh 包一层 watchdog，detect exit 139 后自动重启（沿用 OpenVLA session 同款方案）。
+</div>
+
+<h3>3.4 训练 launcher 草稿（最终版）</h3>
 
 <pre># LeIsaac/scripts/finetune/gr00t/train.sh
+# 复用 Isaac-GR00T native launch_finetune.py + uv venv.
 
-CONDA_ENV=lerobot \
-DATASET_DIR=$HOME/work/isaaclab-experience/LeIsaac/datasets/raw/leisaac-pick-orange \
-OUTPUT_DIR=$HOME/work/isaaclab-experience/LeIsaac/outputs/gr00t-n16-leisaac-pick-orange \
-BASE_CKPT=nvidia/GR00T-N1.6-3B \
-\
-conda run -n "$CONDA_ENV" --no-capture-output \
-    python -m lerobot.scripts.lerobot_train \
-        --policy.type=groot \
-        --policy.path="$BASE_CKPT" \
-        --policy.base_model_path="$BASE_CKPT" \
-        --policy.chunk_size=50 \
-        --policy.n_action_steps=16 \
-        --policy.tune_llm=false --policy.tune_visual=false \
-        --policy.tune_projector=true --policy.tune_diffusion_model=true \
-        --policy.lora_rank=32 --policy.lora_alpha=16 --policy.lora_dropout=0.1 \
-        --policy.lora_full_model=false \
-        --policy.embodiment_tag=new_embodiment \
-        --policy.use_bf16=true \
-        --policy.optimizer_lr=1e-4 \
-        --policy.warmup_ratio=0.05 \
-        --dataset.repo_id=local \
-        --dataset.root="$DATASET_DIR" \
-        --output_dir="$OUTPUT_DIR" \
-        --batch_size=4 --num_workers=4 \
-        --steps=10000 --save_freq=500
+GR00T_ROOT="${HOME}/work/Isaac-GR00T"
+DATASET_DIR="${HOME}/work/isaaclab-experience/LeIsaac/datasets/raw/leisaac-pick-orange"
+OUTPUT_DIR="${HOME}/work/isaaclab-experience/LeIsaac/outputs/gr00t-n16-leisaac-pick-orange"
+MODALITY_CFG="${HOME}/work/isaaclab-experience/LeIsaac/scripts/finetune/gr00t/leisaac_config.py"
+MAX_STEPS="${MAX_STEPS:-10000}"
+SAVE_STEPS="${SAVE_STEPS:-500}"
+GLOBAL_BATCH="${GLOBAL_BATCH:-32}"
+GRAD_ACCUM="${GRAD_ACCUM:-4}"          # per-step batch = 32/4 = 8
+
+cd "$GR00T_ROOT"
+CUDA_VISIBLE_DEVICES=0 uv run --extra=gpu python \
+    gr00t/experiment/launch_finetune.py \
+        --base_model_path nvidia/GR00T-N1.6-3B \
+        --dataset_path "$DATASET_DIR" \
+        --modality_config_path "$MODALITY_CFG" \
+        --embodiment_tag NEW_EMBODIMENT \
+        --num_gpus 1 \
+        --output_dir "$OUTPUT_DIR" \
+        --save_steps "$SAVE_STEPS" \
+        --save_total_limit 25 \
+        --max_steps "$MAX_STEPS" \
+        --warmup_ratio 0.05 \
+        --weight_decay 1e-5 \
+        --learning_rate 1e-4 \
+        --global_batch_size "$GLOBAL_BATCH" \
+        --gradient_accumulation_steps "$GRAD_ACCUM" \
+        --dataloader_num_workers 4 \
+        --shard_size 1024 \
+        --num_shards_per_epoch 100000 \
+        --episode_sampling_rate 0.1
 </pre>
+
+<h3>3.5 Auto-eval-on-save 循环</h3>
+
+<p>训练 background 跑，同时 <code>scripts/auto_sweep_gr00t_ckpts.sh</code> 监控 <code>$OUTPUT_DIR/checkpoint-*</code>，每发现新 ckpt 就：</p>
+<ol>
+<li>启动 <code>server/start_server.sh --gr00t-only</code>，<code>GR00T_MODEL_PATH=&lt;ckpt&gt;</code></li>
+<li>跑 6-round eval（<code>EVAL_ROUNDS=6 EPISODE_LENGTH=60 MAX_ROUND_WALL_S=90</code>）</li>
+<li>解析 metrics JSON，append 一行到 <code>logs/gr00t_ckpts.csv</code></li>
+<li>kill server，继续等下一个 ckpt</li>
+</ol>
+<p>训练不中断；eval 串行在 server pause 间隙跑（每 ckpt ≈ 90s × 6 = 9 min 评测；训练每 500 step ≈ 25-30 min @ 4090，eval 不会撞车）。</p>
 
 <h2>4. 风险清单</h2>
 
@@ -327,16 +424,17 @@ conda run -n "$CONDA_ENV" --no-capture-output \
 <h2>5. Phases</h2>
 
 <table>
-<tr><th>Phase</th><th>步骤</th><th>时间预算</th></tr>
-<tr><td>P0a</td><td>下载 <code>nvidia/GR00T-N1.6-3B</code> + cat <code>config.json</code> 比对超参</td><td>~30min</td></tr>
-<tr><td>P0b</td><td>验证 LeRobot v3.0 parquet → groot processor 兼容（应该原生支持）</td><td>~30min</td></tr>
-<tr><td>P1</td><td>Smoke：50 step 跑通 + 看 loss 下降 + 监控 GPU mem</td><td>~1h</td></tr>
-<tr><td>P2</td><td>Train 10k step，save_freq=500</td><td>~3-5h</td></tr>
-<tr><td>P3</td><td>Offline action smoke @ ckpt-2000, 5000, 10000</td><td>~1h</td></tr>
-<tr><td>P4</td><td>GUI eval @ step_hz=30, horizon=16 vs LightwheelAI N1.6 baseline</td><td>~1h</td></tr>
+<tr><th>Phase</th><th>步骤</th><th>时间预算</th><th>X-VLA 经验校准</th></tr>
+<tr><td>P0a</td><td><code>nvidia/GR00T-N1.6-3B</code> 已下载（17.3 GB cache hit）；cat <code>config.json</code> 比对超参</td><td>~10min</td><td>—</td></tr>
+<tr><td>P0b</td><td>写 <code>leisaac_config.py</code> 模态映射 + <code>meta/modality.json</code>（复用 SO100 模板，5+1 D 完全一致）</td><td>~20min</td><td>—</td></tr>
+<tr><td>P1</td><td>Smoke：50 step 跑通 + 看 loss 下降 + 监控 GPU mem（确认 batch=8 在 24GB 内）</td><td>~1h</td><td>必跑，OOM 提前暴露</td></tr>
+<tr><td>P2</td><td>Train 10k step，<b>save_freq=500</b>（X-VLA 同款）</td><td>~3-5h</td><td>同 X-VLA 长跑节奏</td></tr>
+<tr><td>P3</td><td><b>Auto-eval-on-save loop</b>：每 ckpt 6-round (18 ep) closed-loop，append CSV</td><td>训练并行 (~9 min/ckpt × 20 = 3h)</td><td><b>X-VLA 经验：不做 offline action-MSE，已多次证伪不能预测 closed-loop</b></td></tr>
+<tr><td>P4</td><td>Top-3 ckpt 复测 ≥12-round（36 ep）→ 选 best</td><td>~1h</td><td>3-round 方差 ±30%，6-round ±15%，12-round ±5%</td></tr>
+<tr><td>P5</td><td>Best ckpt 跑 benchmark-aligned 3 round × 120s sim × 180s wall_cap，更新 leaderboard</td><td>~30min</td><td>同其他 baseline 条件</td></tr>
 </table>
 
-<p><b>总预算 ≈ 6-8h</b>，跟 X-VLA 同档；但因为 lerobot trainer 完全原生 + 起点就 2/3 → <b>风险最低、ROI 最高的下一个动作</b>。</p>
+<p><b>总预算 ≈ 6-9h</b>，跟 X-VLA 同档；起点就 2/3 → <b>风险最低、ROI 最高的下一个动作</b>。</p>
 
 <h2>6. 与 X-VLA 的取舍</h2>
 

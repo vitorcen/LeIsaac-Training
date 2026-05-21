@@ -57,8 +57,9 @@ _Sort: strict Rounds DESC → 🍊 DESC → time ASC._
 
 | Policy | Params | `config.type` | Strict ✅ | 🍊 (n/9) | Pick rate | Avg round | Peak VRAM | GPU util | Per-round detail |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| **[`hi-space/GR00T-N1.6-3B-Pick-Orange`](https://huggingface.co/hi-space/GR00T-N1.6-3B-Pick-Orange) (step_hz=60)** 🥇 | ~3B | `gr00t_n1_6` | **2/3** | **6/9** | **66.7%** | 96s | 17.3 GB | 31.1% | 3🍊@39s✅ / 0🍊@180s / 3🍊@68s✅ |
-| [`wsagi/SmolVLA-PickOrange`](https://huggingface.co/wsagi/SmolVLA-PickOrange) **(自训 / ours)** 🥈 | ~450M | `smolvla` | 1/3 | 5/9 | 55.6% | 355s | 10.0 GB | 23.0% | 3🍊@158s✅ / 0🍊@552s / 2🍊@355s |
+| **[`wsagi/GR00T-N1.6-PickOrange`](https://huggingface.co/wsagi/GR00T-N1.6-PickOrange) (自训 / ours, ckpt-6500, step_hz=60)** 🥇🆕 | ~3B | `gr00t_n1_6` | **2/3** | **8/9** | **88.9%** | 115s | ~22 GB (train) / 17.3 GB (infer) | TBD | 2🍊@180s / 3🍊@66s✅ / 3🍊@113s✅ |
+| **[`hi-space/GR00T-N1.6-3B-Pick-Orange`](https://huggingface.co/hi-space/GR00T-N1.6-3B-Pick-Orange) (step_hz=60)** 🥈 | ~3B | `gr00t_n1_6` | **2/3** | **6/9** | **66.7%** | 96s | 17.3 GB | 31.1% | 3🍊@39s✅ / 0🍊@180s / 3🍊@68s✅ |
+| [`wsagi/SmolVLA-PickOrange`](https://huggingface.co/wsagi/SmolVLA-PickOrange) **(自训 / ours)** 🥉 | ~450M | `smolvla` | 1/3 | 5/9 | 55.6% | 355s | 10.0 GB | 23.0% | 3🍊@158s✅ / 0🍊@552s / 2🍊@355s |
 | [`LightwheelAI/leisaac-pick-orange-v0`](https://huggingface.co/LightwheelAI/leisaac-pick-orange-v0) **(step_hz=60)** 🥉 | ~3B | `gr00t_n1_5` | 0/3 | 4/9 | 44.4% | 105s | 16.2 GB | 36.1% | 1🍊@180s / 1🍊@55s / 2🍊@79s |
 | [`wsagi/X-VLA-PickOrange`](https://huggingface.co/wsagi/X-VLA-PickOrange) **(自训 / ours, weak-aug 17k)** 🆕 | 0.9B | `xvla` | 0/3 | 4/9 | 44.4% | 180s | ~5 GB | TBD | 2🍊@180s / 1🍊@180s / 1🍊@180s ⭐ 6-round 18/18 ep ≥1 placed (50% per-ep) |
 | [`wsagi/DiffusionPolicy-PickOrange`](https://huggingface.co/wsagi/DiffusionPolicy-PickOrange) **(自训 / ours)** | ~267M | `diffusion` | 0/3 | 2/9 | 22.2% | 108s | 10.6 GB | 22.3% | 0🍊@159s / 2🍊@105s / 0🍊@60s |
@@ -71,7 +72,8 @@ _Sort: strict Rounds DESC → 🍊 DESC → time ASC._
 
 **核心结论 / Headlines**：
 
-- 🥇 **GR00T N1.6 是当前 SOTA** — 2/3 strict, 6/9 🍊, avg 96s/round。N1.5 仅 4/9 — 同 family 但 N1.6 强 1.5×。
+- 🥇 **wsagi 自训 GR00T-N1.6 (ckpt-6500) 是新 SOTA** — 2/3 strict, **8/9** 🍊, avg 115s/round。在 4090 24GB 上极限挤进 N1.6 全参 FT（bf16 + grad-ckpt use_reentrant=False + adafactor + DISABLE_ADDMM_CUDA_LT=1 + watchdog auto-resume），同 strict 但 +2🍊 vs hi-space baseline。
+- 🥈 hi-space N1.6 (公开 baseline) — 2/3 strict, 6/9 🍊, avg 96s。同 family、同 strict，但少 2 颗 🍊 — N1.6 family 上限随训练投入提升。
 - ⚙️ **step_hz=60 对 GR00T 系列关键**：N1.5 step_hz=30 → 1🍊；step_hz=60 → 4🍊（4x boost）。dataset 是 30fps 但 GR00T 的 chunk action 输出预计高于 30Hz 应用以达自然速度。ACT/SmolVLA/DP 在 30Hz 表现一致，未做 60Hz sweep。
 - 🟡 **SmolVLA (self) 数据上限 5/9** ≫ SmolVLA (other) 0/9 — 同架构差异完全来自训练（local 30k step vs edge-inference 早期 ckpt）。
 - ⚠️ **80M ACT 当前 0/3** — 但记忆里 horizon=32 配合曾经 1/1。回归疑似来自 `sim_warmup_steps=30` 默认值变化（commit 1e1bae6）— 仍在 diagnose。

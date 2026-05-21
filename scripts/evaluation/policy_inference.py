@@ -428,20 +428,52 @@ def main():
                         primary[i] = bool(v[0].item()) if hasattr(v, "shape") else bool(v)
                     except Exception:
                         pass
-        # Fallback (loose): direct scene query — orange in plate xy ±10cm AND z ±7cm.
-        # Anchored to plate position so it tracks the actual scene; matches
-        # task_done's box exactly (minus the arm-rest requirement).
+        # Fallback (loose): direct scene query — orange resting on plate surface.
+        # Bug fixes vs naive ±10cm box check:
+        #   (1) orange pressed/clipped under plate (dz < 0) was wrongly counted
+        #   (2) plate flipped upside-down was wrongly counted
+        #   (3) ±10cm SQUARE box catches plate corners that are outside circular
+        #       plate surface — switch to cylindrical radius check
+        #   (4) orange still in transit (held/falling) was wrongly counted —
+        #       require near-zero linear velocity (settled on plate)
         loose = [False, False, False]
         try:
             plate = env.scene["Plate"]
             plate_xyz = plate.data.root_pos_w[0] - env.scene.env_origins[0]
-            for i, name in enumerate(("Orange001", "Orange002", "Orange003")):
-                orange = env.scene[name]
-                oxyz = orange.data.root_pos_w[0] - env.scene.env_origins[0]
-                dx = (oxyz[0] - plate_xyz[0]).item()
-                dy = (oxyz[1] - plate_xyz[1]).item()
-                dz = (oxyz[2] - plate_xyz[2]).item()
-                if abs(dx) < 0.10 and abs(dy) < 0.10 and abs(dz) < 0.07:
+            # Plate orientation: skip placements if plate has tipped > ~45°.
+            try:
+                pq = plate.data.root_quat_w[0]  # (w, x, y, z)
+                plate_up_z = float((1.0 - 2.0 * (pq[1] * pq[1] + pq[2] * pq[2])).item())
+            except Exception:
+                plate_up_z = 1.0  # assume upright on error
+            plate_upright = plate_up_z > 0.7
+            if plate_upright:
+                # Plate radius: LeIsaac plate is ~15cm diameter → 7.5cm radius.
+                # Use 8cm to allow orange center on rim while excluding box corners.
+                plate_r = 0.08
+                # Resting height band: orange center should be ~2-4cm above plate
+                # center (plate ~1cm thick + orange ~3cm radius). 0.5-5cm window.
+                dz_min, dz_max = 0.005, 0.05
+                # Settled velocity threshold: < 0.05 m/s (5 cm/s) — orange has
+                # stopped moving (not in gripper transit / not bouncing).
+                v_thresh = 0.05
+                for i, name in enumerate(("Orange001", "Orange002", "Orange003")):
+                    orange = env.scene[name]
+                    oxyz = orange.data.root_pos_w[0] - env.scene.env_origins[0]
+                    dx = (oxyz[0] - plate_xyz[0]).item()
+                    dy = (oxyz[1] - plate_xyz[1]).item()
+                    dz = (oxyz[2] - plate_xyz[2]).item()
+                    xy_dist = (dx * dx + dy * dy) ** 0.5
+                    if not (xy_dist < plate_r and dz_min < dz < dz_max):
+                        continue
+                    # Settled-velocity gate
+                    try:
+                        vlin = orange.data.root_lin_vel_w[0]
+                        v_mag = float((vlin[0] ** 2 + vlin[1] ** 2 + vlin[2] ** 2).sqrt().item())
+                    except Exception:
+                        v_mag = 0.0
+                    if v_mag > v_thresh:
+                        continue
                     loose[i] = True
         except Exception:
             pass
@@ -541,10 +573,18 @@ def main():
                     if env.cfg.dynamic_reset_gripper_effort_limit:
                         dynamic_reset_gripper_effort_limit_sim(env, task_type)
                     obs_dict, _, reset_terminated, reset_time_outs, _ = env.step(action)
+                    # NON-STICKY: re-evaluate placement each step.
+                    # The env's `put_orangeNNN_to_plate` subtask fires only at the
+                    # *moment of release* — sticking it as True forever was the
+                    # bug source: orange briefly on plate then bounced off was
+                    # still counted.  With our hardened loose check (cylindrical
+                    # radius + dz > 0 + plate upright + velocity settled), the
+                    # current-frame value is the authoritative "is it on plate
+                    # right now" signal.  Episode-end snapshot wins.
                     f1, f2, f3 = _read_subtask_flags(obs_dict)
-                    if f1: placed_flags[0] = True
-                    if f2: placed_flags[1] = True
-                    if f3: placed_flags[2] = True
+                    placed_flags[0] = bool(f1)
+                    placed_flags[1] = bool(f2)
+                    placed_flags[2] = bool(f3)
                     if reset_terminated[0]:
                         success = True
                         break
