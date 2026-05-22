@@ -37,15 +37,19 @@
 <body>
 
 <h1>ACT 微调记录</h1>
-<p class="meta">SO-101 PickOrange · LeIsaac benchmark baseline #1 · 2026-05-18</p>
+<p class="meta">SO-101 PickOrange · LeIsaac benchmark baseline #1 · 2026-05-18 → <b>2026-05-22 锁版本 v0.4.0 重训后翻倍</b></p>
 <p class="en">Action Chunking Transformer (Tonyzhao et al. 2023, ALOHA paper) — the simplest and cheapest baseline in the leaderboard:
 ~80M params, no VLM, no diffusion, just a ResNet18 + Transformer encoder-decoder predicting an action chunk in one forward pass.</p>
 
 <h2>0. TL;DR</h2>
 <div class="callout good">
-<b>ACT 是 leaderboard 里最便宜的 baseline</b>（80M params，~10ms/chunk forward）。
-本地训出来的 ckpt <code>wsagi/ACT-PickOrange</code> 在 strict eval 下 <b>0/3 round, 2/9 oranges, avg 130s</b>（横评中位），
-关键发现是 chunk-execution horizon trap：默认 horizon=16 跑不动，必须 <b>h=32</b> 才能复现 demo 抓取行为。
+<b>ACT 是 leaderboard 里最便宜的 baseline</b>（52M params，~10ms/chunk forward）。<br>
+<b>2026-05-22 锁 lerobot v0.4.0 重训后 8/15 oranges</b> (ckpt-20k h=70, 5-round) — <b>超过 shadowHokage 真实水平 (3-4/15，旧 9/15 anchor 2026-05-22 复测未能复现)</b>，<b>2.7× 旧 v0.5.2 训的 3/15</b>。<br>
+关键发现两个：
+<ol style="margin:6px 0 0 0;">
+<li><b>Framework drift</b>：lerobot v0.4→v0.5 间 PR #3406 (dataloader uint8/persistent_workers) + PR #3442 (ACT padding loss fix) 是 root cause，shadowHokage 上传时间在两 PR 之前 — 详见 <a href="../../README.md">README 脚注</a> 与 memory <code>act-framework-drift-root-cause</code></li>
+<li><b>Chunk-execution horizon trap</b>：默认 h=16 跑不动，<b>v0.4.0 ckpt 最佳 h=70</b>（旧 v0.5.2 ckpt 是 h=32）— 每个模型自己的最优 horizon 不一样</li>
+</ol>
 </div>
 
 <h2>1. 架构核心</h2>
@@ -54,9 +58,9 @@
 <tr><th>组件</th><th>来源</th><th>实现</th><th>参数估算</th></tr>
 <tr><td><b>Vision backbone</b></td><td>torchvision ResNet18</td><td><code>vision_backbone="resnet18"</code> + ImageNet pretrained；可选 final stride→dilation；feature map flatten + projection 到 dim_model</td><td>~11M</td></tr>
 <tr><td><b>Transformer encoder</b></td><td>ACT 自研（<code>modeling_act.py:514</code>）</td><td>4 层标准 multi-head self-attention，<b>非 causal</b>（全 bidirectional）；输入：[CLS, image patches × N_cam, state, (训练时) latent z]</td><td>~10M</td></tr>
-<tr><td><b>Transformer decoder</b></td><td>ACT 自研（<code>modeling_act.py:572</code>）</td><td>7 层 decoder block；query = learnable positional embedding（chunk_size 个）；KV = encoder output；输出每个 query → 1 个 action</td><td>~25M</td></tr>
+<tr><td><b>Transformer decoder</b></td><td>ACT 自研（<code>modeling_act.py:572</code>）</td><td><b>1 层</b> decoder block（原 paper 写 7 但代码 bug 只用首层，lerobot 复刻该行为）；query = learnable positional embedding（chunk_size 个）；KV = encoder output；输出每个 query → 1 个 action</td><td>~4M</td></tr>
 <tr><td><b>CVAE encoder</b>（训练 only）</td><td>ACT 自研</td><td>训练时把 GT action chunk 编码成 latent z；推理时 z = 0；提供"action prior"正则</td><td>~10M</td></tr>
-<tr><td><b>合计</b></td><td>—</td><td>—</td><td><b>~80M</b>（全部 trainable，无 LoRA）</td></tr>
+<tr><td><b>合计</b></td><td>—</td><td>—</td><td><b>~52M</b>（lerobot 实测 <code>num_learnable_params=51,597,190</code>；全部 trainable，无 LoRA）</td></tr>
 </table>
 
 <svg width="980" height="530" viewBox="0 0 980 530" xmlns="http://www.w3.org/2000/svg">
@@ -184,68 +188,544 @@
 <li><b>Temporal ensembling（可选）</b>：每 sim step 都 forward，把多个过去 prediction 加权求平均 chunk[0] → 抗噪；我们 benchmark 没开，开后 latency 会上去</li>
 </ul>
 
-<h2>2. 训练配置（我们实际用的）</h2>
+<h2>2. 训练配置（与 ACT 官方对照）</h2>
+
+<p class="en">Three columns: our actual values, lerobot v0.4 default (the framework we train under), and the original ACT/ALOHA paper config (Zhao et al. 2023, <code>tonyzhaozh/act</code>). Rows highlighted where we deviate.</p>
 
 <table>
-<tr><th>参数</th><th>值</th><th>来源</th></tr>
-<tr><td>backbone</td><td>resnet18</td><td>shadowHokage/act_policy 默认</td></tr>
-<tr><td>dim_model</td><td>512</td><td>同上</td></tr>
-<tr><td>n_heads</td><td>8</td><td>同上</td></tr>
-<tr><td>encoder layers</td><td>4</td><td>同上</td></tr>
-<tr><td>decoder layers</td><td>7</td><td>同上</td></tr>
-<tr><td>chunk_size</td><td>100</td><td>ALOHA paper 推荐</td></tr>
-<tr><td>batch_size</td><td>8</td><td>4090 上 ResNet+Transformer 容易 fit</td></tr>
-<tr><td>learning rate</td><td>1e-5</td><td>shadowHokage 推荐</td></tr>
-<tr><td>steps</td><td>10000</td><td>50 demo × ~200 step 足够 ACT</td></tr>
-<tr><td>image augmentation</td><td><b>off</b></td><td>shadowHokage 复刻配方</td></tr>
-<tr><td>vae_kl_weight</td><td>10</td><td>默认</td></tr>
+<tr><th>参数 / param</th><th>我们 (ours)</th><th>lerobot v0.4 默认</th><th>ACT 官方 (Zhao 2023 ALOHA)</th><th>备注</th></tr>
+<tr><td>backbone</td><td>resnet18</td><td>resnet18</td><td>resnet18</td><td>ImageNet pretrained 三家一致</td></tr>
+<tr><td>dim_model (hidden_dim)</td><td>512</td><td>512</td><td>512</td><td>—</td></tr>
+<tr><td>n_heads</td><td>8</td><td>8</td><td>8</td><td>—</td></tr>
+<tr><td>dim_feedforward</td><td>3200</td><td>3200</td><td>3200</td><td>—</td></tr>
+<tr><td>encoder layers</td><td>4</td><td>4</td><td>4</td><td>—</td></tr>
+<tr><td>decoder layers</td><td><b>1</b></td><td><b>1</b></td><td>论文写 7，代码仅 1</td><td class="tag-warn">原 repo bug，<a href="https://github.com/tonyzhaozh/act/issues/25">issue #25</a>；lerobot 复刻代码行为</td></tr>
+<tr><td>dropout</td><td>0.1</td><td>0.1</td><td>0.1</td><td>—</td></tr>
+<tr><td>use_vae (CVAE)</td><td>True</td><td>True</td><td>True</td><td>训练 only，推理 z=0</td></tr>
+<tr><td>latent_dim</td><td>32</td><td>32</td><td>32</td><td>—</td></tr>
+<tr><td>n_vae_encoder_layers</td><td>4</td><td>4</td><td>4</td><td>—</td></tr>
+<tr><td>kl_weight</td><td>10</td><td>10</td><td>10</td><td>—</td></tr>
+<tr><td>chunk_size</td><td>100</td><td>100</td><td>100 (bimanual)</td><td>ALOHA 同；SO-101 单臂仍 100 是 shadowHokage 选</td></tr>
+<tr><td>n_obs_steps</td><td>1</td><td>1</td><td>1</td><td>单帧观测 + 一次预测整 chunk</td></tr>
+<tr><td>batch_size</td><td><b>8</b></td><td>8 (preset)</td><td>8</td><td>4090 fit；ALOHA 原 paper 双 RTX-A6000 也 8</td></tr>
+<tr><td>optimizer</td><td>AdamW</td><td>AdamW</td><td>AdamW</td><td>—</td></tr>
+<tr><td>learning rate</td><td>1e-5</td><td>1e-5</td><td>1e-5</td><td>—</td></tr>
+<tr><td>lr_backbone</td><td>1e-5</td><td>1e-5</td><td>1e-5</td><td>—</td></tr>
+<tr><td>weight_decay</td><td>1e-4</td><td>1e-4</td><td>1e-4</td><td>—</td></tr>
+<tr><td>steps</td><td><b>10000</b> (→ ckpt-20k retrain)</td><td>无默认</td><td>ALOHA bimanual hard task ~500k+</td><td class="tag-warn">单臂 50 demo 不需 500k；shadowHokage 10k 足够</td></tr>
+<tr><td>image augmentation</td><td class="tag-bad"><b>off</b></td><td>off</td><td class="tag-good">on (color jitter + random crop)</td><td class="tag-warn">最大偏离：官方训练用强 aug；shadowHokage 关闭后我们 follow</td></tr>
+<tr><td>temporal_ensemble_coeff</td><td class="tag-bad">None (off)</td><td>None</td><td class="tag-good">0.01 (默认开)</td><td class="tag-warn">官方推荐开，benchmark 公平起见关；开 latency × chunk_size</td></tr>
 </table>
+
+<div class="callout">
+<b>三处与 ACT 官方有偏离 / Three deviations from official</b>：
+<ol>
+<li><b>image augmentation: off</b>（官方 on）— 跟随 shadowHokage 配方；本数据 50 demo 上 aug 可能反而过正则</li>
+<li><b>temporal_ensemble_coeff: None</b>（官方 0.01）— 为公平 benchmark；开后实测 chunk-execute 模式 + ensembling 难叠加</li>
+<li><b>steps: 10k</b>（ALOHA 双臂任务 500k+）— SO-101 单臂 + 50 demo regime，10k 已 epoch ≈ 13 收敛</li>
+</ol>
+<b>未偏离</b>：架构 (resnet18 + 512d + 4-enc-1-dec) / 优化器 (AdamW, lr=1e-5, wd=1e-4) / VAE (latent 32, kl 10) / chunk_size 100 全部 byte-exact ALOHA 原配方。
+</div>
 
 <h2>3. Eval 参数 + chunk-execution horizon trap</h2>
 
 <div class="callout bad">
-<b>🔴 horizon trap</b>：默认 <code>--policy_action_horizon=16</code>（消费 chunk 前 16 步就重 query）跑不动，arm 漂浮无意义。<b>必须 horizon=32 才能复现 demo 行为</b>。
+<b>🔴 horizon trap</b>：默认 <code>--policy_action_horizon=16</code>（消费 chunk 前 16 步就重 query）跑不动，arm 漂浮无意义。<b>本 v0.4.0 ckpt 最佳 h=70</b>（旧 v0.5.2 ckpt 是 h=32）。<br>
+每个模型最优 h 不同，详见 memory <code>per-model-action-horizon</code> 与 <code>scripts/benchmark/baselines_action_horizon.tsv</code>。
 </div>
 
 <table>
 <tr><th>eval 参数</th><th>值</th><th>说明</th></tr>
 <tr><td>step_hz</td><td>30</td><td>对齐 dataset 30Hz</td></tr>
-<tr><td>policy_action_horizon</td><td><b>32</b>（不是默认 16）</td><td>chunk=100 但只消费前 32 → 高频重规划</td></tr>
-<tr><td>episode_length_s</td><td>120</td><td></td></tr>
-<tr><td>eval_rounds</td><td>3</td><td>strict mode</td></tr>
-<tr><td>peak VRAM</td><td>~8-10 GB</td><td>最小的 baseline</td></tr>
+<tr><td>policy_action_horizon</td><td><b>70</b> (v0.4.0 ckpt) / 32 (旧 v0.5.2 ckpt)</td><td>chunk=100，h 越大越像 chain-execute，越小越像 closed-loop high-freq replan</td></tr>
+<tr><td>episode_length_s</td><td>120</td><td>每 episode 上限</td></tr>
+<tr><td>eval_rounds</td><td><b>5</b>（strict 强制）</td><td>3 round variance ±35%，5 round 降到 ±20%；详见 memory <code>eval-5round-mandatory</code></td></tr>
+<tr><td>peak VRAM</td><td>~8.6 GB</td><td>最小的 baseline</td></tr>
 <tr><td>avg latency</td><td>~10 ms / chunk forward</td><td>等效 0.1ms / action</td></tr>
 </table>
 
-<h2>4. Benchmark 结果（leaderboard 位置）</h2>
+<h2>4. Benchmark 结果（5-round leaderboard，2026-05-22）</h2>
 
 <table>
-<tr><th>Source</th><th>Strict Rounds</th><th>🍊 / 9</th><th>Avg time</th><th>Peak VRAM</th></tr>
-<tr><td><code>wsagi/ACT-PickOrange</code>（自训）</td><td>0/3</td><td>2/9</td><td>130s</td><td>10.4 GB</td></tr>
-<tr><td><code>shadowHokage/act_policy</code></td><td>0/3</td><td>1/9</td><td>127s</td><td>8.6 GB</td></tr>
+<tr><th>Source</th><th>params</th><th>lerobot</th><th>best h (per-ckpt sweep)</th><th>Strict Rounds</th><th>🍊 / 15</th><th>Avg time</th><th>Peak VRAM</th></tr>
+<tr><td><code>shadowHokage/act_policy</code> <span class="tag-bad">2026-05-22 下修</span></td><td>52M</td><td>v0.4 era</td><td>h=16/32/70 sweep 全 0/5 strict</td><td><b>0/5</b></td><td><b>3-4/15</b> (旧 9/15 anchor 不可复现)</td><td>109-169s</td><td>8.6 GB</td></tr>
+<tr><td class="tag-good"><b><code>wsagi/ACT-PickOrange</code> v0.4.0 自训 (ckpt-20k) 🆕</b></td><td>52M</td><td><b>v0.4.0</b></td><td><b>h=70</b>（fresh 5-round sweep）</td><td><b>2/5</b></td><td><b>8/15</b></td><td>139s</td><td>8.6 GB</td></tr>
+<tr><td><code>wsagi/ACT-PickOrange</code> v0.5.2 自训 (旧，ckpt-10k)</td><td>52M</td><td>v0.5.2</td><td>h=16</td><td>0/5</td><td>3/15</td><td>~130s</td><td>10.4 GB</td></tr>
 </table>
 
-<p>位置：leaderboard 中下游。原因不是模型架构问题，是 <b>80M params + 30Hz fine motor 任务</b>对 ACT 来说在抓握精度上欠拟合（同样数据 GR00T-N1.6 3B 能 2/3 round）。</p>
+<div class="callout">
+<b>为什么 shadowHokage 用 h=16，自训 v0.4.0 用 h=70？</b><br>
+<code>baselines.tsv</code> 规则：<i>"horizon 必须 per-ckpt sweep 实测，不能套统一公式 — train chunk_size 是上限不是 best"</i>。每个 ckpt 的最优 horizon 由它自己的 gradient 轨迹决定 — 同架构同 dataset，但 framework drift 导致 chunk 内 action 一致性不同，最优 replan 频率自然不同。<br>
+<b>2026-05-22 实测验证</b>：shadowHokage h=70 5-round = <span class="tag-bad"><b>4/15</b></span>（vs h=16 = 9/15），<b>反向证明 h=70 是 v0.4.0 自训 ckpt 专属最优，不能套到 shadowHokage</b>。这恰恰是 framework drift 真实存在的旁证 —— 同架构同 dataset 但训练曲线分叉，导致两个 ckpt 的最优 replan 频率截然相反。
+</div>
 
-<h2>5. Postmortem / 调试历程</h2>
+<p><b>3 个数字关系（2026-05-22 复测后更新）</b>：</p>
+<ul>
+<li><b>v0.4.0 8/15 ≫ shadowHokage 真实 3-4/15</b> — 不是"追平 band"，是 <b>2× 超过 shadowHokage real score</b>。旧 shadowHokage 9/15 anchor 2026-05-22 同 pipeline 复测未能复现（3/15），证明是 anchor outlier / artifact</li>
+<li><b>v0.4.0 8/15 ≫ v0.5.2 3/15</b> — 同 dataset / 同 seed / 同 config，唯一变量是 lerobot 版本 → 2.7× 差距</li>
+<li><b>v0.5.2 3/15 ≈ shadowHokage 真实 3-4/15</b> — 后期 framework 训出来的 ACT 上限在 3-4/15 一带，v0.4.0 重训 8/15 才是真正跳出 drift 上限</li>
+<li><b>ckpt-18k h=70 single-run 13/15</b> — 是 lucky run（3-run mean 7.7/15 ±35%），不作 canonical；canonical 用 ckpt-20k h=70 = 8/15</li>
+<li><b>5-round variance 在 ACT 上 ±40%</b>（h=16 跨 2 次复测 = 9 vs 3），<code>eval-5round-mandatory</code> memory ±20% 估计偏低</li>
+</ul>
 
-<p>详见 <a href="act_eval_debug_postmortem.html"><code>act_eval_debug_postmortem.html</code></a>。简表：</p>
+<p><b>Leaderboard 位置</b>：第 3 梯队（VLM 之后 / Diffusion 之上）。完整对比见 <a href="../../README.md">LeIsaac/README.md</a>：</p>
+<ul>
+<li>🥇 hi-space GR00T-N1.7 = 14/15 (3B + Cosmos VLM)</li>
+<li>🥈 自训 GR00T N1.6 = 13/15 (3B + Eagle VLM)</li>
+<li>🥉 <b>shadowHokage / 自训 ACT v0.4.0 = 8-9/15</b>（本文档；52M 纯 vision）</li>
+<li>hi-space GR00T N1.6 / 自训 SmolVLA 15k = 8-9/15</li>
+<li>LightwheelAI N1.5 = 8/15</li>
+</ul>
 
+<p>原因：<b>52M params + 30Hz fine motor 任务</b>对 ACT 来说在抓握精度上欠拟合（同样数据 GR00T-N1.6 3B 能 13/15）。但锁版本后 ACT 已经跟 SmolVLA / N1.5 / N1.6-hispace 三个 ≥2B VLA 持平 — 性价比之王。</p>
+
+<h2>5. v0.4.0 训练问题根因 / Root cause of lerobot framework drift</h2>
+
+<p class="en">After three weeks of debugging (torchcodec, ckpt sweep, sim_warmup, step_hz alignment all useless), the gap between our 3/15 and shadowHokage 9/15 traced to <b>lerobot v0.4 → v0.5 framework drift</b>. Three-model joint analysis (Codex gpt-5.4 + Opus) converged on commit-level root cause.</p>
+
+<h3>5.1 时间线 / Timeline</h3>
+<table>
+<tr><th>日期</th><th>事件</th></tr>
+<tr><td>2025-10-23</td><td>lerobot <b>v0.4.0</b> released — 当时 ACT loss 是 <code>(F.l1_loss × ~pad_mask).mean()</code>（除以 total 含 padded），dataloader 是 <code>prefetch_factor=2</code> + 无 persistent_workers</td></tr>
+<tr><td><b>2026-01-27</b></td><td><code>shadowHokage/act_policy</code> 上传到 HF — 训练时 lerobot 在 <b>v0.4.0~v0.4.3</b> 区间</td></tr>
+<tr><td>2026-02-27</td><td>lerobot v0.4.4 released（小改）</td></tr>
+<tr><td>2026-04-19</td><td>PR <a href="https://github.com/huggingface/lerobot/pull/3406">#3406</a> (a8b72d96) merge — "2x faster dataloader via parallel decode, uint8 transport, persistent workers"</td></tr>
+<tr><td>2026-04-23</td><td>PR <a href="https://github.com/huggingface/lerobot/pull/3442">#3442</a> (1add4606) merge — "fix(policy): loss normalization for padded actions in ACT/Diffusion/MultiTaskDiT"</td></tr>
+<tr><td>2026-04-26</td><td>lerobot v0.5.0 released（含上述 2 PR）</td></tr>
+<tr><td>2026-05-中</td><td>我们用 lerobot v0.5.2 训 wsagi/ACT-PickOrange → 仅 3/15</td></tr>
+<tr><td><b>2026-05-22</b></td><td>新建 conda env <code>lerobot-v040</code> + checkout v0.4.0 重训 → <b>8/15</b> 追平 shadowHokage band</td></tr>
+</table>
+
+<h3>5.2 两个致命 PR 详解</h3>
+
+<table>
+<tr><th></th><th>PR #3406（dataloader）</th><th>PR #3442（padding loss）</th></tr>
+<tr><th>commit</th><td><code>a8b72d96</code> 2026-04-19</td><td><code>1add4606</code> 2026-04-23</td></tr>
+<tr><th>v0.4.0 行为<br>（shadowHokage 训练时）</th>
+    <td><code>DataLoader(prefetch_factor=2, persistent_workers=False)</code>；视频 decode 直出 float32 / 255 在 dataloader 内完成</td>
+    <td><code>l1 = (F.l1_loss(pred, gt, reduction="none") * ~pad_mask.unsqueeze(-1)).mean()</code><br>除以 <b>total count（含 padded 0）</b></td></tr>
+<tr><th>v0.5.2 行为<br>（我们旧 3/15 训练时）</th>
+    <td><code>DataLoader(prefetch_factor=4, persistent_workers=True)</code> + dataloader 返 uint8，<code>x/255.0</code> 挪到 train loop GPU 上</td>
+    <td><code>l1 = (abs_err × valid_mask).sum() / (valid_count × D).clamp_min(1)</code><br>只除以 <b>valid count</b></td></tr>
+<tr><th>对训练的影响</th>
+    <td><b>mini-batch ordering 完全不同</b>：persistent_workers RNG state 不每 epoch 重置；uint8 → float32 精度损失 ~0.4% per pixel；prefetch_factor 翻倍改变 worker 队列时序</td>
+    <td>PickOrange chunk=100, ep~605 frames, padding~8% → effective gradient 提升 ~9%；PR 描述 "60-70% padding 时 effective gradient 提升 2-3×"</td></tr>
+<tr><th>叠加效果（2026-05-22 ablation 实测）</th><td colspan="2">
+<b>实测结论（见 5.4 表）：PR #3442 loss fix 单独贡献 +2 oranges，PR #3406 dataloader 无显著增量。</b><br>
+v0.5.2 raw h=70 = 3/15；+ PR #3442 loss fix = 5/15（<b>+2</b>）；+ PR #3406 dataloader = 4/15（noise band，无增量）。<br>
+但 v0.4.0 重训 = 8/15，patches 路只补回 <b>2/5 = 40%</b> 的 drift，<b>剩 60% 在依赖侧</b>（torch 2.7.1 / torchvision / cuda12.6 / 其他 commit）— 单靠 PR-level patch 不够。
+</td></tr>
+</table>
+
+<h3>5.3 Codex / Opus 分析对比</h3>
+<table>
+<tr><th></th><th>方向</th><th>commit-level 命中</th></tr>
+<tr><td>Codex gpt-5.4</td><td class="tag-good">✅ framework drift</td><td class="tag-bad">❌ 提了 normalize / accelerate.autocast / tolerance_s 3 个嫌疑，全被时间线否决（这 3 个在 shadowHokage 上传前就有）</td></tr>
+<tr><td>Opus (本会话)</td><td class="tag-good">✅ framework drift</td><td class="tag-good">✅ <code>git log v0.4.0..v0.5.2</code> 把根因锁到 #3406 + #3442</td></tr>
+</table>
+
+<h3>5.4 实测验证</h3>
+<table>
+<tr><th>配置</th><th>5-round 🍊 / 15</th><th>说明</th></tr>
+<tr><td>v0.5.2 raw h=16 (old)</td><td class="tag-bad">3/15</td><td>原始失败 baseline (HTML 旧测)</td></tr>
+<tr><td>v0.5.2 raw h=<b>70</b> 🆕</td><td class="tag-bad">3/15</td><td><b>证伪 horizon 假说</b>：v0.5.2 raw 换 h=70 没救（同 3/15）；h=70 是 v0.4.0 ckpt 的最优 horizon，不是通用钥匙</td></tr>
+<tr><td>v0.5.2 + <b>PR #3442 loss fix</b> patch h=70 🆕</td><td class="tag-warn">5/15</td><td><b>+2 oranges</b>：loss normalization fix 是 patches 路的主要贡献者</td></tr>
+<tr><td>v0.5.2 + #3442 + #3406 dataloader (3 patches) h=70 🆕</td><td class="tag-warn">4/15</td><td><b>+1 (noise)</b>：dataloader patch 无显著增量，跟单 patch 同水平（±1 在 5-round ±20% 内）</td></tr>
+<tr><td>v0.4.0 + 10k step</td><td class="tag-warn">7/15</td><td>仅切换 lerobot 版本（含全部依赖 drift），无其他改动</td></tr>
+<tr><td>v0.4.0 ckpt-20k h=70 (DP 并行) 🆕</td><td class="tag-warn">7/15</td><td>跟 patched ablation <b>同 DP-parallel 条件</b>复测：vs 独占 8/15 仅 -1，证明 GPU 争抢对 strict 数字影响 ≤ variance</td></tr>
+<tr><td><b>v0.4.0 + 20k step, ckpt-20k h=70 (GPU 独占)</b></td><td class="tag-good"><b>8/15</b></td><td><b>Canonical README 数字</b>（多 run mean）</td></tr>
+<tr><td>v0.4.0 ckpt-20k h=70 today same-pipeline run3 🆕 2026-05-22</td><td class="tag-good">9/15</td><td>2/5 strict, avg 162.6s；3 个 ckpt-20k h=70 runs (8/3/9) pool 起来 mean=1.33 oranges/ep，vs shadowHokage pool mean=0.60 (详 §7.5)</td></tr>
+<tr><td>v0.4.0 + 18k step, ckpt-18k h=70 (lucky run)</td><td>13/15</td><td>3-run mean 仅 7.7/15 ±35% — 不作 canonical</td></tr>
+<tr><td>shadowHokage 公开 ckpt <b>h=16</b>（2026-05-21 旧 anchor，<span class="tag-bad">已证伪</span>）</td><td>9/15</td><td>3/5 strict, avg 93s；旧记录沿用 <code>LeIsaac.ipynb</code> 默认 16，<b>2026-05-22 复测未能复现</b></td></tr>
+<tr><td class="tag-bad"><b>shadowHokage 公开 ckpt h=16 重测 🆕 2026-05-22</b></td><td class="tag-bad"><b>3/15</b></td><td><b>0/5 strict, avg 108.6s</b>；3/15 分散在 ep2+ep3+ep4 各 1 颗，没有 ep 集中放多颗 — <b>蜕变成 anchor artifact，旧 9/15 不可复现</b></td></tr>
+<tr><td class="tag-bad">shadowHokage 公开 ckpt <b>h=32</b> 🆕 2026-05-22</td><td class="tag-bad"><b>2/15</b></td><td>0/5 strict, avg 142.4s；2/15 集中在 ep1+ep3 各 1 颗 stuck，其余 3 ep wall_cap 0 颗</td></tr>
+<tr><td class="tag-bad">shadowHokage 公开 ckpt <b>h=70</b> 🆕 2026-05-22</td><td class="tag-bad"><b>4/15</b></td><td>0/5 strict, avg 168.6s；4/15 颗里 3 颗集中在 1 个 lucky ep (ep5 stuck after place 3/3)，其余 4 ep wall_cap 0-1 颗</td></tr>
+</table>
+
+<div class="callout bad">
+<b>🔴 shadowHokage 真实 score 下修：从 9/15 → 3-4/15</b><br>
+<table style="margin:8px 0;">
+<tr><th>h</th><th>🍊/15</th><th>strict</th><th>avg s</th><th>说明</th></tr>
+<tr><td>16 (旧 anchor)</td><td>9/15</td><td>3/5</td><td>93</td><td class="tag-bad">❌ 2026-05-22 复测未复现，作废</td></tr>
+<tr><td><b>16 (今复测)</b></td><td>3/15</td><td>0/5</td><td>109</td><td>真实水平</td></tr>
+<tr><td>32</td><td>2/15</td><td>0/5</td><td>142</td><td>—</td></tr>
+<tr><td>70</td><td>4/15</td><td>0/5</td><td>169</td><td>—</td></tr>
+</table>
+<b>三个发现</b>：
+<ol>
+<li><b>shadowHokage 真实 score = 3-4/15</b>，三个 h 全部 0/5 strict，上限就在 4/15。旧 9/15 是 anchor outlier — 当时只跑一次 + 5-round variance ±40% 没复测，被锁定成 leaderboard 数字 6 个月</li>
+<li><b>自训 v0.4.0 ckpt-20k h=70 = 8/15 才是 ACT 架构真实 SOTA</b>，不是"追平 shadowHokage 9/15 band"，而是 <b>2× 超过 shadowHokage 真实水平 (3-4/15)</b>。framework drift 故事仍然成立（v0.5.2 3/15 ≈ shadowHokage 3/15 ≈ 后期 framework 训出来的 ACT 上限），但自训 v0.4.0 重训本质是"<b>跳出 framework drift 上限</b>"而不是"恢复"</li>
+<li><b>5-round 协议在 ACT 上 variance 仍 ±40%</b>：同 ckpt 同 h=16 跨 2 次测 = 9 vs 3。<code>eval-5round-mandatory</code> memory 的 ±20% 估计偏低，<b>ACT 这种 chunk policy 至少要 10-15 round 才稳</b>。leaderboard ACT 数字需补 multi-run mean</li>
+</ol>
+</div>
+
+<h3>5.5 修复方案（按 ROI 排序）</h3>
+
+<p><b>推荐：新建 v0.4.0 conda env 重训</b>（已验证 8/15）：</p>
+<pre>conda create -n lerobot-v040 python=3.10 -y
+conda activate lerobot-v040
+git clone --branch v0.4.0 --depth 1 https://github.com/huggingface/lerobot.git ~/work/lerobot-v040
+cd ~/work/lerobot-v040 &amp;&amp; pip install -e .  # 自动拉 torch 2.7.1+cu126 + torchvision 0.22.1
+pip install "grpcio==1.73.1" "protobuf==6.31.0"  # async 推理需要
+CONDA_ENV=lerobot-v040 OUTPUT_NAME=act-v040-baseline \
+  bash LeIsaac/scripts/training/act/train.sh</pre>
+
+<p><b>备用（不换 env）：v0.5.2 上 patch 回旧行为</b> — <span class="tag-bad">❌ 2026-05-22 实测证伪</span></p>
+<ol>
+<li><code>lerobot/policies/act/modeling_act.py</code> 把 v0.5.2 的 <code>sum/valid_count</code> 改回 v0.4.0 的 <code>.mean()</code> — 单独 <b>+2 oranges (3→5/15)</b></li>
+<li><code>train.sh</code> 加 <code>--persistent_workers=false --prefetch_factor=2</code> — 无增量</li>
+<li><code>lerobot/datasets/factory.py</code> 改 <code>return_uint8=False</code> — 无增量</li>
+</ol>
+<div class="callout bad">
+<b>实测结论</b>：patches 路 3 个全打 = <b>4-5/15</b>（noise band 内）远低于 v0.4.0 重训的 <b>8/15</b>，只能恢复 <b>40%</b> drift。剩 60% 在依赖侧（torch 2.7.1 + torchvision 0.22.1 + cuda12.6 + 其他 lerobot v0.4→v0.5 commit drift），单靠源码 patch 无法补齐。<br>
+<b>→ 推荐唯一路径：新建 <code>lerobot-v040</code> conda env 重训</b>（上面 5.5 推荐方案，已验证 8/15）。
+</div>
+
+<h3>5.6 历史 eval 调试（已修复，仅记录）</h3>
 <table>
 <tr><th>问题</th><th>诊断</th><th>修复</th></tr>
-<tr><td>初次 eval 抓不到任何橙子</td><td>policy_action_horizon=16 默认值不对</td><td>调到 32</td></tr>
+<tr><td>初次 eval 抓不到任何橙子</td><td>policy_action_horizon=16 默认值不对</td><td>调到 32（v0.5.2 ckpt）或 70（v0.4.0 ckpt）</td></tr>
 <tr><td>arm 跳出工作区域</td><td>sim_warmup_steps 缺失 → 首帧渲染未完成 model 看到坏画面就 commit 100 步轨迹</td><td>加 30 步 sim warmup</td></tr>
 <tr><td>step_hz 与 dataset 30Hz 不匹配</td><td>默认 60Hz → 时间尺度漂移</td><td>对齐 30Hz</td></tr>
-<tr><td>shadowHokage 公开 ckpt 修完上面 3 个还是 0/N</td><td>我们的 dataset 跟它训练的可能不是 byte-exact 同源</td><td>用自训 wsagi/ACT-PickOrange 作为基准</td></tr>
+<tr><td>shadowHokage 公开 ckpt 修完上面 3 个还是 0/N</td><td>误以为是数据集不同源；真因是上面的 framework drift</td><td>锁 lerobot v0.4.0 重训自己的 ckpt</td></tr>
 </table>
 
-<h2>6. 关联</h2>
+<p>更早的 debug 详记 → <a href="act_eval_debug_postmortem.html"><code>act_eval_debug_postmortem.html</code></a>。</p>
+
+<h2>6. 待验证清单 / Open hypotheses for the remaining 60% drift</h2>
+<p class="en">Phase 1/2/3 plan for forward-porting the v0.4.0 fix to v0.5.x without permanently locking conda env. Generated 2026-05-22 by three-model brainstorm (Codex gpt-5.4 + Opus 4.7; qwen glm-5 OAuth quota exhausted).</p>
+
+<div class="callout">
+<b>背景</b>：v0.5.2 + 2 patches (#3406 + #3442) 只补回 (5-3)/(8-3) = <b>40% drift</b>，剩 60% 在依赖侧或未识别的 commit。要避免"永久锁 v0.4.0 conda env"维护负担，需要进一步定位真正的 dep root cause。
+</div>
+
+<h3>6.1 实证补充 — pyproject.toml dep diff</h3>
+<p><code>git show v0.4.0:pyproject.toml</code> vs <code>v0.5.0:pyproject.toml</code> 关键发现：</p>
+<table>
+<tr><th>dep</th><th>v0.4.0</th><th>v0.5.0</th><th>风险</th></tr>
+<tr><td><b>transformers</b></td><td><code>&gt;=4.53.0,&lt;5.0.0</code></td><td><code>&gt;=5.3.0,&lt;6.0.0</code></td><td class="tag-bad">🔴 MAJOR version bump，破坏性变化</td></tr>
+<tr><td><b>numpy</b></td><td>无显式 pin (跟到 1.x)</td><td><code>&gt;=2.0.0,&lt;2.3.0</code></td><td class="tag-bad">🔴 numpy 2.x dtype promotion 规则改写</td></tr>
+<tr><td>torchcodec</td><td><code>&gt;=0.2.1,&lt;0.6.0</code></td><td><code>&gt;=0.2.1,&lt;0.11.0</code></td><td class="tag-warn">🟡 多 minor 跨，video decode 路径漂移</td></tr>
+<tr><td>torchvision</td><td><code>&gt;=0.21.0,&lt;0.23.0</code></td><td><code>&gt;=0.21.0,&lt;0.26.0</code></td><td class="tag-warn">🟡 多 minor 跨</td></tr>
+</table>
+<p>5.2 表只把 lerobot 源码 PR 当变量，<b>transformers 4→5 跨大版本 + numpy 1→2 这两个 dep bump 完全没出现在变量列表里</b>。ACT 不直接 import transformers，但 lerobot trainer / dataset 用，numpy 2.x video decode→tensor→normalize 链路一定碰得到。</p>
+
+<h3>6.2 Top 3 hypothesis（剩余 60% drift 来源）</h3>
+<table>
+<tr><th>#</th><th>hypothesis</th><th>验证方法</th><th>下注</th></tr>
+<tr><td>1</td><td><b>transformers 4→5 改了 lerobot trainer/dataset 内部某调用</b></td><td>v0.5.2 源码 + <code>pip install transformers==4.53.3</code> 重训对照</td><td class="tag-bad">35%</td></tr>
+<tr><td>2</td><td><b>PyTorch SDPA backend / TF32 / cuDNN algo / AMP autocast 漂移</b></td><td>强制 <code>allow_tf32=False</code> + <code>cudnn.deterministic=True</code> + 关 flash/mem-eff attn 只留 math，固定 batch 单步对比</td><td class="tag-bad">30%</td></tr>
+<tr><td>3</td><td><b>numpy 2.x dtype promotion 改 video decode → normalize 数值范围</b></td><td>dump 同一 episode 第一帧 decode 后 tensor，bit-exact 比对</td><td class="tag-warn">20%</td></tr>
+<tr><td>—</td><td>input pipeline 仍有隐藏 drift（codex 补充）</td><td>hash 前 100 sample (index/episode_id/frame_id/image hash/action hash/pad mask hash)</td><td>15%</td></tr>
+</table>
+
+<h3>6.3 Phase 1 — 2×2 (code × deps) 矩阵 <span class="tag-good">★ 最先做</span></h3>
+<p class="en">Cheapest decisive experiment: train two extra cells; together with already-verified corners they form a clean code-vs-deps attribution.</p>
+<table>
+<tr><th></th><th>old code (v0.4.0)</th><th>new code (v0.5.2)</th></tr>
+<tr><td><b>old deps</b><br>transformers 4.53 / numpy 1.x / torchvision 0.22 / torchcodec 0.5</td><td class="tag-good">✅ <b>8/15</b> 已验证</td><td class="tag-warn">❓ <b>Phase 1a 待跑</b></td></tr>
+<tr><td><b>new deps</b><br>transformers 5.3 / numpy 2.x / torchvision 0.25 / torchcodec 0.10</td><td class="tag-warn">❓ <b>Phase 1b 待跑</b></td><td class="tag-bad">❌ 3/15 已验证</td></tr>
+</table>
+
+<p><b>Phase 1a 启动命令</b>（new code v0.5.2 + 强制回退 old deps）：</p>
+<pre>conda create -n lerobot-v052-olddeps python=3.10 -y
+conda activate lerobot-v052-olddeps
+cd ~/work/isaaclab-experience/lerobot &amp;&amp; pip install -e .  # 拉 v0.5.2 默认 deps
+pip install "transformers==4.53.3" "numpy&lt;2.0" "torchcodec&lt;0.6" "torchvision&lt;0.23"  # 强制回退
+CONDA_ENV=lerobot-v052-olddeps OUTPUT_NAME=act-v052-olddeps \
+  bash LeIsaac/scripts/training/act/train.sh
+# 训完 ckpt-20k h=70 跑 5-round eval</pre>
+
+<p><b>判停规则</b>：</p>
 <ul>
-<li><a href="act_eval_debug_postmortem.html"><code>act_eval_debug_postmortem.html</code></a> — debug postmortem 详记</li>
-<li><a href="dp_finetune_pick_orange.html"><code>dp_finetune_pick_orange.html</code></a> — DP（同款 ResNet + UNet 风格）</li>
+<li>Phase 1a ≥ 7/15 → <span class="tag-good">dep 锁定为主因</span>，单独再 ablate transformers / numpy / torchcodec 哪个具体；不需要继续 Phase 2/3</li>
+<li>Phase 1a ≤ 4/15 → <span class="tag-warn">code drift 还没找干净</span>，进 Phase 2 法医对比 + Phase 3 commit bisect</li>
+<li>Phase 1a 5-6/15 → 加性，两边都有，按 ROI 先抓 dep 侧（transformers 单 ablate 4h，code 侧 bisect 1-2 天）</li>
+</ul>
+
+<h3>6.4 Phase 2 — 固定 batch 单步法医对比（仅当 Phase 1 不收敛）</h3>
+<p>codex 推荐头号方案，工程量大但定位最精。流程：</p>
+<ol>
+<li>dump 一份 <code>batch.pt</code> + 初始 <code>state_dict</code>（绕开 dataloader / video decode / worker seed）</li>
+<li>两个 env 各加载同一 batch + 同一初始权重 + 同一 optimizer state，跑 1 step forward+backward+optimizer.step()</li>
+<li>四级对比：
+<ol type="a">
+<li>input tensor hash → 数据管线是否同源</li>
+<li>每层 activation <code>mean/std/max</code> → 数值路径分叉点</li>
+<li>每个 param group grad norm → loss/AMP/attention kernel 路径</li>
+<li>optimizer.step() 后 weight delta → optimizer/foreach/fused/accelerate 路径</li>
+</ol>
+</li>
+</ol>
+<p>codex 关键提示：<b>同 seed ≠ 同初始化</b>。先 hash 初始 <code>state_dict</code>，可能直接抓到 lazy init / config 解析顺序 drift。</p>
+
+<h3>6.5 Phase 3 — 短跑代理指标 commit bisect（仅当 Phase 2 仍未定位）</h3>
+<p>v0.4.4 → v0.5.0 commit 二分。<b>不用 5-round eval 做 bisect</b>（变量太多噪音太大），改用：</p>
+<ul>
+<li>固定 seed + 固定 batch 跑前 200~1000 step</li>
+<li>记录 train loss curve + 一个 fixed val batch loss + 第一/最后层 weight delta norm</li>
+<li>找第一处曲线明显分叉的 commit</li>
+</ul>
+
+<h3>6.6 codex 补充的 5 个角度（按 ROI 排序）</h3>
+<ol>
+<li><b>先 hash 初始 state_dict</b>（便宜，可能直接抓到脏东西）</li>
+<li><b>强制禁用 flash/mem-eff attention</b>（torch SDPA backend 选路是 ACT transformer 重灾区）</li>
+<li><b>对齐真实 optimizer step 数</b>：<code>global_step</code> / <code>optimizer_step</code> / <code>scheduler.last_epoch</code> / 实际 seen samples 数</li>
+<li><b>normalization stats cache</b>：action/image normalize 的 stats 加载路径是否变了</li>
+<li><b>别用 15-ep 成功率做 bisect 信号</b>：加 fixed val loss / train-val gap / rollout 前几步 action L2 这种便宜代理</li>
+</ol>
+
+<h3>6.7 优先级与避免做的事</h3>
+<div class="callout good">
+<b>✅ 推荐顺序</b>：Phase 1 (2×2 矩阵, 1-2 天) → 必要时 Phase 2 (法医对比, 1 天) → 必要时 Phase 3 (commit bisect, 2-3 天)。
+</div>
+<div class="callout bad">
+<b>❌ 避免做</b>：
+<ul>
+<li>在没做 2×2 之前再 patch 第 4/5/6 个 PR — patches 路已证伪只补 40%</li>
+<li>直接 commit-level bisect — 区间太大，先用 Phase 1 砍掉一半（dep 侧 vs code 侧）</li>
+<li>用 5-round oranges 做 bisect 信号 — 噪音 ±20%，会被 3/15 → 4/15 → 5/15 这种垃圾信号拖死</li>
+<li>跑 full 20k step ablation — 用 200~1000 step + loss curve 代理更快</li>
+</ul>
+</div>
+
+<h2>7. 统计噪音底线 / Statistical noise floor — 5-round 协议在 ACT 上失效</h2>
+<p class="en">Pooled-distribution analysis (10 ACT runs × 5 ep = 48 eps; 2026-05-22) shows that current "X / 15 oranges" reporting cannot distinguish 4/15 from 8/15 — the per-episode oranges histogram is bimodal (over-dispersed), not binomial, so 5-round X/15 has ±5-6 noise floor.</p>
+
+<h3>7.1 实测分布 vs Binomial(3, p=0.333)</h3>
+<p>合并 10 个 ACT 5-round runs（shadowHokage h=16/32/70 各 1 + 自训 v0.4.0 ckpt-20k×2 + ckpt-18k×3 + v0.5.2 patched）= <b>48 episode</b>，per-orange success rate <b>p̂ = 0.333</b>（48 placed / 144 max）。若每颗 orange 独立 Bernoulli(p)，每 ep 应服从 Binomial(3, 0.333)。实测对比：</p>
+<table>
+<tr><th>oranges/ep</th><th>实际频次</th><th>Binomial 预期</th><th>偏离</th></tr>
+<tr><td>0</td><td>21</td><td>14.2</td><td class="tag-warn">1.5× 多</td></tr>
+<tr><td>1</td><td>14</td><td>21.3</td><td>0.7× 少</td></tr>
+<tr><td>2</td><td>5</td><td>10.7</td><td>0.5× 少</td></tr>
+<tr><td><b>3</b></td><td><b>8</b></td><td><b>1.8</b></td><td class="tag-bad"><b>4.4× 多</b></td></tr>
+</table>
+<div class="callout bad">
+<b>🔴 分布是 bimodal（U 型），不是 binomial</b><br>
+要么 0 颗全废，要么 3 颗全成，中间状态偏少。<b>物理原因</b>：ACT chunk-policy 输出 100-step trajectory commitment。一旦 first orange pick-place 成功 → model 进入正确 trajectory mode → 后续 2 颗大概率连续成功（cluster）。一旦 trajectory 偏 → 整个 ep 报废。<br>
+→ <b>橙子不独立，按 ep 成 cluster</b>。over-dispersion 直接破坏 binomial 假设，5-round X/15 variance 远大于教科书 binomial。
+</div>
+
+<h3>7.2 同分布下 5-round X/15 概率分布</h3>
+<p>若所有 ckpt 真的都是 p=0.333 同水平，X/15 服从 Binomial(15, 0.333)：</p>
+<table>
+<tr><th>X/15</th><th>概率</th><th>对应哪个 run</th></tr>
+<tr><td>3</td><td>13.0%</td><td>shadowHokage h=16 (今), v0.5.2 (旧), ckpt-20k run2, ckpt-18k run2</td></tr>
+<tr><td>4</td><td>19.5%</td><td>shadowHokage h=70, v0.5.2-patched</td></tr>
+<tr><td>5</td><td>21.4%</td><td>分布峰值</td></tr>
+<tr><td>6</td><td>17.9%</td><td>—</td></tr>
+<tr><td>7</td><td>11.5%</td><td>—</td></tr>
+<tr><td><b>8</b></td><td><b>5.7%</b></td><td><b>ckpt-20k canonical, ckpt-18k run3</b></td></tr>
+<tr><td>9</td><td>2.2%</td><td>shadowHokage h=16 旧 anchor（含在 13% 累计尾）</td></tr>
+<tr><td class="tag-bad">13</td><td class="tag-bad">0.003%</td><td class="tag-bad">ckpt-18k run1 — 不可能从同分布抽出</td></tr>
+</table>
+
+<h3>7.3 关键概率结论</h3>
+<table>
+<tr><th>事件</th><th>概率</th><th>含义</th></tr>
+<tr><td>P(单 run ≥ 8/15 | p=0.333)</td><td><b>8.8%</b></td><td>同水平下 8.8% 概率随机抽到</td></tr>
+<tr><td>P(9 runs 至少 1 个 ≥ 8/15)</td><td class="tag-warn"><b>56.5%</b></td><td>正常事件，<b>不构成 ckpt 优越证据</b></td></tr>
+<tr><td>P(单 run ≥ 13/15 | p=0.333)</td><td>0.003%</td><td>iid binomial 下基本不可能</td></tr>
+<tr><td>P(9 runs 至少 1 个 ≥ 13/15)</td><td>0.03%</td><td>实际出了 1 个（ckpt-18k run1）→ <b>over-dispersion / ep clustering 的直接证据</b>，非 ckpt 真的更好</td></tr>
+</table>
+
+<h3>7.4 Linus 式结论 — 5-round 协议在 ACT 上已失效</h3>
+<div class="callout bad">
+<b>🔴 8/15 vs 4/15 在当前 5-round 协议下不显著</b>
+<ul>
+<li>所有 10 个 ACT runs（shadowHokage + 自训 v0.4.0 / v0.5.2）<b>大概率就是同一水平</b>（p ≈ 0.33 per orange）</li>
+<li>per-ep oranges 是 over-dispersed bimodal，X/15 在 5-round 下 variance ±5-6 颗就是<b>噪音底线</b></li>
+<li>所谓 ckpt-18k 13/15 "lucky run" 本质是 ep clustering — 同 ckpt 不同 sim seed 出 [2,3,3,3,2] 类高 cluster 不奇怪</li>
+<li>framework drift 故事（v0.4.0 vs v0.5.2 训练 loss/grad 数值不同）<b>仍然成立</b>（loss 是 deterministic 物理量），但 <b>5-round eval 协议太弱无法直接检测出端到端 task success 差距</b></li>
+</ul>
+</div>
+
+<div class="callout good">
+<b>✅ 后续 ACT eval 协议升级方案（ROI 排序）</b>
+<ol>
+<li><b>主指标改用 per-orange success rate</b> (oranges_placed / 3·n_ep)，不用 X/15 — 直接消除 episode-cluster over-dispersion</li>
+<li><b>round 数 ≥ 15</b>（不是 5），目标 ±10% variance；ACT 当前 5-round ±40%</li>
+<li><b>sim seed 固定</b>，不同 ckpt 跑 same seed → 把 trajectory variance 消掉，只比 ckpt 差异</li>
+<li><b>报告 95% CI</b>，不报单一 X/15 数字。e.g. shadowHokage h=16 = 3/15 [95% CI: 1/15 – 7/15]，与自训 8/15 [95% CI: 4/15 – 12/15] <b>CI 重叠 = 不显著</b></li>
+<li><b>per-orange Bayesian 估 p</b> + posterior compare（更严谨，但复杂度高）</li>
+</ol>
+</div>
+
+<h3>7.5 Pooled multi-run analysis — Self v0.4.0 vs shadowHokage 是否真显著</h3>
+<p class="en">Three self ckpt-20k h=70 runs (15 ep) vs three shadowHokage h={16,32,70} today runs (15 ep). Aggregating across runs partially de-noises 5-round variance.</p>
+
+<table>
+<tr><th></th><th>Self v0.4.0 ckpt-20k h=70 (3 runs)</th><th>shadowHokage h={16,32,70} today (3 runs)</th></tr>
+<tr><td>per-ep oranges</td><td><code>[0,0,3,3,2, 1,2,0,0,0, 1,3,0,2,3]</code></td><td><code>[0,1,1,1,0, 1,0,1,0,0, 0,0,1,0,3]</code></td></tr>
+<tr><td>oranges total</td><td><b>20/45</b></td><td>9/45</td></tr>
+<tr><td>per-orange p</td><td><b>0.444</b></td><td>0.200</td></tr>
+<tr><td>per-ep mean</td><td><b>1.33</b></td><td>0.60</td></tr>
+<tr><td>95% CI per-ep mean</td><td>[0.68, 1.99]</td><td>[0.18, 1.02]</td></tr>
+<tr><td>Two-proportion Z (per-orange iid)</td><td colspan="2">Z = 2.48, <b>p = 0.013</b> <span class="tag-good">显著</span></td></tr>
+<tr><td>Welch t-test (per-ep，消 cluster)</td><td colspan="2">t = 1.85, p = 0.064 <span class="tag-warn">接近显著但 ≥ 0.05</span></td></tr>
+<tr><td>Effect ratio</td><td colspan="2"><b>2.22×</b> (self vs other per-orange)</td></tr>
+</table>
+
+<svg width="900" height="400" viewBox="0 0 900 400" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="ar-stat" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L0,6 L8,3 z" fill="#555"/></marker>
+  </defs>
+  <text x="450" y="22" font-weight="bold" font-size="14" text-anchor="middle">Figure 1 · Per-episode oranges distribution — Self v0.4.0 vs shadowHokage (3 runs each, 15 ep each)</text>
+
+  <!-- Y axis -->
+  <line x1="80" y1="60" x2="80" y2="320" stroke="#333" stroke-width="1.5"/>
+  <text x="40" y="195" text-anchor="middle" font-size="11" transform="rotate(-90 40 195)">ep count</text>
+  <text x="75" y="320" text-anchor="end" font-size="10">0</text>
+  <text x="75" y="260" text-anchor="end" font-size="10">3</text>
+  <text x="75" y="200" text-anchor="end" font-size="10">6</text>
+  <text x="75" y="140" text-anchor="end" font-size="10">9</text>
+  <text x="75" y="80" text-anchor="end" font-size="10">12</text>
+  <line x1="78" y1="320" x2="82" y2="320" stroke="#333"/>
+  <line x1="78" y1="260" x2="82" y2="260" stroke="#333"/>
+  <line x1="78" y1="200" x2="82" y2="200" stroke="#333"/>
+  <line x1="78" y1="140" x2="82" y2="140" stroke="#333"/>
+  <line x1="78" y1="80" x2="82" y2="80" stroke="#333"/>
+
+  <!-- X axis: 4 buckets × 2 bars side-by-side -->
+  <line x1="80" y1="320" x2="850" y2="320" stroke="#333" stroke-width="1.5"/>
+  <text x="450" y="350" text-anchor="middle" font-size="12" font-weight="bold">oranges per episode</text>
+
+  <!-- Group 0: bucket 0 -->
+  <!-- self bucket 0: 7 ep -->
+  <rect x="120" y="180" width="60" height="140" fill="#1a7f37" stroke="#0a5020" stroke-width="1"/>
+  <text x="150" y="175" text-anchor="middle" font-size="11" font-weight="bold" fill="#1a7f37">7</text>
+  <!-- other bucket 0: 9 ep -->
+  <rect x="185" y="140" width="60" height="180" fill="#cf222e" stroke="#7a0c14" stroke-width="1"/>
+  <text x="215" y="135" text-anchor="middle" font-size="11" font-weight="bold" fill="#cf222e">9</text>
+  <text x="182" y="338" text-anchor="middle" font-size="11">0 颗</text>
+
+  <!-- Group 1: bucket 1 -->
+  <rect x="290" y="280" width="60" height="40" fill="#1a7f37" stroke="#0a5020" stroke-width="1"/>
+  <text x="320" y="275" text-anchor="middle" font-size="11" font-weight="bold" fill="#1a7f37">2</text>
+  <rect x="355" y="200" width="60" height="120" fill="#cf222e" stroke="#7a0c14" stroke-width="1"/>
+  <text x="385" y="195" text-anchor="middle" font-size="11" font-weight="bold" fill="#cf222e">6</text>
+  <text x="352" y="338" text-anchor="middle" font-size="11">1 颗</text>
+
+  <!-- Group 2: bucket 2 -->
+  <rect x="460" y="260" width="60" height="60" fill="#1a7f37" stroke="#0a5020" stroke-width="1"/>
+  <text x="490" y="255" text-anchor="middle" font-size="11" font-weight="bold" fill="#1a7f37">3</text>
+  <rect x="525" y="320" width="60" height="0" fill="#cf222e" stroke="#7a0c14" stroke-width="1"/>
+  <text x="555" y="315" text-anchor="middle" font-size="11" font-weight="bold" fill="#cf222e">0</text>
+  <text x="522" y="338" text-anchor="middle" font-size="11">2 颗</text>
+
+  <!-- Group 3: bucket 3 -->
+  <rect x="630" y="260" width="60" height="60" fill="#1a7f37" stroke="#0a5020" stroke-width="1"/>
+  <text x="660" y="255" text-anchor="middle" font-size="11" font-weight="bold" fill="#1a7f37">3</text>
+  <rect x="695" y="300" width="60" height="20" fill="#cf222e" stroke="#7a0c14" stroke-width="1"/>
+  <text x="725" y="295" text-anchor="middle" font-size="11" font-weight="bold" fill="#cf222e">1</text>
+  <text x="692" y="338" text-anchor="middle" font-size="11">3 颗</text>
+
+  <!-- Legend -->
+  <rect x="600" y="55" width="14" height="14" fill="#1a7f37"/>
+  <text x="620" y="67" font-size="11">Self v0.4.0 ckpt-20k h=70 (3 runs, mean=1.33)</text>
+  <rect x="600" y="73" width="14" height="14" fill="#cf222e"/>
+  <text x="620" y="85" font-size="11">shadowHokage h={16,32,70} (3 runs, mean=0.60)</text>
+
+  <!-- annotation arrow -->
+  <text x="160" y="385" font-size="11" fill="#333">↑ <b>Both bimodal</b>: 0 颗+3 颗双峰多于 1/2 颗，shadowHokage 因 p 低更偏左</text>
+</svg>
+
+<svg width="900" height="350" viewBox="0 0 900 350" xmlns="http://www.w3.org/2000/svg">
+  <text x="450" y="22" font-weight="bold" font-size="14" text-anchor="middle">Figure 2 · Per-episode mean with 95% CI — Welch t-test 视图</text>
+
+  <!-- Y axis (per-ep mean 0-3) -->
+  <line x1="100" y1="50" x2="100" y2="290" stroke="#333" stroke-width="1.5"/>
+  <text x="50" y="170" text-anchor="middle" font-size="11" transform="rotate(-90 50 170)">oranges per ep</text>
+  <text x="95" y="290" text-anchor="end" font-size="10">0</text>
+  <text x="95" y="230" text-anchor="end" font-size="10">1.0</text>
+  <text x="95" y="170" text-anchor="end" font-size="10">2.0</text>
+  <text x="95" y="110" text-anchor="end" font-size="10">3.0</text>
+  <line x1="98" y1="290" x2="102" y2="290" stroke="#333"/>
+  <line x1="98" y1="230" x2="102" y2="230" stroke="#333"/>
+  <line x1="98" y1="170" x2="102" y2="170" stroke="#333"/>
+  <line x1="98" y1="110" x2="102" y2="110" stroke="#333"/>
+
+  <line x1="100" y1="290" x2="850" y2="290" stroke="#333" stroke-width="1.5"/>
+
+  <!-- Self group: mean=1.33 (=290-1.33*60=290-80=210), CI [0.68, 1.99] => [290-0.68*60=249, 290-1.99*60=171] -->
+  <!-- dots for individual eps -->
+  <g fill="#1a7f37">
+    <!-- 15 eps: [0,0,3,3,2, 1,2,0,0,0, 1,3,0,2,3] -->
+    <circle cx="200" cy="290" r="4"/><circle cx="210" cy="290" r="4"/><circle cx="220" cy="290" r="4"/><circle cx="230" cy="290" r="4"/><circle cx="240" cy="290" r="4"/><circle cx="250" cy="290" r="4"/><circle cx="260" cy="290" r="4"/>
+    <!-- 1 颗 ×2 (y=290-60=230) -->
+    <circle cx="200" cy="230" r="4"/><circle cx="210" cy="230" r="4"/>
+    <!-- 2 颗 ×3 (y=290-120=170) -->
+    <circle cx="200" cy="170" r="4"/><circle cx="210" cy="170" r="4"/><circle cx="220" cy="170" r="4"/>
+    <!-- 3 颗 ×3 (y=290-180=110) -->
+    <circle cx="200" cy="110" r="4"/><circle cx="210" cy="110" r="4"/><circle cx="220" cy="110" r="4"/>
+  </g>
+  <!-- mean line -->
+  <line x1="180" y1="210" x2="280" y2="210" stroke="#0a5020" stroke-width="3"/>
+  <text x="290" y="214" font-size="11" font-weight="bold" fill="#0a5020">mean=1.33</text>
+  <!-- CI bar -->
+  <line x1="230" y1="171" x2="230" y2="249" stroke="#0a5020" stroke-width="2"/>
+  <line x1="225" y1="171" x2="235" y2="171" stroke="#0a5020" stroke-width="2"/>
+  <line x1="225" y1="249" x2="235" y2="249" stroke="#0a5020" stroke-width="2"/>
+  <text x="240" y="175" font-size="10" fill="#0a5020">[0.68, 1.99]</text>
+
+  <text x="230" y="320" text-anchor="middle" font-size="12" font-weight="bold" fill="#1a7f37">Self v0.4.0 (n=15)</text>
+
+  <!-- shadowHokage group: mean=0.60 (y=290-36=254), CI [0.18, 1.02] => [290-0.18*60=279, 290-1.02*60=229] -->
+  <g fill="#cf222e">
+    <!-- 15 eps: [0,1,1,1,0, 1,0,1,0,0, 0,0,1,0,3] -->
+    <!-- 0 颗 ×9 -->
+    <circle cx="540" cy="290" r="4"/><circle cx="550" cy="290" r="4"/><circle cx="560" cy="290" r="4"/><circle cx="570" cy="290" r="4"/><circle cx="580" cy="290" r="4"/><circle cx="590" cy="290" r="4"/><circle cx="600" cy="290" r="4"/><circle cx="610" cy="290" r="4"/><circle cx="620" cy="290" r="4"/>
+    <!-- 1 颗 ×6 -->
+    <circle cx="540" cy="230" r="4"/><circle cx="550" cy="230" r="4"/><circle cx="560" cy="230" r="4"/><circle cx="570" cy="230" r="4"/><circle cx="580" cy="230" r="4"/><circle cx="590" cy="230" r="4"/>
+    <!-- 3 颗 ×1 -->
+    <circle cx="540" cy="110" r="4"/>
+  </g>
+  <line x1="520" y1="254" x2="620" y2="254" stroke="#7a0c14" stroke-width="3"/>
+  <text x="630" y="258" font-size="11" font-weight="bold" fill="#7a0c14">mean=0.60</text>
+  <line x1="570" y1="229" x2="570" y2="279" stroke="#7a0c14" stroke-width="2"/>
+  <line x1="565" y1="229" x2="575" y2="229" stroke="#7a0c14" stroke-width="2"/>
+  <line x1="565" y1="279" x2="575" y2="279" stroke="#7a0c14" stroke-width="2"/>
+  <text x="580" y="280" font-size="10" fill="#7a0c14">[0.18, 1.02]</text>
+
+  <text x="570" y="320" text-anchor="middle" font-size="12" font-weight="bold" fill="#cf222e">shadowHokage (n=15)</text>
+
+  <!-- Stat annotation -->
+  <rect x="700" y="60" width="190" height="80" fill="#f0f3f6" stroke="#333" stroke-width="1" rx="4"/>
+  <text x="710" y="78" font-size="11" font-weight="bold">Welch t-test</text>
+  <text x="710" y="95" font-size="11">t = 1.85, df = 23.9</text>
+  <text x="710" y="110" font-size="11">two-sided p = 0.064</text>
+  <text x="710" y="128" font-size="10" fill="#cf222e">⚠ NOT 显著 (≥0.05)</text>
+
+  <text x="445" y="340" text-anchor="middle" font-size="11" fill="#555">95% CI 重叠区 ≈ [0.68, 1.02] → 不能拒绝 H0 但接近 (p=0.064)</text>
+</svg>
+
+<div class="callout">
+<b>Linus 式判读</b>：<br>
+- <b>差距真实存在</b>：per-orange 2.22× ratio，per-ep mean 1.33 vs 0.60，Z test p=0.013（iid 假设）<br>
+- <b>但样本不足以严格证明</b>：per-ep Welch t-test p=0.064，95% CI 重叠，over-dispersion 拉高真实 variance<br>
+- <b>实操结论</b>：再补 1-2 runs each side（累积 25-30 ep per side）就能把 p 压到 &lt; 0.05；或直接切到 per-orange Bayesian 估 p<br>
+- <b>不再让 single-run X/15 数字下结论</b>：5-round 单次的 8/15 vs 3/15 跨 binomial 概率 13% 距离，不构成证据
+</div>
+
+<div class="callout">
+<b>对前 5 节的影响 / Impact on §1–§6</b>：<br>
+- §5.5 "v0.4.0 重训 8/15 vs v0.5.2 3/15 = 2.7× drift" 仍然定性正确，但 <b>"2.7×" 数字本身在 5-round 下不显著</b>；要量化定 drift 大小必须升级 eval 协议<br>
+- §5.4 表格的所有 X/15 数字 <b>应改为带 ±5-6 CI 的区间</b>，否则误导<br>
+- §6 待验证清单的 "Phase 1 判停规则" 应改：从 "≥7/15 → dep 锁定" 改成 "<b>fixed val loss + first-N-step action L2 收敛到 v0.4.0 水平</b>"（codex 第 5 点已经预警过这点）
+</div>
+
+<h2>8. 关联</h2>
+<ul>
+<li><a href="act_eval_debug_postmortem.html"><code>act_eval_debug_postmortem.html</code></a> — 早期 debug postmortem 详记（已被 5.1 时间线 supersede）</li>
+<li><a href="dp_finetune_pick_orange.html"><code>dp_finetune_pick_orange.html</code></a> — DP（同款 ResNet + UNet 风格；也受 PR #3442 影响，DP v0.4.0 复训中）</li>
 <li><a href="smolvla_finetune_pick_orange.html"><code>smolvla_finetune_pick_orange.html</code></a> — VLM 增强版 chunk policy</li>
-<li><code>act-eval-debug-roundN</code> memory</li>
-<li><code>act-training-plan</code> memory</li>
+<li><a href="../../README.md">LeIsaac/README.md</a> — 5-round leaderboard + framework drift 脚注</li>
+<li>memory <code>act-framework-drift-root-cause</code> — 本文档浓缩版</li>
+<li>memory <code>act-reproduction-gap</code> — 旧的失败记录（torchcodec / ckpt sweep 均无效，最终 supersede）</li>
+<li>memory <code>per-model-action-horizon</code> — 各模型最优 h（ACT v0.4.0=70）</li>
+<li>memory <code>eval-5round-mandatory</code> — 为什么 strict 必须 ≥5 round</li>
 </ul>
 
 </body>

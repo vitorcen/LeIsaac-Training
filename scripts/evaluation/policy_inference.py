@@ -449,11 +449,17 @@ def main():
             plate_upright = plate_up_z > 0.7
             if plate_upright:
                 # Plate radius: LeIsaac plate is ~15cm diameter → 7.5cm radius.
-                # Use 8cm to allow orange center on rim while excluding box corners.
-                plate_r = 0.08
-                # Resting height band: orange center should be ~2-4cm above plate
-                # center (plate ~1cm thick + orange ~3cm radius). 0.5-5cm window.
-                dz_min, dz_max = 0.005, 0.05
+                # Env's strict put_orangeN_to_plate subtask uses a 10cm xy box, so
+                # match that with plate_r=0.10 — anything tighter (e.g. 0.08) misses
+                # oranges resting on the plate rim that env counts as placed.
+                plate_r = 0.10
+                # Resting height band: orange center should be ≥ ~3cm above plate
+                # center (plate ~1cm thick + orange ~3cm radius). dz_max raised to
+                # 0.20 to accept stacked oranges (top of a 3-stack ≈ 15cm above
+                # plate center), since the env's success criterion treats any
+                # orange whose xy is inside the plate as "placed" regardless of
+                # stack height.
+                dz_min, dz_max = 0.005, 0.20
                 # Settled velocity threshold: < 0.05 m/s (5 cm/s) — orange has
                 # stopped moving (not in gripper transit / not bouncing).
                 v_thresh = 0.05
@@ -518,6 +524,10 @@ def main():
         round_start_t = time.time()
         # Stuck detector: rolling (timestamp, joint_pos_tensor) buffer over last stuck_window_s seconds
         joint_history: list[tuple[float, torch.Tensor]] = []
+        # Capture home pose (arm at reset position) for "returned-to-home" detector.
+        # Set lazily on first inner-loop iter so it reflects post-warmup state.
+        home_arm_pose: "torch.Tensor | None" = None
+        home_return_armed = False  # set True once arm has clearly moved away from home
         while simulation_app.is_running():
             # run everything in inference mode
             with torch.inference_mode():
@@ -526,21 +536,50 @@ def main():
                     args_cli.max_round_wall_s > 0
                     and wall_elapsed >= args_cli.max_round_wall_s
                 )
-                # Stuck-detector check: only after we have ≥ stuck_window_s of history.
+                # Stuck-detector check: arm at quasi-rest (range < stuck_eps_rad over
+                # the last 5 seconds) and the policy has had a chance to do work
+                # (we've seen ≥ one motion burst above eps already, or round_age >
+                # short grace). This catches "policy retracted to home and gave up"
+                # cases where waiting to wall_cap (180s) is just lost time.
+                # `stuck_window_s` env var keeps a minimum-grace guard so policies
+                # whose initial pose happens to be near-still don't trigger on iter 0.
+                # Gripper joint is ignored (open/close idle cycles defeat detection).
                 stuck = False
                 if args_cli.stuck_window_s > 0 and joint_history:
-                    cutoff = time.time() - args_cli.stuck_window_s
-                    if joint_history[0][0] <= cutoff:
-                        window = torch.stack([jp for ts, jp in joint_history if ts >= cutoff], dim=0)
-                        # window shape: (T, n_joints). Check each joint range < eps.
-                        if window.shape[0] >= 10:
-                            ranges = window.max(dim=0).values - window.min(dim=0).values
+                    round_age = time.time() - round_start_t
+                    if round_age >= args_cli.stuck_window_s:
+                        short_still_s = 5.0
+                        cutoff = time.time() - short_still_s
+                        recent = [jp for ts, jp in joint_history if ts >= cutoff]
+                        if len(recent) >= 10:
+                            window = torch.stack(recent, dim=0)
+                            arm_window = window[:, :-1] if window.shape[1] > 1 else window
+                            ranges = arm_window.max(dim=0).values - arm_window.min(dim=0).values
                             if ranges.max().item() < args_cli.stuck_eps_rad:
                                 stuck = True
-                if controller.reset_state or _skip_requested() or wall_capped or stuck:
+                # Home-return detector: arm joints have visibly moved AWAY from the
+                # episode-start pose (so policy did work) and have now returned to
+                # within home_tol_rad of that pose → policy is signaling "done".
+                # Fires faster than stuck because it doesn't require sustained
+                # stillness — one match suffices once `home_return_armed` is True.
+                home_return = False
+                if home_arm_pose is not None and joint_history:
+                    last_jp = joint_history[-1][1]
+                    arm_jp = last_jp[:-1] if last_jp.numel() > 1 else last_jp
+                    diff = (arm_jp - home_arm_pose).abs()
+                    # arm 5 joints, 0.5 rad ≈ 29° per joint = clearly "moved away"
+                    moved_away = diff.max().item() > 0.5
+                    near_home = diff.max().item() < 0.15  # 8.6° tolerance
+                    if moved_away:
+                        home_return_armed = True
+                    if home_return_armed and near_home:
+                        home_return = True
+                if controller.reset_state or _skip_requested() or wall_capped or stuck or home_return:
                     reason = "wall_cap" if wall_capped else (
-                        "stuck" if stuck else (
-                            "file_skip" if _skip_requested() else "key_R"
+                        "home_return" if home_return else (
+                            "stuck" if stuck else (
+                                "file_skip" if _skip_requested() else "key_R"
+                            )
                         )
                     )
                     if _skip_requested():
@@ -572,30 +611,30 @@ def main():
                     action = actions[i, :, :]
                     if env.cfg.dynamic_reset_gripper_effort_limit:
                         dynamic_reset_gripper_effort_limit_sim(env, task_type)
-                    obs_dict, _, reset_terminated, reset_time_outs, _ = env.step(action)
-                    # NON-STICKY: re-evaluate placement each step.
-                    # The env's `put_orangeNNN_to_plate` subtask fires only at the
-                    # *moment of release* — sticking it as True forever was the
-                    # bug source: orange briefly on plate then bounced off was
-                    # still counted.  With our hardened loose check (cylindrical
-                    # radius + dz > 0 + plate upright + velocity settled), the
-                    # current-frame value is the authoritative "is it on plate
-                    # right now" signal.  Episode-end snapshot wins.
+                    # Read placement BEFORE env.step — in single-env mode,
+                    # env.step() returns a *post-auto-reset* obs when termination
+                    # fires, with oranges already at fresh random positions.
+                    # The current `obs_dict` here is from the previous step's
+                    # tail (or env.reset for iter 0), guaranteed pre-reset.
                     f1, f2, f3 = _read_subtask_flags(obs_dict)
                     placed_flags[0] = bool(f1)
                     placed_flags[1] = bool(f2)
                     placed_flags[2] = bool(f3)
+                    obs_dict, _, reset_terminated, reset_time_outs, _ = env.step(action)
                     if reset_terminated[0]:
                         success = True
                         break
                     if reset_time_outs[0]:
                         time_out = True
                         break
-                    # record joint state for stuck detector (env 0 only, single-env eval)
+                    # record joint state for stuck/home-return detectors
                     if args_cli.stuck_window_s > 0:
                         try:
                             jp = obs_dict["policy"]["joint_pos"][0].detach().cpu().clone()
                             now_t = time.time()
+                            if home_arm_pose is None:
+                                # capture once, on the first post-warmup obs of the round
+                                home_arm_pose = jp[:-1].clone() if jp.numel() > 1 else jp.clone()
                             joint_history.append((now_t, jp))
                             # Trim entries older than 2 × window (kept generous so the
                             # range check upstream sees enough headroom)

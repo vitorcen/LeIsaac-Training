@@ -35,12 +35,20 @@
 #   RENAME_MAP          JSON dict (sim→policy keys). Empty if natural-key match.
 #   EXTRA_ARGS          Free-form extra flags appended to lerobot-train
 #   CONDA_ENV           Conda env name                             (default lerobot)
+#   AUTO_EVAL           1=spawn eval_watcher.sh per-ckpt sanity eval (default 1)
+#                       Set 0 to disable. See LeIsaac/CLAUDE.md "incremental
+#                       sanity eval" rule + eval_watcher.sh for env knobs.
+#   EVAL_HORIZON        policy_action_horizon for watcher (auto from POLICY_TYPE)
 #
 # Behavior:
 #   - Refuses to start if DATASET_ROOT not present (hints to run download.sh).
 #   - Refuses to start if dataset codebase_version != v3.0 (hints convert_to_v30.sh).
 #   - Logs full stdout/stderr to outputs/<OUTPUT_NAME>/train.log.
 #   - Final ckpt: outputs/<OUTPUT_NAME>/checkpoints/last/pretrained_model
+#   - If AUTO_EVAL=1 (default): spawns eval_watcher.sh in background; watcher
+#     polls $OUTPUT_DIR/checkpoints/ and runs 3-round 60s quick eval per ckpt.
+#     Wrapper polls $OUTPUT_DIR/.eval_abort and SIGTERMs lerobot-train if set
+#     (3 consecutive 0-orange or stuck slices → don't burn N more hours).
 
 set -euo pipefail
 
@@ -63,6 +71,8 @@ SAVE_FREQ="${SAVE_FREQ:-5000}"
 RENAME_MAP="${RENAME_MAP:-}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 CONDA_ENV="${CONDA_ENV:-lerobot}"
+AUTO_EVAL="${AUTO_EVAL:-1}"
+EVAL_HORIZON="${EVAL_HORIZON:-}"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 DATASET_BASENAME="$(basename "${DATASET_REPO_ID}")"
@@ -145,8 +155,57 @@ ARGS+=("${EXTRA_ARGS_ARR[@]}")
 
 echo "[finetune] launching lerobot-train; full log: ${LOG_FILE}"
 set -o pipefail
-conda run -n "${CONDA_ENV}" --no-capture-output lerobot-train "${ARGS[@]}" 2>&1 | tee -a "${LOG_FILE}"
-TRAIN_RC=${PIPESTATUS[0]}
+conda run -n "${CONDA_ENV}" --no-capture-output lerobot-train "${ARGS[@]}" 2>&1 | tee -a "${LOG_FILE}" &
+TRAIN_PID=$!
+
+# -------- AUTO_EVAL=1: spawn per-ckpt sanity-eval watcher (LeIsaac/CLAUDE.md rule) --------
+WATCHER_PID=""
+if [[ "${AUTO_EVAL}" == "1" ]]; then
+    # Infer inference-side policy_type slug
+    if [[ -n "${POLICY_TYPE:-}" ]]; then
+        case "${POLICY_TYPE}" in
+            diffusion)      EVAL_POLICY_TYPE="lerobot-diffusion" ;;
+            act)            EVAL_POLICY_TYPE="lerobot-act" ;;
+            smolvla)        EVAL_POLICY_TYPE="lerobot-smolvla" ;;
+            *)              EVAL_POLICY_TYPE="lerobot-${POLICY_TYPE}" ;;
+        esac
+    elif [[ -n "${BASE_MODEL:-}" ]]; then
+        case "${BASE_MODEL,,}" in
+            *smolvla*)      EVAL_POLICY_TYPE="lerobot-smolvla" ;;
+            *)              EVAL_POLICY_TYPE="lerobot-act" ;;  # best-effort
+        esac
+    else
+        EVAL_POLICY_TYPE="lerobot-act"
+    fi
+    OUTPUT_DIR="${OUTPUT_DIR}" POLICY_TYPE="${EVAL_POLICY_TYPE}" \
+        EVAL_HORIZON="${EVAL_HORIZON}" \
+        nohup bash "${REPO_ROOT}/scripts/training/eval_watcher.sh" \
+        > "${OUTPUT_DIR}/auto_eval.log" 2>&1 &
+    WATCHER_PID=$!
+    disown "${WATCHER_PID}" 2>/dev/null || true
+    echo "[finetune] AUTO_EVAL watcher PID=${WATCHER_PID} → ${OUTPUT_DIR}/auto_eval.log"
+    echo "[finetune] watcher polls ${OUTPUT_DIR}/checkpoints/ and SIGTERMs training if 3 consecutive 0-orange slices"
+fi
+
+# -------- monitor abort marker + reap training --------
+ABORT_MARKER="${OUTPUT_DIR}/.eval_abort"
+while kill -0 "${TRAIN_PID}" 2>/dev/null; do
+    if [[ -f "${ABORT_MARKER}" ]]; then
+        echo "[finetune] ABORT: eval_watcher signaled (3 consecutive 0-orange / stuck slices)" >&2
+        kill -TERM "${TRAIN_PID}" 2>/dev/null || true
+        sleep 10
+        kill -9 "${TRAIN_PID}" 2>/dev/null || true
+        break
+    fi
+    sleep 30
+done
+wait "${TRAIN_PID}"
+TRAIN_RC=$?
+
+if [[ -n "${WATCHER_PID}" ]]; then
+    kill -TERM "${WATCHER_PID}" 2>/dev/null || true
+fi
+
 if [[ ${TRAIN_RC} -ne 0 ]]; then
     echo "[finetune] FAILED with rc=${TRAIN_RC}; see ${LOG_FILE}" >&2
     exit "${TRAIN_RC}"

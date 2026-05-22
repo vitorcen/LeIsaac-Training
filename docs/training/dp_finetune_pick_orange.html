@@ -255,11 +255,63 @@
 <li><b>step_hz=60 与 dataset 30Hz 错配</b>：部署时间尺度漂移，arm 速度加倍。修：step_hz=30</li>
 </ul>
 
-<h2>6. 关联</h2>
+<h2>6. 重训计划（2026-05-22 起）</h2>
+
+<p>第三方 <code>wsagi/DiffusionPolicy-PickOrange</code> (lerobot v0.5.2, resize 240×320 + crop None) <b>5-round 0/15 stuck @ 33s</b>。
+v0.4.0 retrain (默认 crop=[84,84]) 100k step <b>0/15 stuck @ 35s</b> — framework drift 假说被否决（ACT 同迁移成功 3/15→8/15 但 DP 没救）。
+真正 root cause 待定，先用最强配置（max visual info + ACT-equivalent setup）重训。</p>
+
+<h3>分辨率决策：<code>crop_shape=null</code> + full 480×640</h3>
+
+<table>
+<tr><th>选项</th><th>输入 H×W</th><th>信息量</th><th>VRAM (bs=32)</th><th>评估</th></tr>
+<tr><td>wsagi original</td><td>240×320 (resize)</td><td>76,800 px</td><td>~6 GB</td><td>已测 0/15，不行</td></tr>
+<tr><td>v0.4.0 default</td><td>84×84 (crop)</td><td>7,056 px</td><td>~5 GB</td><td>已测 0/15，不行</td></tr>
+<tr><td><b>推荐: crop=null</b></td><td><b>480×640 full</b></td><td><b>307,200 px</b></td><td><b>~12 GB</b></td><td><b>ACT v0.4.0 同输入 → 8/15 成功 ⇒ ResNet18 吃得动</b></td></tr>
+<tr><td>保守: crop=[240,320]</td><td>240×320 random</td><td>76,800 px</td><td>~6 GB</td><td>仅匹配 wsagi 区域，已知不工作</td></tr>
+</table>
+
+<p><b>原因</b>：ACT v0.4.0 用同样 480×640 直进 ResNet18，5-round eval 8/15 (best run 13/15)，证明 ResNet18 + GroupNorm 在这个分辨率收敛良好。
+wsagi 240×320 已证伪，再匹配它没意义。crop=null 给 policy 最大视觉输入。</p>
+
+<h3>训练命令</h3>
+
+<pre>cd /home/david/work/isaaclab-experience/LeIsaac
+CONDA_ENV=lerobot-v040 OUTPUT_NAME=dp-v040-fullres \
+  POLICY_TYPE=diffusion DATASET_REPO_ID=LightwheelAI/leisaac-pick-orange \
+  STEPS=100000 BATCH_SIZE=32 NUM_WORKERS=2 SAVE_FREQ=10000 \
+  EXTRA_ARGS="--dataset.video_backend=pyav --policy.crop_shape=null" \
+  bash scripts/training/lerobot_finetune.sh</pre>
+
+<p><b>SAVE_FREQ=10000</b> = 100k/10 = 10 等分，per <code>LeIsaac/CLAUDE.md</code> 强制规则。
+每个 ckpt 落地立刻跑 <code>EVAL_ROUNDS=3 EPISODE_S=60 MAX_ROUND_WALL_S=90</code> X-VLA-style quick eval (~3-5 min/eval × 10 = 30-50 min 总开销)。</p>
+
+<h3>Quick eval 中止条件</h3>
+
+<ul>
+<li><b>连续 3 个 slice (e.g. 30%, 40%, 50%) oranges=0</b> → abort，policy 学到 degenerate "do nothing"</li>
+<li><b>连续 3 个 slice arm stuck &lt; 30s/ep</b> → abort，diagnostic 必须先做：dump action chunk 看 server 实际返回什么</li>
+<li>正常应在 30k step 看到 oranges &gt; 0（ACT v0.4.0 6k step 就开始 placement）</li>
+</ul>
+
+<h3>如果 full 480×640 仍 0/15</h3>
+
+<p>说明 DP 失败不在分辨率，而在更深的 architecture / sampling 问题。逐项排查：</p>
+<ol>
+<li><b>DDIM swap</b>：训练 DDPM 100-step → 部署 DDIM 32-step，inference 393ms → 147ms。延迟过高 → arm 跟不上 chunk，可能学习 OK 但部署崩</li>
+<li><b>must_go semantics</b>：DP n_action_steps=8 短 chunk，server dedup 会冻 obs。debug 时强制 <code>must_go=True</code> 看是否解锁</li>
+<li><b>n_obs_steps=2 客户端兼容性</b>：dump client 实际发送的 obs，确认 server 真的拿到 2 帧而不是 stack 同一帧</li>
+<li><b>降到 n_action_steps=1</b>：单步执行最稳，没 chunk hold-pose 问题。代价是 inference 频率 30Hz 全程跑</li>
+<li><b>action normalize 检查</b>：DP 用 MIN_MAX or MEAN_STD？跟 ACT 比对</li>
+</ol>
+
+<h2>7. 关联</h2>
 <ul>
 <li><a href="dp_inference_speedup_and_dynamic_timeout.html"><code>dp_inference_speedup_and_dynamic_timeout.html</code></a> — DDIM swap 详记 + dynamic timeout</li>
 <li><a href="act_finetune_pick_orange.html"><code>act_finetune_pick_orange.html</code></a> — ACT（同款 ResNet 路线，但 transformer 解码）</li>
-<li><code>leisaac-eval-timeout</code> memory</li>
+<li><code>act-framework-drift-root-cause</code> memory — ACT v0.4.0 retrain 成功案例</li>
+<li><code>feedback-incremental-eval-during-training</code> memory — 10 等分 quick eval 强制规则</li>
+<li><code>leisaac-eval-timeout</code> memory — DDIM swap + dynamic timeout</li>
 </ul>
 
 </body>

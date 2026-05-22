@@ -5,7 +5,7 @@
 # Single 4090, bf16 full fine-tune (projector + DiT + top4 LLM layers ≈ 600M trainable).
 #
 # Env knobs:
-#   GR00T_ROOT        path to Isaac-GR00T repo (default: ~/work/Isaac-GR00T)
+#   GR00T_ROOT        path to Isaac-GR00T repo (default: REPO_ROOT/dependencies/Isaac-GR00T submodule)
 #   DATASET_DIR       LeRobot v3.0 dataset root (default: LeIsaac/datasets/raw/leisaac-pick-orange)
 #   OUTPUT_DIR        ckpt + logs output dir
 #   BASE_MODEL        HF model id (default: nvidia/GR00T-N1.6-3B)
@@ -23,7 +23,7 @@ set -euo pipefail
 LEISAAC_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 REPO_ROOT="$(cd "$LEISAAC_ROOT/.." && pwd)"
 
-GR00T_ROOT="${GR00T_ROOT:-$HOME/work/Isaac-GR00T}"
+GR00T_ROOT="${GR00T_ROOT:-$REPO_ROOT/dependencies/Isaac-GR00T}"
 DATASET_DIR="${DATASET_DIR:-$LEISAAC_ROOT/datasets/v2-gr00t/leisaac-pick-orange}"
 OUTPUT_DIR="${OUTPUT_DIR:-$LEISAAC_ROOT/outputs/gr00t-n16-leisaac-pick-orange}"
 MODALITY_CFG="${MODALITY_CFG:-$LEISAAC_ROOT/scripts/finetune/gr00t/leisaac_config.py}"

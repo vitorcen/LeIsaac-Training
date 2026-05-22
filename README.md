@@ -55,18 +55,23 @@ _Treating `LeIsaac-SO101-PickOrange-v0` as a benchmark; 7 baselines × 3 rounds 
 
 _Sort: strict Rounds DESC → 🍊 DESC → time ASC._
 
-| Policy | Params | `config.type` | Strict ✅ | 🍊 (n/9) | Pick rate | Avg round | Peak VRAM | GPU util | Per-round detail |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| **[`wsagi/GR00T-N1.6-PickOrange`](https://huggingface.co/wsagi/GR00T-N1.6-PickOrange) (自训 / ours, ckpt-6500, step_hz=60)** 🥇🆕 | ~3B | `gr00t_n1_6` | **2/3** | **8/9** | **88.9%** | 115s | ~22 GB (train) / 17.3 GB (infer) | TBD | 2🍊@180s / 3🍊@66s✅ / 3🍊@113s✅ |
-| **[`hi-space/GR00T-N1.6-3B-Pick-Orange`](https://huggingface.co/hi-space/GR00T-N1.6-3B-Pick-Orange) (step_hz=60)** 🥈 | ~3B | `gr00t_n1_6` | **2/3** | **6/9** | **66.7%** | 96s | 17.3 GB | 31.1% | 3🍊@39s✅ / 0🍊@180s / 3🍊@68s✅ |
-| [`wsagi/SmolVLA-PickOrange`](https://huggingface.co/wsagi/SmolVLA-PickOrange) **(自训 / ours)** 🥉 | ~450M | `smolvla` | 1/3 | 5/9 | 55.6% | 355s | 10.0 GB | 23.0% | 3🍊@158s✅ / 0🍊@552s / 2🍊@355s |
-| [`LightwheelAI/leisaac-pick-orange-v0`](https://huggingface.co/LightwheelAI/leisaac-pick-orange-v0) **(step_hz=60)** 🥉 | ~3B | `gr00t_n1_5` | 0/3 | 4/9 | 44.4% | 105s | 16.2 GB | 36.1% | 1🍊@180s / 1🍊@55s / 2🍊@79s |
-| [`wsagi/X-VLA-PickOrange`](https://huggingface.co/wsagi/X-VLA-PickOrange) **(自训 / ours, weak-aug 17k)** 🆕 | 0.9B | `xvla` | 0/3 | 4/9 | 44.4% | 180s | ~5 GB | TBD | 2🍊@180s / 1🍊@180s / 1🍊@180s ⭐ 6-round 18/18 ep ≥1 placed (50% per-ep) |
-| [`wsagi/DiffusionPolicy-PickOrange`](https://huggingface.co/wsagi/DiffusionPolicy-PickOrange) **(自训 / ours)** | ~267M | `diffusion` | 0/3 | 2/9 | 22.2% | 108s | 10.6 GB | 22.3% | 0🍊@159s / 2🍊@105s / 0🍊@60s |
-| [`wsagi/ACT-PickOrange`](https://huggingface.co/wsagi/ACT-PickOrange) **(自训 / ours)** | ~80M | `act` | 0/3 | 2/9 | 22.2% | 130s | 10.4 GB | 24.7% | 0🍊@106s / 0🍊@180s / 2🍊@103s |
-| [`shadowHokage/act_policy`](https://huggingface.co/shadowHokage/act_policy) (h=16) | ~80M | `act` | 0/3 | 1/9 | 11.1% | 127s | 8.6 GB | 24.6% | 0🍊@157s / 1🍊@77s / 0🍊@146s |
-| [`edge-inference/smolvla-so101-pick-orange`](https://huggingface.co/edge-inference/smolvla-so101-pick-orange) | ~450M | `smolvla` | 0/3 | 0/9 | 0.0% | 168s | 10.2 GB | 23.4% | 0🍊@180s / 0🍊@167s / 0🍊@157s |
-| π0.5 **(自训 / ours)** — pt-v3 final_lora.npz | 3.36B + 5M LoRA | `pi05` | 0/3 | 0/9 | 0.0% | 180s | 18.7 GB | 25.2% | 0🍊@180s / 0🍊@180s / 0🍊@180s |
+**Note (2026-05-21)**：所有标 ✅ 5-round 的行用了 post-fix eval (≥5 round = 15 ep 必要 + pre-step placement snapshot + dz_max=0.20 + plate_r=0.10 + arm-only stuck + home_return)；标 ✗ 还是旧 3-round 数据待重测。see [`scripts/benchmark/README.html`](../scripts/benchmark/README.html).
+
+| Policy | Params | `config.type` | Rounds | 🍊 | Pick rate | Avg round | Peak VRAM | Per-round detail |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| **[`hi-space/GR00T-N1.7-3B-Pick-Orange`](https://huggingface.co/hi-space/GR00T-N1.7-3B-Pick-Orange) (h=40, step_hz=60)** 🥇 ✅ | ~3B | `gr00t_n1_7` | **4/5** | **14/15** | **93.3%** | **69s** | 17.3 GB | 3🍊@35s✅ / 3🍊@35s✅ / 2🍊@180s / 3🍊@50s✅ / 3🍊@48s✅ |
+| **[`wsagi/GR00T-N1.6-PickOrange`](https://huggingface.co/wsagi/GR00T-N1.6-PickOrange) (自训 / ours, ckpt-6500, h=40)** 🥈 ✅ | ~3B | `gr00t_n1_6` | **4/5** | **13/15** | **86.7%** | 92s | ~22 GB / 17.3 GB | 3🍊@58s✅ / 3🍊@70s✅ / 1🍊@180s / 3🍊@28s✅ / 3🍊@126s✅ |
+| [`hi-space/GR00T-N1.6-3B-Pick-Orange`](https://huggingface.co/hi-space/GR00T-N1.6-3B-Pick-Orange) (h=40, step_hz=60) 🥉 ✅ | ~3B | `gr00t_n1_6` | 2/5 | 9/15 | 60.0% | 122s | 17.3 GB | 3🍊@31s✅ / 2🍊@41s✅ / 1🍊@180s / 1🍊@180s / 2🍊@180s |
+| [`wsagi/SmolVLA-PickOrange`](https://huggingface.co/wsagi/SmolVLA-PickOrange) **(自训 / ours, main=15k, sweep best)** ✅ | ~450M | `smolvla` | 2/5 | 8/15 | 53.3% | 133s | 10.0 GB | 3🍊@85s✅ / 1🍊@180s / 3🍊@42s✅ / 0🍊@180s / 1🍊@180s |
+| [`edge-inference/smolvla-so101-pick-orange`](https://huggingface.co/edge-inference/smolvla-so101-pick-orange) ✅ | ~450M | `smolvla` | 1/5 | 6/15 | 40.0% | 135s | 10.2 GB | 3🍊@93s✅ / 1🍊@180s / 0🍊@42s(stuck) / 0🍊@180s / 2🍊@180s |
+| **[`wsagi/ACT-PickOrange`](https://huggingface.co/wsagi/ACT-PickOrange) (自训 / ours, lerobot v0.4.0 ckpt-18k, h=70)** ✅ | ~52M | `act` | **1/5** | **5/15** | **36.7%** | 154s | 8.6 GB | 4-run trimmed mean (剔除 lucky 13/15 outlier)；per-run strict [3,0,2,1,2] oranges [13,2,8,5,5]，含 outlier mean=2/7，剔除后 1/5 5/15。pool 含 outlier 33/75=44.0%, Welch t vs shadowHokage p=0.034 ✅ |
+| [`LightwheelAI/leisaac-pick-orange-v0`](https://huggingface.co/LightwheelAI/leisaac-pick-orange-v0) **(N1.5, h=16, step_hz=60)** ✅ | ~3B | `gr00t_n1_5` | 0/5 | 8/15 | 53.3% | 140s | 16.2 GB | 1🍊@180s / 2🍊@60s(stuck) / 2🍊@180s / 1🍊@101s(stuck) / 2🍊@180s |
+| [`shadowHokage/act_policy`](https://huggingface.co/shadowHokage/act_policy) **(others, h=70)** ✅ | ~52M | `act` | 0/5 | 4/15 | 26.7% | 169s | 8.6 GB | h=70 single 5-round, per-ep [0,0,1,0,3] = 4 oranges. h-sweep {16,32,64} 也都 0/5 strict 2-3/15 oranges。旧 9/15 anchor 是 sticky-env-success 协议（env→success 但只 1-2 颗 placed 也算 strict），post-bug-fix 严格协议下 0/5 strict |
+| [`wsagi/X-VLA-PickOrange`](https://huggingface.co/wsagi/X-VLA-PickOrange) **(自训 / ours, weak-aug 17k, h=32, no-stuck)** ✅ | 0.9B | `xvla` | 0/5 | 3/15 | 20.0% | 180s | ~5 GB | 1🍊@180s / 0🍊@180s / 0🍊@180s / 1🍊@180s / 1🍊@180s |
+| [`wsagi/DiffusionPolicy-PickOrange`](https://huggingface.co/wsagi/DiffusionPolicy-PickOrange) **(自训 / ours, v0.5)** ✅ | ~267M | `diffusion` | 0/5 | 0/15 | 0.0% | 33s* | 10.6 GB | all stuck @ 33s — **真因不是 policy dead**，是 lerobot async server bug: `predict_action_chunk` 不调 `populate_queues` → n_obs_steps=2 stack 空 deque → server stream crash → client 8-retry 拿不到 action → 静默"不动"。fix 见 [[lerobot-dp-async-server-bug]] |
+| DP **(自训 / ours, v0.4 fullres patched, ckpt-70k)** ✅ | ~267M | `diffusion` | 0/5 | 0/15 | 0.0% | 183s | ~13 GB | crop_shape=null + 上述 server patch + 100k step 重训，ckpt-70k 5-round 在 h={8,12,16} 全 0/15。framework bug fix 让 policy 能产合理 action (joint ±0.6 rad) 但 50 demo 上 DP 学不到稳定 task。watcher 3-round h=8 sweep 在 60/70/80k 各拿 1/9 后被 5-round 全部证伪为 single-ep noise |
+| OpenVLA-7B **(自训 / ours, ckpt-6300 / 8bit-1000, h=16, no-stuck)** ✅ | 7B + 32 LoRA | `openvla` | 0/5 | 0/15 | 0.0% | 180s | ~8 GB | all wall_cap (both ckpts identical: 0) |
+| π0.5 **(自训 / ours)** — pt-v3 final_lora.npz, h=35 ✅ | 3.36B + 5M LoRA | `pi05` | 0/5 | 0/15 | 0.0% | 180s | ~16 GB | all wall_cap 0/3 |
 
 > 历史快照在 [`results/benchmark/snapshots/`](../results/benchmark/snapshots/) — 包含 round 1 (step_hz=30 全部) / round 2 (sticky-strict + GR00T step_hz=60 fix)。原始 JSON + 1Hz GPU CSV 都在内。
 
