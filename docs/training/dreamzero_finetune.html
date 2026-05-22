@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>DreamZero N1.6 (Wan2.1-I2V-14B) — Finetune & Inference on RTX 4090 24G</title>
+<style>
+body { font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif; max-width: 1180px; margin: 24px auto; padding: 0 18px; line-height: 1.55; color: #222; background: #fafafa; }
+h1, h2, h3 { font-weight: 700; }
+h1 { border-bottom: 2px solid #444; padding-bottom: 8px; }
+h2 { margin-top: 2em; border-left: 4px solid #2b6cb0; padding-left: 10px; }
+h3 { color: #2b6cb0; }
+code, pre { font-family: Menlo, Monaco, Consolas, monospace; }
+pre { background: #f6f8fa; padding: 12px; border-radius: 5px; overflow-x: auto; font-size: 12.5px; line-height: 1.45; }
+code { background: #f1f3f5; padding: 1px 5px; border-radius: 3px; font-size: 0.92em; }
+.bad { background: #fff5f5; border-left: 4px solid #c53030; padding: 8px 12px; margin: 8px 0; }
+.good { background: #f0fff4; border-left: 4px solid #2f855a; padding: 8px 12px; margin: 8px 0; }
+.warn { background: #fffaf0; border-left: 4px solid #dd6b20; padding: 8px 12px; margin: 8px 0; }
+.tldr { background: #ebf8ff; border-left: 4px solid #2b6cb0; padding: 10px 14px; margin: 10px 0; }
+.measured { background: #f0fff4; border: 1px dashed #2f855a; padding: 10px 14px; margin: 10px 0; }
+table { border-collapse: collapse; width: 100%; margin: 10px 0; font-size: 13px; }
+th, td { border: 1px solid #ddd; padding: 6px 9px; text-align: left; vertical-align: top; }
+th { background: #f0f4f8; }
+.en { color: #666; font-style: italic; font-size: 0.93em; }
+ul li { margin: 4px 0; }
+.diag { background: #fff; border: 1px solid #ddd; border-radius: 6px; padding: 12px; margin: 14px 0; text-align: center; }
+.diag svg { max-width: 100%; height: auto; }
+.tag-ok { background: #2f855a; color: #fff; padding: 1px 6px; border-radius: 3px; font-size: 11px; }
+.tag-bad { background: #c53030; color: #fff; padding: 1px 6px; border-radius: 3px; font-size: 11px; }
+.tag-warn { background: #dd6b20; color: #fff; padding: 1px 6px; border-radius: 3px; font-size: 11px; }
+</style>
+</head>
+<body>
+
+<h1>DreamZero <span class="en">(Wan2.1-I2V-14B World Action Model)</span> — 4090 24G 微调 & 推理可行性</h1>
+
+<div class="tldr">
+<b>TL;DR (2026-05-21 实测验证)</b>
+<br><br>
+DreamZero = NVIDIA GEAR Lab 提出的 <b>World Action Model (WAM)</b>，把 <b>Wan2.1-I2V-14B</b> 视频扩散模型作为 backbone，加 chunk-wise causal attention + 24 action tokens + flow matching，实现「先想象一段未来视频，再从中提取动作」的范式（vs VLA「直接预测动作」）。
+<br><br>
+<b>核心实测结论（4090 单卡 NF4 推理）：</b>
+<ul>
+<li>权重 <code>8.54 GB</code> · forward peak <code>10.43 GB</code> · activations 仅 <code>1.89 GB</code> · 余量 <code>13.57 GB</code> <span class="tag-ok">显存充裕</span></li>
+<li>单 step 推理 <code>6318 ms</code>（无 flash-attn），4 step denoise ≈ 25s/inference → <b>0.04 Hz 实时性</b> <span class="tag-bad">7Hz 不可能</span></li>
+<li>结论：<b>本地 4090 适合 batch eval / 演示 / QLoRA 训练；闭环 7Hz 实控必须 H100×2 TP</b></li>
+</ul>
+<span class="en">DreamZero is NVIDIA GEAR Lab's World Action Model — Wan2.1-I2V-14B video diffusion + chunk-wise causal action tokens + flow matching. Verified NF4 weights 8.54 GB on a single 4090; activations only 1.89 GB; total peak 10.43 GB with 13.57 GB headroom. But 4090 can't hit the paper's 7 Hz (single-step 6.3 s without flash-attn). Local 4090 is good for batch eval, demos, and QLoRA finetune; real-time closed-loop control still needs H100×2.</span>
+</div>
+
+<h2>1. DreamZero 是什么 <span class="en">(What is DreamZero)</span></h2>
+
+<div class="diag">
+<svg viewBox="0 0 1080 280" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#444"/>
+    </marker>
+  </defs>
+  <text x="540" y="22" text-anchor="middle" font-size="15" font-weight="700">VLA vs WAM 架构对比 (Architecture: VLA vs WAM)</text>
+
+  <!-- VLA path (top) -->
+  <text x="60" y="58" font-size="13" font-weight="700" fill="#c53030">VLA (传统)</text>
+  <rect x="50" y="68" width="120" height="50" rx="6" fill="#fed7d7" stroke="#c53030"/>
+  <text x="110" y="90" text-anchor="middle" font-size="12">Image + Prompt</text>
+  <text x="110" y="106" text-anchor="middle" font-size="11" fill="#555">(obs)</text>
+  <line x1="170" y1="93" x2="220" y2="93" stroke="#444" stroke-width="1.5" marker-end="url(#arr)"/>
+  <rect x="220" y="68" width="150" height="50" rx="6" fill="#fbb6ce" stroke="#c53030"/>
+  <text x="295" y="90" text-anchor="middle" font-size="12">Language VLM</text>
+  <text x="295" y="106" text-anchor="middle" font-size="11" fill="#555">(LLaMA / Eagle)</text>
+  <line x1="370" y1="93" x2="420" y2="93" stroke="#444" stroke-width="1.5" marker-end="url(#arr)"/>
+  <rect x="420" y="68" width="150" height="50" rx="6" fill="#feb2b2" stroke="#c53030"/>
+  <text x="495" y="90" text-anchor="middle" font-size="12">Action Decoder</text>
+  <text x="495" y="106" text-anchor="middle" font-size="11" fill="#555">(MLP / DiT)</text>
+  <line x1="570" y1="93" x2="620" y2="93" stroke="#444" stroke-width="1.5" marker-end="url(#arr)"/>
+  <rect x="620" y="68" width="120" height="50" rx="6" fill="#fc8181" stroke="#c53030"/>
+  <text x="680" y="90" text-anchor="middle" font-size="12">Actions</text>
+  <text x="680" y="106" text-anchor="middle" font-size="11" fill="#fff">(direct)</text>
+
+  <text x="900" y="95" font-size="12" fill="#c53030">需大规模 robot data 才能 grafting</text>
+  <text x="900" y="110" font-size="11" fill="#888">need bot-data scale to "graft"</text>
+
+  <!-- WAM path (bottom) -->
+  <text x="60" y="172" font-size="13" font-weight="700" fill="#2f855a">WAM (DreamZero)</text>
+  <rect x="50" y="182" width="120" height="50" rx="6" fill="#c6f6d5" stroke="#2f855a"/>
+  <text x="110" y="204" text-anchor="middle" font-size="12">Image + Prompt</text>
+  <text x="110" y="220" text-anchor="middle" font-size="11" fill="#555">(obs)</text>
+  <line x1="170" y1="207" x2="220" y2="207" stroke="#444" stroke-width="1.5" marker-end="url(#arr)"/>
+  <rect x="220" y="182" width="200" height="50" rx="6" fill="#9ae6b4" stroke="#2f855a"/>
+  <text x="320" y="200" text-anchor="middle" font-size="12">Video Diffusion (Wan2.1)</text>
+  <text x="320" y="216" text-anchor="middle" font-size="11" fill="#555">"梦境" 未来帧</text>
+  <line x1="420" y1="207" x2="470" y2="207" stroke="#444" stroke-width="1.5" marker-end="url(#arr)"/>
+  <rect x="470" y="182" width="180" height="50" rx="6" fill="#9ae6b4" stroke="#2f855a"/>
+  <text x="560" y="200" text-anchor="middle" font-size="12">Chunk-wise Causal Attn</text>
+  <text x="560" y="216" text-anchor="middle" font-size="11" fill="#555">joint video+action token</text>
+  <line x1="650" y1="207" x2="700" y2="207" stroke="#444" stroke-width="1.5" marker-end="url(#arr)"/>
+  <rect x="700" y="182" width="160" height="50" rx="6" fill="#68d391" stroke="#2f855a"/>
+  <text x="780" y="200" text-anchor="middle" font-size="12">Action via Inverse Dyn.</text>
+  <text x="780" y="216" text-anchor="middle" font-size="11" fill="#555">(flow matching)</text>
+  <line x1="860" y1="207" x2="900" y2="207" stroke="#444" stroke-width="1.5" marker-end="url(#arr)"/>
+  <rect x="900" y="182" width="120" height="50" rx="6" fill="#48bb78" stroke="#2f855a"/>
+  <text x="960" y="204" text-anchor="middle" font-size="12">Actions</text>
+  <text x="960" y="220" text-anchor="middle" font-size="11" fill="#fff">(extracted)</text>
+
+  <text x="540" y="262" text-anchor="middle" font-size="12" fill="#2f855a">Pretrain on video-only data — 30 min/embodiment fine-tune → zero-shot</text>
+</svg>
+</div>
+
+<h3>1.1 关键架构参数 <span class="en">(Spec)</span></h3>
+
+<table>
+<tr><th>组件 (Component)</th><th>规格 (Spec)</th><th>显存 bf16 / NF4</th><th>说明</th></tr>
+<tr><td>DiT backbone (Wan2.1)</td><td>14B · 40 layer · dim=5120 · ffn=13824 · 40 heads</td><td>32.6 GB / <b>8.5 GB</b></td><td>主体；NF4 压缩 3.85×</td></tr>
+<tr><td>Action head</td><td>WANPolicyHead + LoRA (~50M) · action_dim=32 · horizon=24</td><td>~0.2 GB</td><td>SO-101 用 6-DOF，其余 pad</td></tr>
+<tr><td>Image encoder</td><td>CLIP ViT-H/14 (1.28B)</td><td>4.8 GB / 1.2 GB</td><td>仅 prompt 阶段，可 swap CPU</td></tr>
+<tr><td>Text encoder</td><td>UMT5-XXL (11.3B)</td><td>22 GB / 5-10 GB</td><td>仅 prompt 阶段，可 swap CPU</td></tr>
+<tr><td>VAE</td><td>WanVAE (4× 时间 / 8× 空间)</td><td>0.5 GB</td><td>encode/decode 各一次</td></tr>
+<tr><td>Chunk causal KV cache</td><td>num_frame_per_block=2, max_chunk=4</td><td>~1 GB</td><td>chunk-wise inference 必需</td></tr>
+</table>
+
+<h2>2. 显存账本：4090 24G 实测 <span class="en">(Real-Measured VRAM Budget)</span></h2>
+
+<div class="measured">
+<b>2026-05-21 实测（脚本 <code>LeIsaac/scripts/inference/dreamzero/wan14b_nf4_forward.py</code>）：</b>
+<table>
+<tr><th>阶段 (Stage)</th><th>显存 (VRAM)</th><th>备注</th></tr>
+<tr><td>Wan2.1-I2V-14B DiT 全 488 Linear NF4 量化后</td><td><b>8.54 GB</b></td><td>仅 DiT 部分，不含 VAE/CLIP/T5</td></tr>
+<tr><td>+ 480P latent forward step（9×60×104, B=1, bf16）</td><td><b>10.43 GB peak</b></td><td>activations 仅 +1.89 GB</td></tr>
+<tr><td>余量 (Headroom)</td><td><b>13.57 GB</b></td><td>可装 KV cache + action head + small batch</td></tr>
+<tr><td>Forward 耗时（torch SDPA，无 flash-attn）</td><td>6318 ms / step</td><td>装 flash-attn 估 3-5× 加速 → 1.5-2 s/step</td></tr>
+</table>
+<b>对比之前的保守估算（NF4 14-19GB peak）— 实测好太多。原因：bf16 activations 在 B=1 video diffusion 单 step 下只占 ~2GB，不是想象中的 4-8GB。</b>
+<br><br>
+<span class="en">Measured 2026-05-21 on RTX 4090 24G with NF4-quantized Wan2.1-I2V-14B DiT (488 Linears). Weights 8.54 GB, forward peak 10.43 GB (activations only +1.89 GB), leaving 13.57 GB headroom — plenty of room for KV cache, action head, and small batch. Single-step forward 6318 ms without flash-attn; with flash-attn expect 3-5× speedup.</span>
+</div>
+
+<h3>2.1 与其他 4090 部署的 VLA 对比 <span class="en">(Comparison)</span></h3>
+
+<table>
+<tr><th>模型</th><th>params</th><th>NF4 weights</th><th>fwd peak (B=1)</th><th>~speed on 4090</th><th>4090 可行?</th></tr>
+<tr><td>ACT</td><td>~84M</td><td>—</td><td>~2 GB</td><td>~30Hz</td><td><span class="tag-ok">极轻</span></td></tr>
+<tr><td>Diffusion Policy</td><td>~30M</td><td>—</td><td>~1.5 GB</td><td>~7Hz (DDIM-32)</td><td><span class="tag-ok">极轻</span></td></tr>
+<tr><td>GR00T N1.6</td><td>3B (Eagle 2.4B + DiT 0.5B)</td><td>—（bf16 训）</td><td>~10 GB</td><td>~10Hz</td><td><span class="tag-ok">舒服</span></td></tr>
+<tr><td>SmolVLA</td><td>500M</td><td>—</td><td>~3 GB</td><td>~25Hz</td><td><span class="tag-ok">舒服</span></td></tr>
+<tr><td>π0.5</td><td>2.7B</td><td>—</td><td>~6 GB</td><td>~5Hz</td><td><span class="tag-ok">舒服</span></td></tr>
+<tr><td>X-VLA</td><td>~1B</td><td>—</td><td>~3 GB</td><td>~8Hz</td><td><span class="tag-ok">舒服</span></td></tr>
+<tr><td>OpenVLA</td><td>7B</td><td>~4 GB</td><td>~7 GB</td><td>~1-2Hz</td><td><span class="tag-warn">慢</span></td></tr>
+<tr><td>Fast-WAM (Wan2.2-5B)</td><td>5B</td><td>~3 GB</td><td>~16 GB（含 video subtask）</td><td>~1Hz</td><td><span class="tag-warn">边界</span></td></tr>
+<tr><td><b>DreamZero (Wan2.1-14B)</b></td><td>14B</td><td><b>8.5 GB</b></td><td><b>10.4 GB</b></td><td><b>0.04-0.15Hz</b></td><td><span class="tag-warn">显存 OK 但太慢</span></td></tr>
+</table>
+
+<h2>3. NF4 推理 5 个关键技术坑 <span class="en">(5 Critical Hacks)</span></h2>
+
+<h3>3.1 Meta device init 避免 CPU OOM</h3>
+
+<div class="bad">
+直接 <code>WanModel(**cfg)</code> 在 CPU fp32 = <b>56 GB</b>（14B×4byte）。本机 62GB RAM + 4.5GB swap，第一次跑 <b>SIGKILL exit 137</b> = OOM kill。
+</div>
+
+<div class="good">
+修复：用 <code>torch.device("meta")</code> 上下文构建（0 byte placeholder）：
+<pre>with torch.device("meta"):
+    model = WanModel(**I2V_14B_CONFIG)</pre>
+</div>
+
+<h3>3.2 Shard-by-shard streaming load</h3>
+
+<p>7 个 safetensors shard 总 60 GB（bf16 + fp32 master weights），不能一次 load 进 RAM。修复 = 逐 shard 流式读取，对每个 tensor 立即处理：</p>
+
+<ul>
+<li>2D Linear weight → 立即用 <code>bnb.nn.Linear4bit + Params4bit</code> 量化 → <code>.to("cuda")</code> → cuda hook 触发 NF4 量化 → 释放 CPU 临时</li>
+<li>非 Linear (norm, bias, embed, RoPE) → bf16 → cuda → assign</li>
+</ul>
+
+<h3>3.3 Identity remap（Wan2.1 ≠ diffusers naming）</h3>
+
+<div class="warn">
+踩坑：参考 DreamZero 的 <code>WanModelStateDictConverter.from_diffusers</code>，假设 raw safetensors 是 diffusers 命名（<code>blocks.0.attn1.to_q.weight</code>）。实际跑发现 <b>raw key 0 个匹配</b>，1303 个 model param 一个都没 load。
+</div>
+
+<div class="good">
+修复：Wan2.1-I2V-14B-480P 的官方 safetensors 本来就是 <b>DreamZero 原生命名</b>（<code>blocks.0.cross_attn.k.weight</code>），identity passthrough 即可，195/195 全 match。
+<pre>def remap(raw_k):
+    return raw_k  # identity, no diffusers rename needed</pre>
+</div>
+
+<h3>3.4 RoPE freqs 必须在 cuda device 上重算</h3>
+
+<div class="bad">
+meta init 时 <code>RotaryPositionEmbedding.__init__</code> 调 <code>precompute_freqs_cis_3d</code>，用了 <code>torch.arange / outer / cos / sin</code> — 这些在 <code>with torch.device("meta")</code> 下都是 meta tensor。后续 <code>post_initialize</code> 试 <code>.to("cuda")</code> 报 <code>Cannot copy out of meta tensor</code>。
+</div>
+
+<div class="good">
+<pre>head_dim = I2V_14B_CONFIG["dim"] // I2V_14B_CONFIG["num_heads"]  # 128
+with torch.device("cuda"):
+    model.rope.freqs = model.rope.precompute_freqs_cis_3d(head_dim)</pre>
+</div>
+
+<h3>3.5 distributed primitives 必须绕开 <span class="en">(单卡 hack)</span></h3>
+
+<div class="warn">
+官方 inference server <code>socket_test_optimized_AR.py</code> 用 <code>torch.distributed.run --nproc_per_node=2</code>，里面 <code>init_device_mesh</code> + <code>dist.get_rank()</code>。<b>2-GPU TP 是为了 H100 切 14B 模型，4090 不需要</b>。
+</div>
+
+<div class="good">
+单卡需做 3 件事：<br>
+1. <code>dist.init_process_group(backend="nccl", world_size=1, rank=0)</code> 起 1-rank world<br>
+2. <code>sim_policy.py:346-350</code> 已有 <code>try: model.parallelize(device_mesh=device_mesh) except: pass</code> fail-soft，传 <code>device_mesh=None</code> 自动跳过<br>
+3. server 层 <code>DeviceMesh</code> / <code>dist.broadcast</code> 改成本地直传
+</div>
+
+<h2>4. 训练路径选择 <span class="en">(Training Path Decision)</span></h2>
+
+<table>
+<tr><th>方案</th><th>显存</th><th>硬件</th><th>速度</th><th>评价</th></tr>
+<tr><td><b>A. 4090 QLoRA r=16</b></td><td>~20 GB</td><td>本机 4090 24G</td><td>~1.5 s/step（套 fastwam-qlora 全 patch）</td><td><span class="tag-warn">紧凑但可</span> 复用 <code>fastwam_qlora</code> patch 链；overfit 风险高（50 demo）</td></tr>
+<tr><td><b>B. AutoDL H100 LoRA r=64</b></td><td>~30 GB</td><td>单卡 H100 80GB ¥40/h</td><td>~0.5 s/step</td><td><span class="tag-ok">推荐</span> 10k step ≈ 3-5h × ¥40 = <b>~¥150-300/run</b></td></tr>
+<tr><td>C. AutoDL 2×H100 全 FT</td><td>~110 GB</td><td>2× H100 80GB ¥80/h</td><td>~0.3 s/step</td><td><span class="tag-bad">烧钱</span> 10k step ≈ 3h × ¥80 = ¥240；但 50 demo 不配 14B 全 FT</td></tr>
+<tr><td>D. 4090 全 FT</td><td>~110 GB</td><td>—</td><td>—</td><td><span class="tag-bad">不可能</span></td></tr>
+</table>
+
+<div class="warn">
+<b>⚠️ Fast-WAM 教训 复习</b>（<code>fastwam_qlora_inference_debug.html</code>）：
+<br>50 demo + 5B Wan2.2 + 39M LoRA = step_008000 模型在 eval 时 joint 输出 -170°，训练 range 是 [-100, +64]，<b>严重 extrapolate</b>。video diffusion subtask 在小数据集上会强迫模型 memorize 训练帧而非学到 generalization。
+<br><br>
+<b>对 DreamZero 的预测</b>：14B 比 5B 更容易 overfit。Vizuara 用了 <b>~800 episode 跨 8 个 task 的 SO-101 aggregate dataset</b> 才训出可用的 LoRA — 我们 LeIsaac 只有 50 demo + 1 task，<b>大概率重蹈覆辙</b>。
+<br><br>
+<b>建议：先用 Vizuara LoRA zero-shot，验证架构在 SO-101 PickOrange 上的 transfer 能力，再决定是否自己训。</b>
+</div>
+
+<h2>5. 4 步执行计划 <span class="en">(4-Phase Execution Plan)</span></h2>
+
+<div class="diag">
+<svg viewBox="0 0 1080 240" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="arr2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#444"/>
+    </marker>
+  </defs>
+  <text x="540" y="22" text-anchor="middle" font-size="15" font-weight="700">DreamZero on LeIsaac 4-Phase Plan</text>
+
+  <!-- 4 boxes horizontally -->
+  <g>
+    <rect x="20" y="60" width="240" height="120" rx="8" fill="#bee3f8" stroke="#2b6cb0"/>
+    <text x="140" y="82" text-anchor="middle" font-size="13" font-weight="700">Phase 1 · 显存验证</text>
+    <text x="140" y="100" text-anchor="middle" font-size="11" fill="#555">VRAM Verify</text>
+    <text x="140" y="124" text-anchor="middle" font-size="11">✅ 已完成 2026-05-21</text>
+    <text x="140" y="142" text-anchor="middle" font-size="11">NF4 weights 8.54 GB</text>
+    <text x="140" y="158" text-anchor="middle" font-size="11">peak 10.43 GB on 4090</text>
+    <text x="140" y="174" text-anchor="middle" font-size="11" fill="#888">~2h</text>
+  </g>
+  <line x1="260" y1="120" x2="290" y2="120" stroke="#444" stroke-width="2" marker-end="url(#arr2)"/>
+  <g>
+    <rect x="290" y="60" width="240" height="120" rx="8" fill="#fef3c7" stroke="#dd6b20"/>
+    <text x="410" y="82" text-anchor="middle" font-size="13" font-weight="700">Phase 2 · Vizuara zero-shot</text>
+    <text x="410" y="100" text-anchor="middle" font-size="11" fill="#555">Zero-shot LoRA Eval</text>
+    <text x="410" y="124" text-anchor="middle" font-size="11">🔄 进行中</text>
+    <text x="410" y="142" text-anchor="middle" font-size="11">单卡 inference adapter</text>
+    <text x="410" y="158" text-anchor="middle" font-size="11">LeIsaac PickOrange × 6 round</text>
+    <text x="410" y="174" text-anchor="middle" font-size="11" fill="#888">~1-2 day</text>
+  </g>
+  <line x1="530" y1="120" x2="560" y2="120" stroke="#444" stroke-width="2" marker-end="url(#arr2)"/>
+  <g>
+    <rect x="560" y="60" width="240" height="120" rx="8" fill="#f0fff4" stroke="#2f855a"/>
+    <text x="680" y="82" text-anchor="middle" font-size="13" font-weight="700">Phase 3 · 决策 fork</text>
+    <text x="680" y="100" text-anchor="middle" font-size="11" fill="#555">Decision Fork</text>
+    <text x="680" y="124" text-anchor="middle" font-size="11">⏸ 待 Phase 2 结果</text>
+    <text x="680" y="142" text-anchor="middle" font-size="11">≥1/3 strict → 训练值得</text>
+    <text x="680" y="158" text-anchor="middle" font-size="11">&lt;1/3 → 弃坑</text>
+  </g>
+  <line x1="800" y1="120" x2="830" y2="120" stroke="#444" stroke-width="2" marker-end="url(#arr2)"/>
+  <g>
+    <rect x="830" y="60" width="240" height="120" rx="8" fill="#fed7d7" stroke="#c53030"/>
+    <text x="950" y="82" text-anchor="middle" font-size="13" font-weight="700">Phase 4 · 训练 (可选)</text>
+    <text x="950" y="100" text-anchor="middle" font-size="11" fill="#555">Train (Optional)</text>
+    <text x="950" y="124" text-anchor="middle" font-size="11">⏸ 待 Phase 3</text>
+    <text x="950" y="142" text-anchor="middle" font-size="11">autoDL H100 LoRA r=64</text>
+    <text x="950" y="158" text-anchor="middle" font-size="11">~¥200-500 / 10k step</text>
+    <text x="950" y="174" text-anchor="middle" font-size="11" fill="#888">~3-5h</text>
+  </g>
+</svg>
+</div>
+
+<h3>5.1 Phase 2 工程量拆解 <span class="en">(Phase 2 breakdown)</span></h3>
+
+<table>
+<tr><th>子任务</th><th>状态</th><th>工程量</th><th>说明</th></tr>
+<tr><td>新建 <code>dreamzero</code> conda env (python 3.11)</td><td>✅</td><td>30 min</td><td>装 torch 2.7.1+cu128 + bnb + transformers + diffusers 0.30 + peft 0.5 + dreamzero --no-deps + 一堆 robot deps</td></tr>
+<tr><td>NF4 stream load + forward 验证脚本</td><td>✅</td><td>2h</td><td><code>wan14b_nf4_forward.py</code>（含 5 个 hack）</td></tr>
+<tr><td>装 flash-attn（pre-built wheel 或 source build）</td><td>⏳</td><td>30 min – 1h</td><td>4090 sm_89，<code>MAX_JOBS=4</code> 编译 ~30 min</td></tr>
+<tr><td>下 UMT5-XXL + CLIP ViT-H weights</td><td>⏳</td><td>~30 min</td><td>UMT5 ~10GB + CLIP 4.8GB（CLIP 已在 Wan2.1 repo 里）</td></tr>
+<tr><td>包 inference server wrapping Wan2.1 + LoRA + UMT5 + CLIP + VAE</td><td>⏳</td><td>~1 day</td><td>核心 hack：去掉 distributed primitives，加 LoRA load + Vizuara config 重映射（绝对路径 <code>/workspace/checkpoints/</code> → 本地）</td></tr>
+<tr><td>LeIsaac sim 侧 client（参考 <code>server/eval_gr00t.sh</code>）</td><td>⏳</td><td>~2h</td><td>action_horizon=24, action_dim=6 (SO-101) vs Vizuara 训练的 action_dim=32（pad/unpad）</td></tr>
+<tr><td>跑 6 round eval + 记录</td><td>⏳</td><td>~1h</td><td>Vizuara LoRA forward ~25s/inference × 24 action × 120s episode × 6 round ≈ 2-3h wall</td></tr>
+</table>
+
+<h2>6. 推理速度 <span class="en">(Inference Speed)</span></h2>
+
+<table>
+<tr><th>硬件 / 配置</th><th>step time</th><th>4 step denoise</th><th>实时 Hz</th><th>来源</th></tr>
+<tr><td>GB200（论文 best）</td><td>~150 ms</td><td>0.6 s</td><td><b>7 Hz</b></td><td>官方 README</td></tr>
+<tr><td>H100 ×2 TP（官方 baseline）</td><td>~750 ms</td><td>3 s</td><td><b>~0.3 Hz</b></td><td>官方 README</td></tr>
+<tr><td>4090 单卡 + flash-attn（预估）</td><td>~1.5 s</td><td>6 s</td><td>~0.15 Hz</td><td>外推</td></tr>
+<tr><td><b>4090 单卡 + torch SDPA</b>（实测）</td><td><b>6.3 s</b></td><td>~25 s</td><td><b>0.04 Hz</b></td><td>2026-05-21 实测</td></tr>
+</table>
+
+<div class="warn">
+<b>结论：</b>4090 上 DreamZero <b>不可能闭环实时控制 7 Hz</b>。但对 LeIsaac sim 来说，sim 本身可以暂停等 inference（不像真机），<b>120 s episode + 24 action chunk + 6 round eval 总耗时 ~2-3 小时是可接受的</b>。
+</div>
+
+<h2>7. 相关文件 <span class="en">(Related Files)</span></h2>
+
+<table>
+<tr><th>路径</th><th>用途</th></tr>
+<tr><td><code>LeIsaac/scripts/inference/dreamzero/wan14b_nf4_forward.py</code></td><td>NF4 quantize + forward 验证脚本（本文档 §3 的 5 个 hack 都在里面）</td></tr>
+<tr><td><code>LeIsaac/scripts/inference/dreamzero/run_fwd.log</code></td><td>最新一次实测 log（含 step time / weights / peak）</td></tr>
+<tr><td><code>server/dreamzero_leisaac/</code></td><td>(待写) Phase 2 inference server 目录</td></tr>
+<tr><td><code>server/eval_gr00t.sh</code></td><td>参考 — eval client 调用 server 的模板</td></tr>
+<tr><td><code>/home/david/work/dreamzero-repo/</code></td><td>NVIDIA DreamZero 官方源码（已 clone）</td></tr>
+<tr><td><code>~/.cache/huggingface/hub/models--Wan-AI--Wan2.1-I2V-14B-480P</code></td><td>77 GB Wan2.1-I2V base weights（已下载）</td></tr>
+<tr><td><code>~/.cache/huggingface/hub/models--Vizuara--dreamzero-so101-lora</code></td><td>SO-101 LoRA 217 MB（已下载）</td></tr>
+</table>
+
+<h2>8. 关联 memory & 文档 <span class="en">(Cross-References)</span></h2>
+
+<ul>
+<li><b>dreamzero-nf4-vram-verified</b> — 本次实测 memory，含完整脚本路径 + 5 个 hack 说明</li>
+<li><b>fastwam-qlora-finetune</b> — 同源失败教训：14B / 5B Wan + 50 demo = overfit</li>
+<li><b>leisaac-policy-comparison</b> — leaderboard，DreamZero 还没接入</li>
+<li><code>LeIsaac/docs/training/fastwam_qlora_inference_debug.html</code> — Wan-family inference debug 完整案例</li>
+<li><code>LeIsaac/docs/training/gr00t_finetune_pick_orange.html</code> — 24G 显存压缩 patch 链参考</li>
+</ul>
+
+</body>
+</html>
