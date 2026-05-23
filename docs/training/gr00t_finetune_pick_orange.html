@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8" />
-<title>GR00T N1.5 / N1.6 微调计划 — LeIsaac SO-101 PickOrange</title>
+<title>GR00T N1.5 / N1.6 / N1.7 微调计划 — LeIsaac SO-101 PickOrange</title>
 <style>
   :root {
     --bg: #fafafa; --fg: #1a1a1a; --muted: #555;
@@ -36,21 +36,25 @@
 </head>
 <body>
 
-<h1>GR00T N1.5 / N1.6 微调计划</h1>
-<p class="meta">SO-101 PickOrange · LeIsaac benchmark champion (N1.6 🥇 2/3) · 2026-05-18 · 2026-05-20 v2 (X-VLA 经验回灌 + Isaac-GR00T native path 锁定)</p>
-<p class="en">NVIDIA Isaac GR00T N1.5/N1.6 — Eagle2 VLM + multi-embodiment flow-matching DiT action head, ~3B params.
-Already top of the leaderboard via the LightwheelAI public ckpt; the next obvious lever is in-house finetune to push from 6/9 to 8/9 oranges.</p>
+<h1>GR00T N1.5 / N1.6 / N1.7 微调计划</h1>
+<p class="meta">SO-101 PickOrange · LeIsaac benchmark champion (N1.7 🥇 14/15, N1.6 自训 13/15) · 2026-05-18 → 2026-05-22 v3 (N1.7 hi-space ckpt 验证完成 + 微调计划补充)</p>
+<p class="en">NVIDIA Isaac GR00T N1.5 / N1.6 / N1.7 — VLM + multi-embodiment flow-matching DiT action head, ~3B params (N1.7 ≈ 5B due to Cosmos-Reason2-2B backbone).
+N1.7 hi-space public ckpt now tops the leaderboard at 14/15; the next lever is in-house finetune from N1.7 base.</p>
 
 <h2>0. TL;DR</h2>
 <div class="callout good">
-<b>GR00T-N1.6 是当前 leaderboard 🥇</b>（LightwheelAI ckpt 实测 2/3 strict round, 6/9 oranges, 96s avg, 17.3 GB VRAM）。
-架构：<b>Eagle2-VLM (~2.4B, frozen) + Flow-matching Action DiT (~600M, trainable)</b>，3B 总参数。
-N1.5 是上一代（0/3, 4/9，但已 commit 落盘 8 颗其中 4 strict）；N1.6 用更新的 Eagle2.5 backbone + 优化 action head。
+<b>三代横评 (5-round 15-episode strict, 2026-05-21 leaderboard)</b>：
+<ul>
+<li><b>N1.7 hi-space ckpt — 🥇 14/15 oranges</b>（2/3 → 3/3 env, 104s avg, action_horizon=<b>40</b>, Cosmos-Reason2-2B backbone）</li>
+<li><b>N1.6 自训 ckpt-6500 — 13/15</b>（≈ N1.7 但慢 10%, action_horizon=<b>50</b>）</li>
+<li><b>N1.5 LightwheelAI — 8/15</b>（Eagle2 老 backbone, action_horizon=16 旧默认）</li>
+</ul>
+架构家族：<b>VLM (frozen) + Flow-matching Action DiT (trainable)</b>，N1.5 用 Eagle2 (~2.4B)、N1.6 升级 Eagle 2.5、<b>N1.7 换成 Cosmos-Reason2-2B + 新 action head（总参数 ≈ 5B）</b>。
 <br/><br/>
-<b>路径决策（2026-05-20 v2）</b>：用 <b>Isaac-GR00T native <code>launch_finetune.py</code></b>，<b>不</b>走 lerobot groot wrapper。
-理由：lerobot wrapper 硬编码了 <code>GR00TN15</code>（N1.6 不兼容）；native 路径是 LightwheelAI SOTA ckpt 的同款 pipeline；推理直接复用 <code>server/start_server.sh --gr00t-only</code> + <code>nvidia/GR00T-N1.6-3B</code>，0 协议改动。
+<b>路径决策（2026-05-22 v3）</b>：仍用 <b>Isaac-GR00T native <code>launch_finetune.py</code></b>（now under <code>dependencies/Isaac-GR00T</code> submodule）。
+N1.7 base 微调可复用 N1.6 同款 launcher，只需调三处：<code>--base_model_path nvidia/GR00T-N1.7-3B</code>、<code>action_horizon=40</code>、确保 Cosmos-Reason2-2B HF access granted。
 <br/><br/>
-<b>下一步</b>：N1.6 base 单 4090 全参 bf16 微调（trainable = projector + DiT + top4 LLM layers ≈ 600M），save_steps=500，自动 6-round eval-on-save，预期 2/3 → 3/3。<b>不上 LoRA</b>（Isaac-GR00T native 不暴露 lora_rank；显存够，不必）。
+<b>下一步</b>：N1.6 自训 ckpt-6500 已 13/15 接近 SOTA → <b>下一站 N1.7 base finetune</b>，目标 14/15 → 15/15。N1.7 显存预算 ≈ N1.6 但 backbone 大一档（5B vs 3B），可能需要 batch_size halved。
 </div>
 
 <div class="callout">
@@ -239,12 +243,27 @@ N1.5 是上一代（0/3, 4/9，但已 commit 落盘 8 颗其中 4 strict）；N1
 <h2>2. 当前 benchmark 实测</h2>
 
 <table>
-<tr><th>ckpt</th><th>来源</th><th>Strict Rounds</th><th>🍊 / 9</th><th>Avg time</th><th>Peak VRAM</th></tr>
-<tr><td>LightwheelAI N1.5</td><td>HF</td><td>0/3</td><td>4/9</td><td>105s</td><td>16.2 GB</td></tr>
-<tr><td><b>LightwheelAI N1.6</b></td><td><b>HF</b></td><td><b>2/3</b></td><td><b>6/9</b></td><td><b>96s</b></td><td><b>17.3 GB</b></td></tr>
+<tr><th>ckpt</th><th>来源</th><th>Strict Rounds (5-round)</th><th>🍊 / 15</th><th>Avg time</th><th>action_horizon</th><th>Peak VRAM (inference)</th></tr>
+<tr><td>LightwheelAI N1.5</td><td>HF</td><td>—</td><td>8/15</td><td>—</td><td>16 (legacy)</td><td>16.2 GB</td></tr>
+<tr><td>LightwheelAI N1.6</td><td>HF</td><td>—</td><td>—</td><td>96s</td><td>50</td><td>17.3 GB</td></tr>
+<tr><td><b>自训 N1.6 ckpt-6500</b></td><td>本地 LoRA</td><td>—</td><td><b>13/15</b></td><td>~110s</td><td>50</td><td>~17 GB</td></tr>
+<tr><td><b>hi-space N1.7</b></td><td><b>HF (gated)</b></td><td><b>3/3 env</b></td><td><b>🥇 14/15</b></td><td><b>104s</b></td><td><b>40</b></td><td><b>~22 GB</b></td></tr>
 </table>
 
-<p>N1.6 是 <b>leaderboard 🥇</b>，但显然 6/9 不是天花板 —— 还差 3 颗。下一步该自训。</p>
+<p>N1.7 是 <b>leaderboard 🥇</b>（14/15 oranges），但仍差 1 颗。N1.7 base 自训是清晰下一步。</p>
+
+<h3>2.5 N1.7 架构差异 <span class="en">(vs N1.5/N1.6)</span></h3>
+
+<table>
+<tr><th>组件</th><th>N1.5 / N1.6</th><th>N1.7</th><th>影响</th></tr>
+<tr><td>VLM backbone</td><td>Eagle2 / Eagle 2.5 (~2.4B)</td><td><b>Cosmos-Reason2-2B</b>（NVIDIA Cosmos 家族，2B 参数但语义/物理理解更强）</td><td>backbone 略小但 reasoning ↑；HF gated repo，需 Request access 才能下载</td></tr>
+<tr><td>HF repo ID</td><td><code>nvidia/GR00T-N1.5-3B</code> / <code>nvidia/GR00T-N1.6-3B</code></td><td><code>nvidia/GR00T-N1.7-3B</code> + 隐式 <code>nvidia/Cosmos-Reason2-2B</code></td><td>下载前 HF token 必须有 Cosmos-Reason2 access</td></tr>
+<tr><td>action_horizon (chunk)</td><td>50</td><td><b>40</b></td><td>open-loop 缩短 (1.67s → 1.33s @ 30Hz)，更高频重规划，抓握时机更稳</td></tr>
+<tr><td>Action DiT</td><td>cross-attn flow-matching, ~500M</td><td>同范式但 head 重训以匹配 Cosmos 输出维度</td><td>训练时 trainable 部分基本不变</td></tr>
+<tr><td>Wire 协议（推理 server）</td><td>plain msgpack</td><td><b>mnp（msgpack-numpy）</b></td><td><code>server/start_server.sh</code> 的 GR00T server 需要 N1.6→N1.7 切换时改 codec；客户端 <code>policy_inference.py</code> 已兼容</td></tr>
+<tr><td>总参数</td><td>~3B</td><td>~5B（Cosmos-Reason2 + DiT 略大）</td><td>训练显存预算从 22 GB → ~30 GB，<b>单 4090 必须开 8-bit optim + grad_ckpt + 减 batch</b></td></tr>
+<tr><td>仓库路径</td><td><code>~/work/Isaac-GR00T</code></td><td><b><code>dependencies/Isaac-GR00T</code></b>（已作为 submodule 纳入 isaaclab-experience）</td><td>训练 launcher 路径要更新</td></tr>
+</table>
 
 <h2>3. 微调计划 — Isaac-GR00T native finetune from N1.6 base</h2>
 
@@ -409,12 +428,68 @@ CUDA_VISIBLE_DEVICES=0 uv run --extra=gpu python \
 </ol>
 <p>训练不中断；eval 串行在 server pause 间隙跑（每 ckpt ≈ 90s × 6 = 9 min 评测；训练每 500 step ≈ 25-30 min @ 4090，eval 不会撞车）。</p>
 
+<h3>3.7 N1.7 微调差异点 <span class="en">(delta over N1.6 recipe)</span></h3>
+
+<div class="callout good">
+<b>核心思路</b>：N1.6 微调配方已经把单 4090 显存调到 ≈ 22 GB / 24 GB 上限（参 §3.3.1）。N1.7 backbone 大 1-2 GB，<b>不能照搬同 batch</b>。下面只列 delta，其它（prompt 锁、不加外置 aug、不做 EMA/TAE、save_steps=500、auto-eval-on-save）全部沿用 §3.1-3.5。
+</div>
+
+<table>
+<tr><th>CLI flag</th><th>N1.6 推荐</th><th>N1.7 推荐</th><th>理由</th></tr>
+<tr><td><code>--base_model_path</code></td><td><code>nvidia/GR00T-N1.6-3B</code></td><td><b><code>nvidia/GR00T-N1.7-3B</code></b></td><td>HF access 必须先 granted（Cosmos-Reason2-2B gated）</td></tr>
+<tr><td><code>--global_batch_size</code></td><td>16 (per_step=2)</td><td><b>8 (per_step=1)</b></td><td>Cosmos backbone 大 ~2 GB params + activations，必须减半；grad_accum 加倍补回有效 batch</td></tr>
+<tr><td><code>--gradient_accumulation_steps</code></td><td>8</td><td><b>16</b></td><td>有效 batch 仍 ≈ 16，loss curve 可比</td></tr>
+<tr><td><code>action_horizon</code> (modality.json)</td><td>50</td><td><b>40</b></td><td>N1.7 base 训练时就是 40，推理 chunk 也必须 40，否则 action head 维度不对</td></tr>
+<tr><td><code>--max_steps</code></td><td>10000</td><td>10000（先持平）</td><td>warm start 仍是 14/15，预计 5-7k step 收敛</td></tr>
+<tr><td><code>--learning_rate</code></td><td>1e-4</td><td>1e-4（持平）</td><td>无 N1.7 公开调参经验，先 inherit；若早期 loss 抖动严重再降 5e-5</td></tr>
+<tr><td>训练时 trainable 子集</td><td>projector + DiT + top4 LLM layers</td><td>同上（<code>tune_top_llm_layers=4</code>）</td><td>Cosmos-Reason2 backbone 大，但顶 4 层 trainable 参数量级与 Eagle 2.5 相近</td></tr>
+<tr><td>显存 budget</td><td>~22 GB / 24 GB</td><td><b>~23.5 GB / 24 GB</b></td><td>edge case；如果训练 OOM 再砍 grad_accum=32 / per_step=0.5（等价 micro-batching）</td></tr>
+<tr><td>推理 wire 协议</td><td>plain msgpack</td><td><b>mnp (msgpack-numpy)</b></td><td><code>server/start_server.sh --gr00t-only</code> 需要 detect base_model 自动切 codec（已在 server 侧实现）</td></tr>
+</table>
+
+<h4>3.7.1 N1.7 launcher 草稿（基于 §3.4 改 3 行）</h4>
+
+<pre># LeIsaac/scripts/finetune/gr00t/train_n17.sh — 与 train.sh 的 diff
+GR00T_ROOT="${HOME}/work/isaaclab-experience/dependencies/Isaac-GR00T"   # submodule 路径
+OUTPUT_DIR=".../outputs/gr00t-n17-leisaac-pick-orange"
+GLOBAL_BATCH="${GLOBAL_BATCH:-8}"
+GRAD_ACCUM="${GRAD_ACCUM:-16}"          # per-step batch = 8/16 = 0.5 → 用 micro-batch=1 + accum=8
+
+CUDA_VISIBLE_DEVICES=0 uv run --extra=gpu python \
+    gr00t/experiment/launch_finetune.py \
+        --base_model_path nvidia/GR00T-N1.7-3B \
+        --dataset_path "$DATASET_DIR" \
+        --modality_config_path "$MODALITY_CFG_N17" \   # action_horizon=40
+        --embodiment_tag NEW_EMBODIMENT \
+        --output_dir "$OUTPUT_DIR" \
+        --save_steps 500 --save_total_limit 25 \
+        --max_steps 10000 \
+        --learning_rate 1e-4 \
+        --global_batch_size "$GLOBAL_BATCH" \
+        --gradient_accumulation_steps "$GRAD_ACCUM" \
+        --num_gpus 1 \
+        --dataloader_num_workers 4
+</pre>
+
+<h4>3.7.2 N1.7 准入检查清单</h4>
+
+<ol>
+<li><b>HF access</b>: 访问 <code>huggingface.co/nvidia/Cosmos-Reason2-2B</code> 点 Request access；通过后 <code>huggingface-cli whoami</code> 验证 token 有效</li>
+<li><b>Submodule 就位</b>: <code>git submodule update --init dependencies/Isaac-GR00T</code>；checkout 到含 N1.7 launcher 的 tag（README 标注的 commit）</li>
+<li><b>Modality JSON 更新</b>: 复制 N1.6 的 <code>leisaac_config.py</code> 到 <code>leisaac_config_n17.py</code>，<code>action_horizon=50 → 40</code>，其它不变</li>
+<li><b>Server codec check</b>: 跑 <code>server/start_server.sh --gr00t-only GR00T_MODEL_PATH=nvidia/GR00T-N1.7-3B</code>，确认 server 端识别 N1.7 并切到 mnp；客户端跑一次 1-round eval 验证 wire 协议</li>
+<li><b>Smoke 50 step</b>: 必跑，OOM 早暴露；如 OOM 立刻降 batch / 关 fp32 master</li>
+</ol>
+
 <h2>4. 风险清单</h2>
 
 <table>
 <tr><th>风险</th><th>概率</th><th>影响</th><th>缓解</th></tr>
+<tr><td><b>🔴 N1.7 训练 OOM (5B backbone @ 24GB)</b></td><td>高</td><td>训练直接挂</td><td>per_step=1 + grad_accum=16 + paged_adamw_8bit + grad_ckpt + 关 bf16 master fp32；如还 OOM 改 LoRA-only</td></tr>
+<tr><td><b>🟡 Cosmos-Reason2-2B HF gated, access pending</b></td><td>中</td><td>训练 block</td><td>提前 Request access；fallback 用 N1.6 自训 ckpt-6500 (已 13/15) 继续训</td></tr>
+<tr><td><b>🟡 N1.7 mnp wire 协议 server 端兼容 bug</b></td><td>中</td><td>eval pipeline 挂</td><td>跑 hi-space ckpt 做 reference 验证 server；如 N1.6 server 不识别 N1.7 dtype 写一个 N1.7-specific server flag</td></tr>
 <tr><td><b>🟡 N1.6 base 的 cat_id 预训练偏置盖过我们 LoRA</b></td><td>中</td><td>中</td><td>用 <code>new_embodiment</code> tag 新 cat_id；避免选 SO-101 已知 tag（如果有）</td></tr>
-<tr><td><b>🟡 chunk=50 open-loop 1.67s 抓握时机不稳</b></td><td>已观察</td><td>中</td><td>n_action_steps=16 重规划；如还不够再砍到 8</td></tr>
+<tr><td><b>🟡 chunk=40/50 open-loop 抓握时机不稳</b></td><td>已观察</td><td>中</td><td>N1.7 chunk=40 已比 N1.6 短；如还不够再 sweep n_action_steps {8, 16, 25, 40}</td></tr>
 <tr><td>🟡 SO-101 6D state pad 到 64 D 引入大量 0 通道</td><td>—</td><td>低</td><td>同其他 baseline，pad 默认无害</td></tr>
 <tr><td>🟢 GPU OOM</td><td>低</td><td>—</td><td>bf16 LoRA 头顶 16 GB</td></tr>
 <tr><td>🟢 lerobot trainer 兼容</td><td>低</td><td>低</td><td>同 dataset 已跑过 SmolVLA / DP / ACT</td></tr>
@@ -422,6 +497,8 @@ CUDA_VISIBLE_DEVICES=0 uv run --extra=gpu python \
 </table>
 
 <h2>5. Phases</h2>
+
+<h3>5.1 N1.6 微调流程（已跑通，ckpt-6500 = 13/15）</h3>
 
 <table>
 <tr><th>Phase</th><th>步骤</th><th>时间预算</th><th>X-VLA 经验校准</th></tr>
@@ -434,7 +511,23 @@ CUDA_VISIBLE_DEVICES=0 uv run --extra=gpu python \
 <tr><td>P5</td><td>Best ckpt 跑 benchmark-aligned 3 round × 120s sim × 180s wall_cap，更新 leaderboard</td><td>~30min</td><td>同其他 baseline 条件</td></tr>
 </table>
 
-<p><b>总预算 ≈ 6-9h</b>，跟 X-VLA 同档；起点就 2/3 → <b>风险最低、ROI 最高的下一个动作</b>。</p>
+<p><b>N1.6 总预算 ≈ 6-9h</b>。实测 ckpt-6500 = <b>13/15 strict</b>，仅次于 N1.7 hi-space 14/15。</p>
+
+<h3>5.2 N1.7 微调流程（待跑，目标 14/15 → 15/15）</h3>
+
+<table>
+<tr><th>Phase</th><th>步骤</th><th>时间预算</th><th>新增风险</th></tr>
+<tr><td>Q0a</td><td><b>HF Cosmos-Reason2-2B access</b> Request → wait approval</td><td>1h-3 day (人为)</td><td>🔴 阻塞项；提前提交</td></tr>
+<tr><td>Q0b</td><td>submodule 同步 <code>dependencies/Isaac-GR00T</code> checkout 到含 N1.7 launcher 的 commit；下载 <code>nvidia/GR00T-N1.7-3B</code> (~10 GB)</td><td>~30min</td><td>下载带宽</td></tr>
+<tr><td>Q0c</td><td>复制 <code>leisaac_config.py</code> → <code>leisaac_config_n17.py</code>，改 <code>action_horizon=40</code></td><td>~5min</td><td>—</td></tr>
+<tr><td>Q1</td><td><b>Server-side wire 协议验证</b>：跑 hi-space N1.7 ckpt 走我们的 server，确认 mnp codec 与 client 端 sync；1-round closed-loop 必须 success</td><td>~30min</td><td>🟡 wire 兼容</td></tr>
+<tr><td>Q2</td><td>Smoke 50 step：<b>per_step=1 + grad_accum=16 + paged_adamw_8bit</b> 起步；监控峰值显存 ≤ 23.8 GB</td><td>~1h</td><td>🔴 OOM；OOM 时连续降 batch / 关 fp32 master / 砍 grad_ckpt</td></tr>
+<tr><td>Q3</td><td>Train 10k step + save_steps=500</td><td>~5-7h（backbone 大，per-step 慢 ~30%）</td><td>—</td></tr>
+<tr><td>Q4</td><td>Auto-eval-on-save：N1.7 chunk=40，eval 单 ep 略快</td><td>训练并行 (~8 min/ckpt × 20 = 2.7h)</td><td>—</td></tr>
+<tr><td>Q5</td><td>Top-3 ckpt × 12-round 复测 → best ckpt 跑 benchmark-aligned 5-round → 更新 leaderboard</td><td>~1.5h</td><td>—</td></tr>
+</table>
+
+<p><b>N1.7 总预算 ≈ 8-12h（不含 HF access 等待）</b>。如果 14/15 推不动，下一步是双重 SOTA 加权融合（hi-space + 自训）。</p>
 
 <h2>6. 与 X-VLA 的取舍</h2>
 
@@ -449,14 +542,81 @@ CUDA_VISIBLE_DEVICES=0 uv run --extra=gpu python \
 
 <p><b>结论</b>：<b>GR00T-N1.6 LoRA 比 X-VLA 更值得先做</b> — 起点高、工程便宜、上限明确。X-VLA 作为"架构探索 + 多 family benchmark 多样性"价值，但 production 优先级低于 GR00T finetune。</p>
 
-<h2>7. 关联</h2>
+<h2>7. 实测数据 · Run telemetry <span class="en">(populated post-train)</span></h2>
+
+<p class="meta">数据源：<code>monitor.csv</code>（resource_monitor.sh 每 15s 一行）+ HF Trainer log_history（step / loss / lr / grad_norm）。
+训练完成后用 <code>LeIsaac/scripts/cloud/autodl/analyze_run.sh</code> 自动从 CSV+log 生成下面的 SVG 图和统计表。</p>
+
+<h3>7.1 Run metadata</h3>
+
+<table id="run-meta">
+<tr><th>项</th><th>值</th></tr>
+<tr><td>GPU</td><td><i>填入 nvidia-smi name + VRAM</i></td></tr>
+<tr><td>GPU_PROFILE</td><td><i>auto-detected 值 (small24 / big48 / big96)</i></td></tr>
+<tr><td>per-step batch × grad_accum = global_batch</td><td><i>填入</i></td></tr>
+<tr><td>optimizer</td><td><i>adafactor / adamw_torch</i></td></tr>
+<tr><td>gradient_checkpointing</td><td><i>True / False</i></td></tr>
+<tr><td>BASE_MODEL</td><td><i>local path or HF id</i></td></tr>
+<tr><td>SAVE_ONLY_MODEL / LOSS_PRUNE_TOP_K</td><td><i>填入</i></td></tr>
+<tr><td>total wall time</td><td><i>填入</i></td></tr>
+<tr><td>actual step throughput</td><td><i>step/s, 从 log 计算</i></td></tr>
+</table>
+
+<h3>7.2 资源峰值 / 平均</h3>
+
+<table id="run-resource">
+<tr><th>指标</th><th>峰值 (peak)</th><th>均值 (mean)</th><th>结论</th></tr>
+<tr><td>GPU util %</td><td>—</td><td>—</td><td><i>&lt;70% 说明 IO bottleneck；&gt;95% 说明 GPU 是瓶颈，可减 IO 等待</i></td></tr>
+<tr><td>VRAM used (GiB / total)</td><td>—</td><td>—</td><td><i>&gt;90% 下次降 batch；&lt;50% 下次升 batch</i></td></tr>
+<tr><td>disk %</td><td>—</td><td>—</td><td><i>验证 LossDrivenPrune 起效（&lt;90% 全程）</i></td></tr>
+</table>
+
+<h3>7.3 训练曲线 <span class="en">(loss / lr / VRAM over time)</span></h3>
+
+<div id="run-charts">
+<!-- analyze_run.sh 会在此处插入 3 个 inline SVG:
+     - loss-vs-step line chart (smoothed window=20)
+     - vram-vs-step line chart
+     - gpu_util-vs-step bar/area chart
+-->
+<p class="meta"><i>训练完成后由 analyze_run.sh 自动填充。</i></p>
+</div>
+
+<h3>7.4 Ckpt 评测分数 <span class="en">(eval-on-save + best ckpt选择)</span></h3>
+
+<table id="run-ckpt-eval">
+<tr><th>step</th><th>train_loss</th><th>eval rounds × ep</th><th>oranges / total</th><th>strict env</th><th>avg time</th><th>kept by prune?</th></tr>
+<tr><td colspan="7"><i>训练完成后填入；最后一行高亮 best ckpt</i></td></tr>
+</table>
+
+<h3>7.5 与 hi-space N1.7 对比 <span class="en">(baseline reference)</span></h3>
+
+<table id="run-comparison">
+<tr><th>来源</th><th>training steps</th><th>final train_loss</th><th>strict eval</th><th>train wall time</th><th>GPU</th></tr>
+<tr><td>hi-space N1.7</td><td>6000</td><td>0.030</td><td>14/15 (5-round)</td><td>—</td><td>—（未公开）</td></tr>
+<tr><td>自训 N1.7 (本次)</td><td><i>填入</i></td><td><i>填入</i></td><td><i>5-round eval</i></td><td><i>填入</i></td><td>RTX PRO 6000 96 GB</td></tr>
+</table>
+
+<h3>7.6 效率改进建议 <span class="en">(extracted lessons → next run)</span></h3>
+
+<p class="meta"><i>训完结合上述数据填写：</i></p>
+<ul>
+<li><i>例：VRAM 峰值 60 / 96 GB → 下次可升到 per-step=16 (global_batch=64)，仍留 20% 余量</i></li>
+<li><i>例：GPU util 平均 65% → IO bottleneck，下次 dataloader_num_workers 8→12 或 prefetch_factor 调高</i></li>
+<li><i>例：step time = 3.5s/step，10k step 估 9.7h vs 实际 N h → 差异原因</i></li>
+</ul>
+
+<h2>8. 关联</h2>
 <ul>
 <li><code>leisaac-policy-comparison</code> memory — 多策略横评主线</li>
+<li><code>gr00t-n17-hi-space</code> memory — hi-space N1.7 公开 ckpt 实测 (2/3 env, 8/9 oranges, action_horizon=40)</li>
+<li><code>leisaac-5round-leaderboard-2026-05-21</code> memory — 5-round 全 baseline 横评（N1.7=14/15, 自训 N1.6=13/15, ...）</li>
+<li><code>per-model-action-horizon</code> memory — N1.7=40 / N1.6=50 / ACT=100 / SmolVLA=50 / X-VLA=32 / π0.5=50</li>
 <li><a href="xvla_finetune_plan.html"><code>xvla_finetune_plan.html</code></a> — 同 cross-embodiment 思路但科研味更浓</li>
 <li><a href="smolvla_finetune_pick_orange.html"><code>smolvla_finetune_pick_orange.html</code></a> — 同 cross-attn flow-matching 范式</li>
 <li><a href="pi05_finetune_pick_orange.html"><code>pi05_finetune_pick_orange.html</code></a> — 同 VLM + action expert 范式</li>
-<li><code>~/work/Isaac-GR00T/</code> — N1.6 官方仓库（不再走，全部用 lerobot 集成）</li>
-<li><code>~/work/Isaac-GR00T-N1.5/</code> — N1.5 仓库（历史）</li>
+<li><code>dependencies/Isaac-GR00T</code> — N1.6 / N1.7 官方仓库（已 submodule 化）</li>
+<li>HF gated repo: <code>huggingface.co/nvidia/Cosmos-Reason2-2B</code>（N1.7 backbone，必须 Request access）</li>
 </ul>
 
 </body>

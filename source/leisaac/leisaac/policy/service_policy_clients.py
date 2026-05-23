@@ -66,20 +66,96 @@ class Gr00tServicePolicyClient(ZMQServicePolicy):
             }
         """
 
-        # get the action chunk via the policy server
-        action_chunk = self.call_endpoint("get_action", obs_dict)
+        # GR00T server launched with --use-sim-policy-wrapper expects:
+        #   - data envelope: {"observation": flat_obs}
+        #   - flat obs with shape (B, T, H, W, C) for video and (B, T, D) for state
+        #     (T = obs horizon delta_indices length, typically 1 for SO-101)
+        # Need to add a T=1 axis to each modality before sending.
+        wrapped_obs = {}
+        for k, v in obs_dict.items():
+            if isinstance(v, np.ndarray):
+                if k.startswith("video."):
+                    # (B, H, W, C) -> (B, 1, H, W, C)
+                    wrapped_obs[k] = v[:, None].astype(np.uint8) if v.ndim == 4 else v.astype(np.uint8)
+                elif k.startswith("state."):
+                    # (B, D) -> (B, 1, D), float32 (wrapper requires float32 not float64)
+                    wrapped_obs[k] = v[:, None].astype(np.float32) if v.ndim == 2 else v.astype(np.float32)
+                else:
+                    wrapped_obs[k] = v
+            else:
+                wrapped_obs[k] = v
+
+        action_chunk = self.call_endpoint("get_action", {"observation": wrapped_obs})
+        if isinstance(action_chunk, dict) and "error" in action_chunk and "action.single_arm" not in action_chunk:
+            raise RuntimeError(f"GR00T server error: {action_chunk['error']}")
 
         """
-            Example of action_chunk for single arm task:
-            action_chunk = {
-                "action.single_arm": np.zeros((1, 5)),
-                "action.gripper": np.zeros((1, 1)),
-            }
+            wrapper wire: list[1+] of dict
+              {"action.single_arm": (B, T, 5), "action.gripper": (B, T, 1)}
+            where T = action_horizon (N1.5/6:16, N1.7:40) and B=1 for single env.
         """
-        concat_action = np.concatenate(
-            [action_chunk["action.single_arm"], action_chunk["action.gripper"]],
-            axis=1,
-        )
+        # DEBUG: dump action_chunk structure once
+        import pickle as _pkl, os as _os
+        _dbg_path = "/tmp/gr00t_action_chunk_dbg.pkl"
+        if not _os.path.exists(_dbg_path):
+            try:
+                with open(_dbg_path, "wb") as _f:
+                    _pkl.dump(action_chunk, _f)
+                print(f"[gr00t-client-DEBUG] saved action_chunk to {_dbg_path}; type={type(action_chunk).__name__}", flush=True)
+                if isinstance(action_chunk, list):
+                    print(f"[gr00t-client-DEBUG]  list len={len(action_chunk)}, [0] type={type(action_chunk[0]).__name__}", flush=True)
+                    if isinstance(action_chunk[0], dict):
+                        for k, v in list(action_chunk[0].items())[:6]:
+                            print(f"[gr00t-client-DEBUG]   [0][{k!r}] type={type(v).__name__} preview={repr(v)[:120]}", flush=True)
+                elif isinstance(action_chunk, dict):
+                    for k, v in list(action_chunk.items())[:6]:
+                        print(f"[gr00t-client-DEBUG]  [{k!r}] type={type(v).__name__} preview={repr(v)[:120]}", flush=True)
+            except Exception as _e:
+                print(f"[gr00t-client-DEBUG] dump failed: {_e}", flush=True)
+        if isinstance(action_chunk, list):
+            action_chunk = action_chunk[0]
+        arm = action_chunk["action.single_arm"]
+        grip = action_chunk["action.gripper"]
+        # Some msgpack-numpy variants return ndarrays still wrapped as dicts
+        # ({"nd": True, ...} or {"__ndarray_class__": True, "as_npy": ...});
+        # MsgSerializer.from_bytes should already decode, but if it doesn't
+        # (e.g. bytes keys vs str keys), decode here as a safety net.
+        import msgpack_numpy as _mnp, io as _io
+        def _to_ndarray(x):
+            if isinstance(x, np.ndarray):
+                return x
+            if isinstance(x, dict):
+                # Try msgpack-numpy format (bytes-keyed dict like {b"nd": True, ...}).
+                # mnp.decode REQUIRES bytes keys — do NOT convert to str.
+                ks = set(x.keys())
+                if "nd" in ks or b"nd" in ks:
+                    if "nd" in ks:
+                        # Re-encode str keys back to bytes for mnp.decode.
+                        x = {(k.encode() if isinstance(k, str) else k): v for k, v in x.items()}
+                    return _mnp.decode(x)
+                # Try legacy __ndarray_class__ format.
+                if "__ndarray_class__" in ks or b"__ndarray_class__" in ks:
+                    key = "as_npy" if "as_npy" in x else b"as_npy"
+                    return np.load(_io.BytesIO(x[key]), allow_pickle=False)
+            if isinstance(x, dict):
+                preview = {}
+                for k, v in list(x.items())[:6]:
+                    kk = k.decode() if isinstance(k, bytes) else k
+                    if isinstance(v, (bytes, bytearray)):
+                        preview[kk] = f"<bytes len={len(v)}>"
+                    elif isinstance(v, np.ndarray):
+                        preview[kk] = f"<ndarray shape={v.shape}>"
+                    else:
+                        preview[kk] = repr(v)[:60]
+                raise TypeError(f"Unexpected action element type=dict; preview={preview}")
+            raise TypeError(f"Unexpected action element type: {type(x).__name__}")
+        arm = _to_ndarray(arm)
+        grip = _to_ndarray(grip)
+        # Squeeze leading batch dim if present.
+        if arm.ndim == 3 and arm.shape[0] == 1:
+            arm = arm[0]      # (T, 5)
+            grip = grip[0]    # (T, 1)
+        concat_action = np.concatenate([arm, grip], axis=-1)  # (T, 6) or (B, 6)
         concat_action = convert_lerobot_action_to_leisaac(concat_action)
 
         return torch.from_numpy(concat_action[:, None, :])
@@ -164,13 +240,12 @@ class Gr00t16ServicePolicyClient(ZMQServicePolicy):
         action_chunk = self.call_endpoint("get_action", obs_dict)
 
         """
-            Example of action_chunk for single arm task:
-            action_chunk = [{
-                "single_arm": np.zeros((1, 16, 5)),
-                "gripper": np.zeros((1, 16, 1)),
-            }]
+            N1.6 wire: list[dict] e.g. [{"single_arm": (1,16,5), "gripper": (1,16,1)}]
+            N1.7 wire: dict       e.g.  {"single_arm": (1,40,5), "gripper": (1,40,1)}
+            Accept both shapes; unwrap the single list element when present.
         """
-        action_chunk = action_chunk[0]
+        if isinstance(action_chunk, list):
+            action_chunk = action_chunk[0]
         concat_action = np.concatenate(
             [action_chunk["single_arm"], action_chunk["gripper"]],
             axis=-1,

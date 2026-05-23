@@ -305,10 +305,120 @@ CONDA_ENV=lerobot-v040 OUTPUT_NAME=dp-v040-fullres \
 <li><b>action normalize 检查</b>：DP 用 MIN_MAX or MEAN_STD？跟 ACT 比对</li>
 </ol>
 
-<h2>7. 关联</h2>
+<h2>7. v040-fullres 实测结果 + 真 root cause (2026-05-23)</h2>
+
+<p><b>TL;DR — DP "policy dead" 不是 model dead，是 lerobot async server 的一个 stack 空 bug。修了 bug 后 DP 能产合理 action，但 50 demo 仍学不到稳定 task。</b></p>
+
+<p><i>DP "policy dead" was a lerobot async-server bug, not a model failure. After patching, actions are valid but the model still does not learn a robust task on 50 demos.</i></p>
+
+<h3>训练过程 / Training</h3>
+
+<ul>
+<li>config: lerobot v0.4, crop_shape=null, fullres 480×640, batch=8 (OOM @ 32), n_obs_steps=2, n_action_steps=8, horizon=16, DDPM 100-step</li>
+<li>100k step ≈ 3h on RTX 4090, loss 0.5 → 0.014, cosine lr 1e-4 → ~1e-10</li>
+<li>watcher 每 10k 自动 quick eval (3-round 60s)，CSV at <code>outputs/dp-v040-fullres/auto_eval.csv</code></li>
+</ul>
+
+<h3>Watcher 3-round h=8 sweep</h3>
+
+<table border="1" cellpadding="6">
+<tr><th>step</th><th>oranges (3 round × 3)</th><th>avg_round_s</th></tr>
+<tr><td>10k-50k</td><td>0/9</td><td>70-90s</td></tr>
+<tr><td><b>60k</b></td><td><b>1/9 🟢</b></td><td>75s</td></tr>
+<tr><td><b>70k</b></td><td><b>1/9 🟢</b></td><td>93s</td></tr>
+<tr><td><b>80k</b></td><td><b>1/9 🟢</b></td><td>94s</td></tr>
+<tr><td>90k-100k</td><td>0/9</td><td>~91s</td></tr>
+</table>
+
+<p>看似 60-80k 有 "sweet spot"，避开 cosine lr decay floor。</p>
+
+<h3>5-round 验证 — 1/9 是 variance</h3>
+
+<table border="1" cellpadding="6">
+<tr><th>ckpt</th><th>h</th><th>5-round (5×3)</th><th>avg_round_s</th></tr>
+<tr><td>70k</td><td>8</td><td>0/15</td><td>183s (all wall_cap)</td></tr>
+<tr><td>70k</td><td>12</td><td>0/15</td><td>183s</td></tr>
+<tr><td>70k</td><td>16</td><td>0/15</td><td>184s</td></tr>
+</table>
+
+<p>三个 horizon × 5-round 全 0/15 = 3-round 那 1/9 是 single-ep variance。</p>
+
+<h3>真根因：lerobot async server populate_queues bug 🐛</h3>
+
+<p>Eval 启动后 server log 立刻报：</p>
+<pre>ERROR Error in StreamActions: stack expects a non-empty TensorList</pre>
+<p>Client log：</p>
+<pre>[CLIENT] no actions after 8 retries (200ms); reusing last action</pre>
+
+<p>翻代码：<code>lerobot/policies/diffusion/modeling_diffusion.py</code></p>
+
+<pre>@torch.no_grad()
+def predict_action_chunk(self, batch, noise=None):
+    # 直接 stack 空 deque → crash
+    batch = {k: torch.stack(list(self._queues[k]), dim=1) for k in batch if k in self._queues}
+    ...
+
+@torch.no_grad()
+def select_action(self, batch, noise=None):
+    # 正常路径：populate_queues 在前
+    self._queues = populate_queues(self._queues, batch)
+    ...</pre>
+
+<p><code>select_action</code> 调 <code>populate_queues</code>（自带 cold-start 复制逻辑：首帧来时复制 n_obs_steps 份填满 deque），但 async server 用的 <code>predict_action_chunk</code> 跳过了这一步 → 首次 inference 必崩。<b>v0.4 和 v0.5 都有这 bug</b>。</p>
+
+<p><i>Both v0.4 and v0.5 have this. <code>select_action</code> populates queues, but the async-server entry <code>predict_action_chunk</code> does not — so first inference with n_obs_steps&gt;1 always crashes.</i></p>
+
+<h3>One-line patch</h3>
+
+<pre>@torch.no_grad()
+def predict_action_chunk(self, batch, noise=None):
+    if self.config.image_features:
+        batch = dict(batch)
+        batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
+    self._queues = populate_queues(self._queues, batch)
+    batch = {k: torch.stack(list(self._queues[k]), dim=1) for k in self._queues if k != ACTION}
+    actions = self.diffusion.generate_actions(batch, noise=noise)
+    return actions</pre>
+
+<p>已 apply 到 <code>/home/david/work/lerobot-v040</code> editable install。建议向 upstream PR — 任何 n_obs_steps&gt;1 的 lerobot policy (DP / VQBet / 等等) async server eval 都受影响。</p>
+
+<h3>Patched 后 server 表现</h3>
+
+<pre>INFO Running inference for observation #N (must_go: False)
+INFO Preprocessing and inference took 0.6840s, action shape: torch.Size([1, 8, 6])
+INFO Action chunk #N generated | Total time: 727ms</pre>
+
+<p>合理 action 出来了（DDPM 100-step + 全 res → 727ms/chunk，client retry budget 1600ms 够），joint range ±0.6 rad 也合理。但执行后 ckpt-70k 5-round 仍 0/15 → <b>bug fix 是 necessary not sufficient</b>。</p>
+
+<h3>错过的两个假设</h3>
+
+<ol>
+<li><b>"crop_shape=(84,84) 是根因"</b> — 看 v0.4 v0.5 default 一致 + 现象一致就假设是它，没继续追 server log。crop 确实是 secondary bug 也得修，但不是 stuck @ 33s 的真因。</li>
+<li><b>"DP 学不动是数据少"</b> — bug fix 后确实学不动，但 actions 是有学到 base structure (joint motion in range)，只是无法稳定完成 task。这个跟 wsagi v0.5 公开 ckpt 0/15 一致，说明上限 ≈ 0/15。</li>
+</ol>
+
+<h3>结案</h3>
+
+<ul>
+<li>DP v040-fullres patched = <b>0/15</b>，跟 wsagi v0.5 ckpt 一致</li>
+<li><b>主要价值</b>：定位 lerobot async server stack-bug，patch fix 让所有 n_obs_steps&gt;1 lerobot policy 重获新生，可向 upstream 贡献</li>
+<li><b>下一个 DP 变种</b>：如要再试，路线建议 <code>n_obs_steps=1 + crop=null + DDIM 32-step</code>（避开 stack bug + 更快 inference），代价 10h 重训，~50% 概率 &gt; 0/15</li>
+<li><b>已加资产</b>：
+    <ul>
+    <li><code>LeIsaac/scripts/training/eval_watcher.sh</code> — auto-eval watcher</li>
+    <li><code>LeIsaac/scripts/training/lerobot_finetune.sh AUTO_EVAL=1</code> — 默认 spawn watcher</li>
+    <li><code>scripts/benchmark/run_one.sh</code> — ACT/DP 默认关 stuck-detector</li>
+    <li><code>scripts/benchmark/baselines.tsv</code> col 7 <code>extra_env</code> — per-row stuck/step_hz 覆盖</li>
+    </ul>
+</li>
+</ul>
+
+<h2>8. 关联</h2>
 <ul>
 <li><a href="dp_inference_speedup_and_dynamic_timeout.html"><code>dp_inference_speedup_and_dynamic_timeout.html</code></a> — DDIM swap 详记 + dynamic timeout</li>
 <li><a href="act_finetune_pick_orange.html"><code>act_finetune_pick_orange.html</code></a> — ACT（同款 ResNet 路线，但 transformer 解码）</li>
+<li><code>lerobot-dp-async-server-bug</code> memory — populate_queues patch 详细</li>
+<li><code>auto-eval-watcher-standard</code> memory — watcher 配置</li>
 <li><code>act-framework-drift-root-cause</code> memory — ACT v0.4.0 retrain 成功案例</li>
 <li><code>feedback-incremental-eval-during-training</code> memory — 10 等分 quick eval 强制规则</li>
 <li><code>leisaac-eval-timeout</code> memory — DDIM swap + dynamic timeout</li>

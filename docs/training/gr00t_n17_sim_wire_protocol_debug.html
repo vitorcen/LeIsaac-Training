@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>GR00T-N1.7 sim eval wire protocol root cause — 2026-05-23</title>
+<style>
+  /* Force light theme — browser dark mode can otherwise invert background while keeping text dark. */
+  :root { color-scheme: light; }
+  html, body { background: #ffffff; }
+  body { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; max-width: 1080px; margin: 0 auto; padding: 24px 32px; line-height: 1.7; color: #1d1d1f; background: #ffffff; }
+  h1 { border-bottom: 3px solid #0a84ff; padding-bottom: 10px; }
+  h2 { color: #0a84ff; margin-top: 36px; border-left: 4px solid #0a84ff; padding-left: 10px; }
+  h3 { color: #515154; margin-top: 22px; }
+  code { background: #f5f5f7; padding: 1px 6px; border-radius: 4px; font-family: SF Mono, Menlo, monospace; font-size: 0.9em; }
+  pre { background: #1d1d1f; color: #f5f5f7; padding: 14px 18px; border-radius: 8px; overflow-x: auto; font-size: 13px; line-height: 1.5; }
+  pre code { background: transparent; color: inherit; padding: 0; }
+  .tldr { background: #fff7e6; border-left: 5px solid #ff9500; padding: 14px 18px; border-radius: 0 6px 6px 0; margin: 16px 0 24px; }
+  .ok  { color: #34c759; font-weight: 600; }
+  .bad { color: #ff3b30; font-weight: 600; }
+  .warn{ color: #ff9500; font-weight: 600; }
+  table { border-collapse: collapse; width: 100%; margin: 14px 0; font-size: 0.95em; }
+  th, td { border: 1px solid #d2d2d7; padding: 8px 12px; text-align: left; vertical-align: top; }
+  th { background: #f5f5f7; font-weight: 600; }
+  .stage { background: #f5f5f7; padding: 14px 18px; border-radius: 8px; margin: 14px 0; border-left: 4px solid #ff3b30; }
+  .stage.fixed { border-left-color: #34c759; }
+  .stage h4 { margin-top: 0; }
+  .eng { color: #6e6e73; font-style: italic; font-size: 0.92em; }
+  .pill { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 0.78em; font-weight: 600; margin-right: 4px; }
+  .pill-bug { background: #ffebec; color: #c93a3f; }
+  .pill-fix { background: #e8f8ed; color: #28a745; }
+</style>
+</head>
+<body>
+
+<h1>GR00T-N1.7 自训 ckpt × LeIsaac sim eval —— 4 层 wire 协议根因复盘</h1>
+<p class="eng">Root-cause: 4-layer wire protocol mismatch between self-trained GR00T-N1.7 server (<code>--use-sim-policy-wrapper</code>) and LeIsaac N1.5 client.</p>
+<p>日期：2026-05-23 · 模型：自训 <code>checkpoint-1200</code> (cold-start Cosmos-Reason2-2B + Gr00tN1d7 DiT)</p>
+
+<div class="tldr">
+  <strong>TL;DR</strong>
+  ckpt 健康 (2.2B params / 0 NaN)，直接 zmq probe 出 action range -28°~+21° 看似合理 —— <b>但 sim 机械臂完全不动</b>。表象一个，根因 <b>四层</b> wire 协议错配，缠了大半天才剥完。最后 client 跑通：arm 会动 (oranges 0/3 是因为 1200 step ≪ hi-space 6000 step 收敛点)。
+  <br><br>
+  <span class="eng">Four stacked bugs in client &lt;-&gt; server payload schema: missing observation envelope, missing T axis + wrong dtype, msgpack-numpy bytes-key decode skipped, mnp.decode requires bytes keys not str.</span>
+</div>
+
+<h2>1. 症状与初步证据 <span class="eng">— Symptom &amp; first evidence</span></h2>
+
+<p>训练 1200/6000 step (≈ 20% 进度) 拉本机做 sim eval：</p>
+<ul>
+  <li>ckpt 文件健康：<code>Gr00tN1d7.from_pretrained()</code> 加载 OK，2.2B params，0 NaN/Inf，698 weight keys 完整 match model architecture</li>
+  <li>用 <b>dummy obs</b> 直接 zmq probe server：<span class="ok">出非零 action</span>，arm shape <code>(1, 40, 5)</code> range -28°~+21°，gripper <code>(1, 40, 1)</code> range 24~32 —— 看起来完全合理</li>
+  <li>但跑 LeIsaac sim：<span class="bad">机械臂完全不动</span>，eval 报 <code>KeyError</code> traceback</li>
+</ul>
+
+<p>第一直觉以为是训练量不足学不会任务，但 probe 出的 action 数值在 SO-101 关节合理范围，且服务端 NaN-free —— 模型实际在出动作，问题在 <b>client 没把动作正确送到 sim env</b>。</p>
+
+<h2>2. 通信链路示意 <span class="eng">— Communication flow</span></h2>
+
+<svg viewBox="0 0 880 380" xmlns="http://www.w3.org/2000/svg" style="background:#fafafa;border:1px solid #ddd;border-radius:8px;display:block;margin:14px auto;width:100%;max-width:880px;">
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#0a84ff"/>
+    </marker>
+    <marker id="arrR" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#ff3b30"/>
+    </marker>
+  </defs>
+
+  <!-- columns -->
+  <rect x="30"  y="30" width="200" height="320" rx="10" fill="#e8f4fd" stroke="#0a84ff" stroke-width="2"/>
+  <rect x="340" y="30" width="200" height="320" rx="10" fill="#fff4e6" stroke="#ff9500" stroke-width="2"/>
+  <rect x="650" y="30" width="200" height="320" rx="10" fill="#fff0f0" stroke="#ff3b30" stroke-width="2"/>
+
+  <text x="130" y="58" text-anchor="middle" font-size="15" font-weight="700" fill="#0a52a1">LeIsaac client</text>
+  <text x="130" y="76" text-anchor="middle" font-size="11" fill="#666">Gr00tServicePolicyClient</text>
+  <text x="130" y="92" text-anchor="middle" font-size="11" fill="#666">(N1.5 wire 默认)</text>
+
+  <text x="440" y="58" text-anchor="middle" font-size="15" font-weight="700" fill="#a06400">ZMQ + msgpack</text>
+  <text x="440" y="76" text-anchor="middle" font-size="11" fill="#666">MsgSerializer envelope</text>
+  <text x="440" y="92" text-anchor="middle" font-size="11" fill="#666">__ndarray_class__ / nd:True</text>
+
+  <text x="750" y="58" text-anchor="middle" font-size="15" font-weight="700" fill="#a00">Gr00tSimPolicyWrapper</text>
+  <text x="750" y="76" text-anchor="middle" font-size="11" fill="#666">--use-sim-policy-wrapper</text>
+  <text x="750" y="92" text-anchor="middle" font-size="11" fill="#666">action_horizon=40 chunk</text>
+
+  <!-- request flow -->
+  <text x="130" y="125" text-anchor="middle" font-size="12" fill="#0a52a1">obs from IsaacLab</text>
+  <text x="130" y="142" text-anchor="middle" font-size="11" fill="#666">(B, H, W, 3) uint8</text>
+  <text x="130" y="158" text-anchor="middle" font-size="11" fill="#666">(B, 5) float64</text>
+
+  <line x1="232" y1="150" x2="338" y2="150" stroke="#0a84ff" stroke-width="2" marker-end="url(#arr)"/>
+  <text x="285" y="143" text-anchor="middle" font-size="11" fill="#0a52a1">request</text>
+
+  <text x="440" y="125" text-anchor="middle" font-size="12" fill="#a06400">{endpoint:"get_action",</text>
+  <text x="440" y="142" text-anchor="middle" font-size="12" fill="#a06400">data: {"observation": flat_obs}}</text>
+
+  <line x1="542" y1="150" x2="648" y2="150" stroke="#0a84ff" stroke-width="2" marker-end="url(#arr)"/>
+
+  <text x="750" y="125" text-anchor="middle" font-size="12" fill="#a00">check_observation</text>
+  <text x="750" y="143" text-anchor="middle" font-size="11" fill="#666">需要 (B,T,H,W,C) 5D</text>
+  <text x="750" y="159" text-anchor="middle" font-size="11" fill="#666">需要 (B,T,D) 3D float32</text>
+
+  <!-- response flow -->
+  <text x="750" y="220" text-anchor="middle" font-size="12" fill="#a00">推理 + chunk</text>
+  <text x="750" y="237" text-anchor="middle" font-size="11" fill="#666">return list[2] of dict</text>
+
+  <line x1="648" y1="260" x2="542" y2="260" stroke="#ff3b30" stroke-width="2" marker-end="url(#arrR)"/>
+  <text x="595" y="253" text-anchor="middle" font-size="11" fill="#c00">response</text>
+
+  <text x="440" y="220" text-anchor="middle" font-size="12" fill="#a06400">list[0]:</text>
+  <text x="440" y="237" text-anchor="middle" font-size="11" fill="#a06400">action.single_arm =</text>
+  <text x="440" y="253" text-anchor="middle" font-size="11" fill="#a06400">{b'nd':True, b'data':bytes,</text>
+  <text x="440" y="268" text-anchor="middle" font-size="11" fill="#a06400">b'type':'&lt;f4', b'shape':[1,40,5]}</text>
+
+  <line x1="338" y1="260" x2="232" y2="260" stroke="#ff3b30" stroke-width="2" marker-end="url(#arrR)"/>
+
+  <text x="130" y="220" text-anchor="middle" font-size="12" fill="#0a52a1">解 list[0] → dict</text>
+  <text x="130" y="237" text-anchor="middle" font-size="11" fill="#0a52a1">解 bytes-key ndarray</text>
+  <text x="130" y="253" text-anchor="middle" font-size="11" fill="#0a52a1">squeeze (1,40,5)→(40,5)</text>
+  <text x="130" y="269" text-anchor="middle" font-size="11" fill="#0a52a1">concat arm+grip → (40,6)</text>
+
+  <!-- result -->
+  <text x="130" y="310" text-anchor="middle" font-size="12" fill="#0a52a1">tensor (40, 1, 6)</text>
+  <text x="130" y="328" text-anchor="middle" font-size="11" fill="#666">→ env.step(action)</text>
+
+  <text x="440" y="320" text-anchor="middle" font-size="12" font-weight="600" fill="#28a745">4 个 wire 错配点</text>
+  <text x="440" y="336" text-anchor="middle" font-size="11" fill="#666">见下面 §3</text>
+</svg>
+
+<h2>3. 四层根因 <span class="eng">— Four stacked bugs</span></h2>
+
+<div class="stage">
+  <h4><span class="pill pill-bug">Bug 1</span> data envelope 缺 <code>observation</code> 包装</h4>
+  <p>Server 启动用 <code>--use-sim-policy-wrapper</code> 时，<code>Gr00tSimPolicyWrapper.get_action(observation, options=None)</code> 走的是 <b>kwargs 解包</b> 路径。server 框架收到 zmq 请求后等价于：</p>
+  <pre><code>policy.get_action(**data)   # data 是 request["data"]</code></pre>
+  <p>LeIsaac 原版 N1.5 client 默认发：</p>
+  <pre><code>request = {"endpoint": "get_action", "data": flat_obs}</code></pre>
+  <p>其中 <code>flat_obs</code> 含 <code>video.front</code>, <code>state.single_arm</code> 等键。Python 把 <code>video.front</code> 当 kwarg 名 —— 不是合法 identifier：</p>
+  <pre><code>"BasePolicy.get_action() got an unexpected keyword argument 'video.front'"</code></pre>
+  <p class="eng">N1.5 raw server 直接接 flat obs 是合法的，但启用 sim_policy_wrapper 后必须多一层 envelope。</p>
+</div>
+
+<div class="stage">
+  <h4><span class="pill pill-bug">Bug 2</span> obs shape 缺 T 轴 + dtype 错</h4>
+  <p>包了 <code>observation</code> 后，<code>Gr00tSimPolicyWrapper.check_observation</code> 强校验：</p>
+  <ul>
+    <li>video: <code>(B, T, H, W, 3) uint8</code> 5D —— LeIsaac 给的是 <code>(B, H, W, 3)</code> 4D <span class="warn">缺 T 轴</span></li>
+    <li>state: <code>(B, T, D) float32</code> 3D —— LeIsaac 给的是 <code>(B, D)</code> 2D <span class="warn">且 dtype 是 float64</span></li>
+    <li>T = <code>len(modality_configs["video"].delta_indices)</code>，SO-101 PickOrange 配置下 T = 1</li>
+  </ul>
+  <p>修复：obs 内每个 video/state ndarray 用 <code>v[:, None, ...]</code> 在 batch 后插入 T=1 轴，state 强转 <code>float32</code>。</p>
+</div>
+
+<div class="stage">
+  <h4><span class="pill pill-bug">Bug 3</span> msgpack-numpy bytes-key 漏解码</h4>
+  <p>N1.7 server 返回 action chunk 时，每个 ndarray 用 <code>msgpack_numpy</code> 标准编码：</p>
+  <pre><code>{b'nd': True, b'type': '&lt;f4', b'kind': b'', b'shape': [1,40,5], b'data': &lt;bytes&gt;}</code></pre>
+  <p>注意 keys 是 <b>bytes</b>。LeIsaac 的 <code>MsgSerializer._decode_custom</code> 当时只查 <code>obj.get("nd")</code>（str key），bytes key 直接漏过：</p>
+  <pre><code>if obj.get("nd") is True:   # ✗ 不命中 bytes key
+    return mnp.decode(obj)
+return obj                  # ← 原 dict 透传给 client</code></pre>
+  <p>结果 client 拿到的 <code>action_chunk[0]["action.single_arm"]</code> 是 <b>嵌套 dict 而不是 ndarray</b>，下一步 <code>arm.ndim</code> 触发 <code>AttributeError: 'dict' object has no attribute 'ndim'</code>。</p>
+</div>
+
+<div class="stage">
+  <h4><span class="pill pill-bug">Bug 4</span> 反向修 key 又踩坑 —— <code>mnp.decode</code> 要 bytes keys</h4>
+  <p>诊断 Bug 3 时我直觉地把 bytes keys 转 str 再喂给 <code>mnp.decode</code>：</p>
+  <pre><code>x = {k.decode(): v for k, v in x.items()}   # ✗ 反方向了
+return _mnp.decode(x)                        # 返回 dict 不是 ndarray</code></pre>
+  <p>实测 <code>mnp.decode</code> 内部 hard-coded 用 bytes keys 查 <code>b'nd'</code>。正确做法是 <b>保留</b> bytes keys，或反向把 str → bytes。验证：</p>
+  <pre><code>>>> mnp.decode({b'nd':True, b'data':..., b'type':'&lt;f4', b'shape':[1,40,5]})
+ndarray (1, 40, 5)                        # ✓
+>>> mnp.decode({'nd':True, 'data':..., 'type':'&lt;f4', 'shape':[1,40,5]})
+dict (returned unchanged)                  # ✗
+</code></pre>
+</div>
+
+<h2>4. 修复 patch <span class="eng">— Minimal fix</span></h2>
+
+<div class="stage fixed">
+  <p>所有改动集中在 <code>LeIsaac/source/leisaac/leisaac/policy/service_policy_clients.py</code> 的 <code>Gr00tServicePolicyClient.get_action</code>：</p>
+<pre><code class="lang-python">def get_action(self, observation_dict):
+    # 1) flat obs with proper shape
+    obs_dict = {f"video.{k}": observation_dict[k].cpu().numpy().astype(np.uint8)
+                for k in self.camera_keys}
+    joint_pos = convert_leisaac_action_to_lerobot(observation_dict["joint_pos"])
+    obs_dict["state.single_arm"] = joint_pos[:, 0:5].astype(np.float32)
+    obs_dict["state.gripper"]    = joint_pos[:, 5:6].astype(np.float32)
+    obs_dict["annotation.human.task_description"] = [observation_dict["task_description"]]
+
+    # 2) 加 T=1 + 强制 float32 / uint8（wrapper.check_observation 要求）
+    wrapped_obs = {}
+    for k, v in obs_dict.items():
+        if isinstance(v, np.ndarray):
+            if k.startswith("video.") and v.ndim == 4:
+                wrapped_obs[k] = v[:, None].astype(np.uint8)   # (B,1,H,W,3)
+            elif k.startswith("state.") and v.ndim == 2:
+                wrapped_obs[k] = v[:, None].astype(np.float32) # (B,1,D)
+            else:
+                wrapped_obs[k] = v
+        else:
+            wrapped_obs[k] = v
+
+    # 3) 加 observation envelope
+    action_chunk = self.call_endpoint("get_action", {"observation": wrapped_obs})
+
+    # 4) 解 list[0] → dict，再用 mnp.decode 还原 bytes-key dict 成 ndarray
+    if isinstance(action_chunk, list):
+        action_chunk = action_chunk[0]
+    arm  = _to_ndarray(action_chunk["action.single_arm"])
+    grip = _to_ndarray(action_chunk["action.gripper"])
+
+    # 5) (1, 40, D) → (40, D)；拼成 (40, 6)；最后 (40, 1, 6) 返回
+    if arm.ndim == 3 and arm.shape[0] == 1:
+        arm, grip = arm[0], grip[0]
+    concat = np.concatenate([arm, grip], axis=-1)
+    concat = convert_lerobot_action_to_leisaac(concat)
+    return torch.from_numpy(concat[:, None, :])
+
+def _to_ndarray(x):
+    if isinstance(x, np.ndarray): return x
+    if isinstance(x, dict):
+        ks = set(x.keys())
+        if "nd" in ks or b"nd" in ks:
+            if "nd" in ks:
+                # mnp.decode 要 bytes keys —— 反向 re-encode
+                x = {(k.encode() if isinstance(k, str) else k): v for k, v in x.items()}
+            return msgpack_numpy.decode(x)
+        if "__ndarray_class__" in ks or b"__ndarray_class__" in ks:
+            key = "as_npy" if "as_npy" in x else b"as_npy"
+            return np.load(io.BytesIO(x[key]), allow_pickle=False)
+    raise TypeError(f"cannot decode action element: {type(x).__name__}")</code></pre>
+  <p>同时 <code>server/eval_gr00t.sh</code> 加 <code>POLICY_TYPE</code> 环境变量并默认 <code>gr00tn1.5</code>（与上面 client 配套）。</p>
+</div>
+
+<h2>5. 验证 <span class="eng">— Verification</span></h2>
+
+<table>
+  <tr><th>阶段</th><th>obs shape</th><th>envelope</th><th>response decode</th><th>结果</th></tr>
+  <tr><td>原版</td><td>(B, H, W, 3)</td><td>无</td><td>—</td><td class="bad">server: "video.front" 不是 kwarg</td></tr>
+  <tr><td>+ wrap</td><td>(B, H, W, 3)</td><td>{"observation": …}</td><td>—</td><td class="bad">server: shape 不是 5D</td></tr>
+  <tr><td>+ T 轴</td><td>(B, 1, H, W, 3)</td><td>{"observation": …}</td><td>list[0]</td><td class="bad">arm.ndim AttributeError on dict</td></tr>
+  <tr><td>+ mnp.decode 错向</td><td>(B, 1, H, W, 3)</td><td>{"observation": …}</td><td>str-key mnp.decode</td><td class="bad">mnp.decode return dict</td></tr>
+  <tr><td>+ 保留 bytes key</td><td>(B, 1, H, W, 3)</td><td>{"observation": …}</td><td>bytes-key mnp.decode</td><td class="ok">arm 会动！1 episode 跑满 120s wall_cap, 0/3 placed</td></tr>
+</table>
+
+<p>0/3 是 <b>训练量不足</b>（1200/6000 step ≈ 20%），不是协议错。hi-space 公开 N1.7 ckpt 6000 step 才收敛到 14/15 SOTA。</p>
+
+<h2>6. 复盘：为什么调这么久？<span class="eng">— Post-mortem</span></h2>
+
+<ul>
+  <li><b>4 个 bug 串行触发，每修一个露下一个</b>，没法一眼看到 root —— 类似 5-layer onion peeling。</li>
+  <li><b>Bug 3 最隐蔽</b>：MsgSerializer 已有 <code>nd:True</code> 解码逻辑，看代码以为没问题；但 msgpack-python 默认 <code>raw=False</code> 时只把 string-typed dict keys 解成 str，<b>非 ASCII 编码的 bytes keys（来自 msgpack-numpy）保持 bytes</b>，绕过了我们的 if check。</li>
+  <li><b>Bug 4 是经典反向直觉</b>：看到 bytes keys 反应是"转 str 再处理"，实测 mnp.decode 强制 bytes keys。</li>
+  <li><b>5090 32GB OOM 副作用</b>：每次 eval timeout 杀掉 bash，但 conda subprocess 不退出，每次累 6.7 GB GPU。3 次后 PhysX OOM 拒绝创建 scene，看起来像新 bug 实际是僵尸进程。<b>教训：以后 eval 用 <code>pkill -f policy_inference</code> 兜底。</b></li>
+</ul>
+
+<h2>7. 关联记忆 <span class="eng">— Related memory</span></h2>
+
+<ul>
+  <li><code>compact-resume-2026-05-23</code> —— 同一天上午误判 ckpt-600/-1200 为"缺 332 keys broken"，实际 keys 数完整 (698 = N1.7 model 正常 size)，错把 hi-space 不同 layout 当对照</li>
+  <li><code>gr00t-n17-hi-space</code> —— hi-space N1.7 14/15 SOTA 基准；wire 协议 N1.6 → N1.7 改用 mnp 格式（本次错配的源头）</li>
+  <li><code>per-model-action-horizon</code> —— N1.7 = 40，client 必须接 (B, 40, D) chunk</li>
+  <li><code>autodl-uv-sync-cn-strategy</code> —— 训练侧 6 patch；本次 root cause 与训练无关，纯推理 wire</li>
+</ul>
+
+<h2>8. 下一步</h2>
+
+<ul>
+  <li>等 AutoDL 上 ckpt-2400 / -3600 / -4800 / -6000 训完，5090 上 step 2400 已过半，每 1200 step 出一个 ckpt</li>
+  <li>每个新 ckpt 做 5-round eval（按 <code>eval-5round-mandatory</code> 规则）</li>
+  <li>把本次 <code>service_policy_clients.py</code> 修复合入主分支</li>
+  <li>给 <code>MsgSerializer._decode_custom</code> 加 bytes-key 兼容（治本，而不是 client 每次自己解）</li>
+</ul>
+
+<p style="color:#999;font-size:0.9em;margin-top:48px;border-top:1px solid #eee;padding-top:14px;">
+作者：David Chen · 2026-05-23 ·
+模型：自训 <code>gr00t-n17-leisaac-pick-orange-autodl-v2/checkpoint-1200</code> · 参考：hi-space/GR00T-N1.7-3B-Pick-Orange · 关联代码：<code>LeIsaac/source/leisaac/leisaac/policy/service_policy_clients.py</code>, <code>dependencies/Isaac-GR00T/gr00t/policy/gr00t_policy.py</code>
+</p>
+
+</body>
+</html>

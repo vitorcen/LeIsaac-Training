@@ -1,0 +1,575 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>AutoDL 云端微调实战手册 — LeIsaac / VLA Finetune</title>
+<style>
+  :root {
+    --bg: #fafafa; --fg: #1a1a1a; --muted: #555;
+    --accent: #1f6feb; --warn: #d29922; --bad: #cf222e; --good: #1a7f37;
+    --code-bg: #f3f3f3; --border: #d0d7de;
+  }
+  body { font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+         background: var(--bg); color: var(--fg);
+         max-width: 1080px; margin: 28px auto; padding: 0 22px; line-height: 1.6; }
+  h1 { border-bottom: 2px solid var(--fg); padding-bottom: 6px; }
+  h2 { margin-top: 36px; border-left: 4px solid var(--accent); padding-left: 10px; }
+  h3 { margin-top: 24px; color: var(--accent); }
+  h4 { margin-top: 18px; color: var(--muted); }
+  .en { color: var(--muted); font-style: italic; font-size: 0.92em; }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0; font-size: 0.92em; }
+  th, td { border: 1px solid var(--border); padding: 6px 10px; text-align: left; vertical-align: top; }
+  th { background: #f0f3f6; }
+  code, pre { font-family: "JetBrains Mono", Menlo, Consolas, monospace; }
+  pre { background: var(--code-bg); padding: 12px; border-radius: 4px; overflow-x: auto; font-size: 0.85em; }
+  code { background: var(--code-bg); padding: 1px 5px; border-radius: 3px; font-size: 0.92em; }
+  .tag-good { color: var(--good); font-weight: 600; }
+  .tag-warn { color: var(--warn); font-weight: 600; }
+  .tag-bad  { color: var(--bad); font-weight: 600; }
+  .callout { border-left: 4px solid var(--warn); background: #fff8e6; padding: 10px 14px; margin: 14px 0; }
+  .callout.bad { border-color: var(--bad); background: #ffeef0; }
+  .callout.good { border-color: var(--good); background: #e6f4ea; }
+  .callout.info { border-color: var(--accent); background: #ddf4ff; }
+  svg { display: block; margin: 14px auto; max-width: 100%; }
+  ul { padding-left: 22px; }
+  li { margin: 4px 0; }
+  .meta { color: var(--muted); font-size: 0.9em; }
+  .kbd { background: #eee; border: 1px solid #ccc; border-radius: 3px; padding: 0 4px; font-size: 0.85em; font-family: monospace; }
+</style>
+</head>
+<body>
+
+<h1>AutoDL 云端微调实战手册</h1>
+<p class="en">AutoDL cloud finetuning playbook — observed limits, working configs, and recovery patterns for VLA training (GR00T N1.7 / X-VLA / SmolVLA on RTX 4090 / RTX PRO 6000)</p>
+<p class="meta">2026-05-22 v1 · 基于 LeIsaac GR00T-N1.7 finetune 实战环境搭建总结</p>
+
+<h2>0. TL;DR</h2>
+<div class="callout good">
+<ul>
+<li><b>选机</b>：单 4090 24GB 是 N1.7 的 "刚好够" 配置；RTX PRO 6000 96GB 可放心开大 batch，训练快 3-4×</li>
+<li><b>磁盘</b>：默认 50GB 不够，<b>必须扩到 100-140GB</b>；旧机不可扩需"克隆系统盘 + 数据盘到新机"</li>
+<li><b>HF 加速三件套</b>：公开 repo → <code>hf-mirror.com</code>；gated repo → <code>/etc/network_turbo</code> + canonical HF；大文件 → <b>单流 curl</b>（多线程被代理掐死）</li>
+<li><b>PyTorch wheel</b>（本机 uv sync）：默认 <code>download.pytorch.org</code> 国内不通 TLS handshake EOF；<b>必须改 aliyun mirror</b> <code>https://mirrors.aliyun.com/pytorch-wheels/cu128</code>（14 MB/s 稳）</li>
+<li><b>模式切换</b>：clone repo / 下载基础模型用<b>无卡模式</b>（便宜）；<code>uv sync</code>（torch + tensorrt build）必须 <b>GPU 模式</b>（无卡 nvidia-smi 权限拒绝）</li>
+<li><b>ckpt 策略</b>：<code>save_only_model=True</code> 单 ckpt 12GB；<b>LossDrivenPrune</b> 留 top-K 自动删差的；100GB 可留 6 个 ckpt</li>
+</ul>
+</div>
+
+<h2>1. 选机指南 <span class="en">(GPU + disk sizing)</span></h2>
+
+<h3>1.1 GPU 型号</h3>
+<table>
+<tr><th>GPU</th><th>VRAM</th><th>BF16 Tensor TFLOPS</th><th>价格区间</th><th>适用场景</th></tr>
+<tr><td>RTX 4090</td><td>24 GB</td><td>~165</td><td>~¥1.5-2/h</td><td>N1.6 / N1.7 / SmolVLA 训练（per-step batch ≤ 2）+ grad-ckpt + adafactor 压显存</td></tr>
+<tr><td><b>RTX PRO 6000 (Blackwell)</b></td><td><b>96 GB</b></td><td><b>~500-700</b></td><td>~¥6-8/h</td><td>放心开大 batch，<b>不需要</b>压显存技巧；FP8 支持（暂未使用）</td></tr>
+<tr><td>A100 40GB / 80GB</td><td>40/80 GB</td><td>~310</td><td>~¥3-5/h</td><td>中档选择；多卡训练比 4090 更省事</td></tr>
+<tr><td>H100 (SXM/PCIe)</td><td>80 GB</td><td>~990</td><td>~¥10+/h</td><td>大模型多卡；单 4090/PRO 6000 用不上的级别</td></tr>
+</table>
+
+<div class="callout info">
+<b>实测速度估算</b>：N1.7 finetune 10k step
+<ul>
+<li>RTX 4090 per-step=2 + grad-ckpt：<b>5-7 小时</b></li>
+<li>RTX PRO 6000 per-step=8 + 无 grad-ckpt：<b>1.5-2.5 小时</b></li>
+</ul>
+钱差不多（4090×5h vs PRO 6000×2h），<b>赶时间或多次 sweep 选 PRO 6000</b>；单次实验等得起选 4090。
+</div>
+
+<h3>1.2 磁盘容量</h3>
+<table>
+<tr><th>大小</th><th>结论</th><th>能放</th></tr>
+<tr><td>50 GB（默认）</td><td><span class="tag-bad">❌ 不够</span></td><td>venv 10 + Cosmos 5 + dataset 1 = 16 GB；剩 34 GB 装不下 6 个 ckpt × 12 GB</td></tr>
+<tr><td>100 GB</td><td><span class="tag-warn">⚠️ 刚好</span></td><td>固定 18 + ckpts 留 4-5 = 80 GB，余量 20 GB；需 smart prune</td></tr>
+<tr><td><b>140 GB</b></td><td><span class="tag-good">✅ 舒服</span></td><td>固定 18 + ckpts 留 6-8 = 100 GB，余量 40 GB</td></tr>
+<tr><td>200 GB+</td><td><span class="tag-good">✅ 浪费</span></td><td>除非要 save_only_model=False 全量 + 多 SOTA 候选并存</td></tr>
+</table>
+
+<div class="callout bad">
+<b>⚠️ 旧机扩容失败的退路：克隆迁移</b>
+<br/>实战：原 50 GB 机器无法直接扩容（机器所在物理盘已满），AutoDL 提供"克隆实例"功能，把整个系统盘 + 数据盘镜像到一台新机器，新机器从一开始就能选更大磁盘。
+<br/>注意：克隆后 SSH 端口会变（如 44911 → 13330），所有自动化脚本中的 ssh 端口要更新；<b>/root/autodl-tmp 内容完整保留</b>（包括下载到一半的模型权重、bashrc 配置、uv 安装）。
+</div>
+
+<h2>2. 网络加速：三件套决策树 <span class="en">(network acceleration decision tree)</span></h2>
+
+<svg viewBox="0 0 980 540" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="ar1" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L9,3 z" fill="#1f6feb" />
+    </marker>
+  </defs>
+  <text x="490" y="22" font-weight="bold" font-size="14" text-anchor="middle">HuggingFace 下载加速决策树</text>
+
+  <!-- start -->
+  <rect x="380" y="40" width="220" height="50" rx="6" fill="#e6f0ff" stroke="#1f6feb" stroke-width="2"/>
+  <text x="490" y="60" text-anchor="middle" font-size="12" font-weight="bold">要下的 HF repo 是 gated 吗？</text>
+  <text x="490" y="78" text-anchor="middle" font-size="10" fill="#555">(需要 token / Request access)</text>
+
+  <!-- gated yes -->
+  <rect x="650" y="120" width="290" height="60" rx="6" fill="#fff8e6" stroke="#d29922" stroke-width="2"/>
+  <text x="795" y="140" text-anchor="middle" font-size="12" font-weight="bold">gated（如 Cosmos / GR00T-N1.x）</text>
+  <text x="795" y="160" text-anchor="middle" font-size="11">必须 canonical HF + token</text>
+  <text x="795" y="175" text-anchor="middle" font-size="10" fill="#555">hf-mirror 不转发 Authorization 头</text>
+
+  <!-- public no -->
+  <rect x="40" y="120" width="290" height="60" rx="6" fill="#e6f4ea" stroke="#1a7f37" stroke-width="2"/>
+  <text x="185" y="140" text-anchor="middle" font-size="12" font-weight="bold">公开（dataset / 非 gated 模型）</text>
+  <text x="185" y="160" text-anchor="middle" font-size="11">优先 hf-mirror.com</text>
+  <text x="185" y="175" text-anchor="middle" font-size="10" fill="#555">~10 MB/s 稳定，最快</text>
+
+  <!-- arrows -->
+  <path d="M 470 90 Q 280 100 200 118" fill="none" stroke="#1a7f37" stroke-width="2" marker-end="url(#ar1)"/>
+  <text x="285" y="100" font-size="11" fill="#1a7f37" font-weight="bold">No</text>
+  <path d="M 510 90 Q 720 100 770 118" fill="none" stroke="#d29922" stroke-width="2" marker-end="url(#ar1)"/>
+  <text x="690" y="100" font-size="11" fill="#d29922" font-weight="bold">Yes</text>
+
+  <!-- public branch detail -->
+  <rect x="40" y="210" width="290" height="100" rx="6" fill="#f0f7f3" stroke="#1a7f37" stroke-width="1"/>
+  <text x="50" y="232" font-size="11" font-weight="bold">公开下载命令：</text>
+  <text x="50" y="252" font-size="10" font-family="monospace">export HF_ENDPOINT=https://hf-mirror.com</text>
+  <text x="50" y="270" font-size="10" font-family="monospace">unset http_proxy https_proxy</text>
+  <text x="50" y="288" font-size="10" font-family="monospace">hf download &lt;repo&gt; --max-workers 8</text>
+  <text x="50" y="305" font-size="9" fill="#555">公开 repo 上 hf 客户端多 worker 没问题</text>
+
+  <!-- gated branch detail -->
+  <rect x="650" y="210" width="290" height="160" rx="6" fill="#fffaf0" stroke="#d29922" stroke-width="1"/>
+  <text x="660" y="232" font-size="11" font-weight="bold">Gated 下载命令：</text>
+  <text x="660" y="252" font-size="10" font-family="monospace">source /etc/network_turbo</text>
+  <text x="660" y="270" font-size="10" font-family="monospace">export HF_ENDPOINT=https://huggingface.co</text>
+  <text x="660" y="288" font-size="10" font-family="monospace">HF_ENDPOINT=$HF_ENDPOINT hf auth login</text>
+  <text x="660" y="306" font-size="10" font-family="monospace">  --token hf_xxxxx</text>
+  <text x="660" y="324" font-size="10" font-family="monospace">hf download &lt;repo&gt; --max-workers 2</text>
+  <text x="660" y="342" font-size="10" fill="#cf222e">⚠️ 多 worker(&gt;4) 容易被代理掐</text>
+  <text x="660" y="360" font-size="10" fill="#cf222e">⚠️ 大 LFS 文件优先 curl 单流</text>
+
+  <!-- big file branch -->
+  <rect x="345" y="400" width="290" height="120" rx="6" fill="#ffeef0" stroke="#cf222e" stroke-width="2"/>
+  <text x="490" y="422" font-size="12" font-weight="bold" text-anchor="middle">大 LFS 文件（&gt;1GB）救命方案</text>
+  <text x="355" y="445" font-size="11" font-weight="bold">curl 单流 + 60s 速度阈值：</text>
+  <text x="355" y="465" font-size="10" font-family="monospace">curl -L -o file.bin \</text>
+  <text x="355" y="481" font-size="10" font-family="monospace">  --retry 50 --retry-delay 15 \</text>
+  <text x="355" y="497" font-size="10" font-family="monospace">  --speed-time 60 --speed-limit 10240 \</text>
+  <text x="355" y="513" font-size="10" font-family="monospace">  -H "Authorization: Bearer hf_xxx" ...</text>
+
+  <path d="M 795 370 Q 700 390 580 400" fill="none" stroke="#cf222e" stroke-width="1.5" stroke-dasharray="3,2" marker-end="url(#ar1)"/>
+  <text x="650" y="385" font-size="10" fill="#cf222e">大文件 / 多线程失败时</text>
+</svg>
+
+<h3>2.1 公开 repo：hf-mirror</h3>
+
+<pre>export HF_ENDPOINT=https://hf-mirror.com
+unset http_proxy https_proxy    # 不走 AutoDL proxy
+hf download LightwheelAI/leisaac-pick-orange --repo-type dataset --max-workers 8</pre>
+
+<p>实测：LeIsaac dataset 700 MB / 186 个文件，57 秒下完（~12 MB/s 平均）。这是当前最快路径。</p>
+
+<h3>2.2 Gated repo：AutoDL 学术代理 + canonical HF</h3>
+
+<p>来源：<code>https://www.autodl.com/docs/network_turbo/</code></p>
+
+<table>
+<tr><th>覆盖网站</th><th>说明</th></tr>
+<tr><td>github.com / githubusercontent.com / githubassets.com</td><td>git clone / pip from github</td></tr>
+<tr><td><b>huggingface.co</b></td><td>gated repo 唯一路径</td></tr>
+</table>
+
+<pre># 在 .bashrc 持久化
+cat >> ~/.bashrc <<'EOF'
+export HF_ENDPOINT=https://huggingface.co     # gated 必须 canonical
+export HF_HOME=/root/autodl-tmp/hf_cache
+export PATH=/root/.local/bin:/root/miniconda3/bin:$PATH
+EOF
+
+# 每次新 session
+source /etc/network_turbo
+HF_ENDPOINT=https://huggingface.co hf auth login --token hf_xxxx --add-to-git-credential
+hf download nvidia/Cosmos-Reason2-2B --max-workers 2    # 不要超过 4！</pre>
+
+<div class="callout bad">
+<b>⚠️ hf auth login 按 endpoint 独立 store token</b>
+<br/>如果你切换 <code>HF_ENDPOINT</code>（hf-mirror ↔ huggingface.co），<b>必须重新</b> <code>hf auth login --token ...</code>，否则 gated repo 会报 "Access denied"。这是 hf 客户端 1.16+ 的设计。
+</div>
+
+<h3>2.3 大文件 LFS：curl 单流</h3>
+
+<div class="callout bad">
+<b>实测多线程在 AutoDL 代理下全部失败</b>：
+<ul>
+<li><code>hf download --max-workers 8</code>：<code>httpx.RemoteProtocolError: Server disconnected</code></li>
+<li><code>aria2c -s 8</code>：连接 <code>CN:1 DL:0B</code> 卡死</li>
+<li><code>git clone</code>（含 LFS）：LFS smudge filter 多线程拉文件，同样掉</li>
+<li><b>唯一稳的</b>：<code>curl</code> 单 connection</li>
+</ul>
+</div>
+
+<p><b>反直觉</b>：bandwidth 不是被限制，是 <b>connection 数</b> 被代理限制。单流 ~600 KB/s 稳定，多流被掐到 0。</p>
+
+<pre># 大 LFS 文件下载脚本模板
+nohup bash -c '
+URL="https://huggingface.co/nvidia/Cosmos-Reason2-2B/resolve/main/model.safetensors"
+TOKEN="hf_xxx"
+OUT="model.safetensors"
+
+source /etc/network_turbo &gt;/dev/null 2&gt;&amp;1
+
+# 关键参数：
+# --speed-time 60 --speed-limit 10240  →  60s 内速度低于 10KB/s 自动 abort，触发 retry
+# --max-time 14400  →  单次连接最长 4 小时
+# --retry 50 --retry-delay 15  →  最多 50 次重试，每次等 15s
+# ⚠️ 不要用 -C - (resume)，跨 session resume 会写出 sparse 空洞文件
+curl -L --retry 50 --retry-delay 15 --retry-max-time 14400 \
+     --max-time 14400 \
+     --speed-time 60 --speed-limit 10240 \
+     -o "$OUT" \
+     -H "Authorization: Bearer $TOKEN" "$URL"
+' > download.log 2>&1 &</pre>
+
+<div class="callout bad">
+<b>⚠️ sparse 空洞陷阱（实战踩过）</b>
+<br/>多次中断的 curl <code>-C -</code> resume 跨 session 会在错误偏移写入字节，剩余部分变成 NULL 空洞。<code>stat</code> 显示文件 4.6 GB，<code>du</code> 实际只 128 MB（其余是空洞）。
+<br/>检测：<code>stat -c "%s %b" file</code> — Size 和 Blocks×512 不一致就是空洞。
+<br/>修复：删除重下；<b>不用 -C -</b>，单次 curl 跑到底。
+</div>
+
+<h2>3. 仓库克隆 + git-lfs 必跑 <span class="en">(submodules + LFS wheels)</span></h2>
+
+<h3>3.1 浅克隆 + 选择性 submodule init</h3>
+
+<p>主仓 + 全部 submodule 可能几个 GB（IsaacLab / IsaacSim / BEHAVIOR-1K 都很大）。N1.7 训练只需要 LeIsaac + Isaac-GR00T：</p>
+
+<pre>cd /root/autodl-tmp
+git clone --depth 1 https://github.com/vitorcen/isaaclab-experience.git
+cd isaaclab-experience
+git submodule update --init --depth 1 LeIsaac
+git clone https://github.com/NVIDIA/Isaac-GR00T.git dependencies/Isaac-GR00T
+cd dependencies/Isaac-GR00T && git checkout &lt;pinned-commit&gt;</pre>
+
+<h3>3.2 git-lfs：第一次必装</h3>
+
+<div class="callout bad">
+<b>不装 git-lfs 直接 uv sync 会爆 "Invalid zip file structure"</b>
+<br/>原因：Isaac-GR00T 的 <code>scripts/deployment/dgpu/wheels/*.whl</code> 是 Git LFS 追踪文件，默认 clone 只拉 pointer (134 字节"version: lfs..."字串)，uv 把它当 zip 解析当然炸。
+</div>
+
+<pre>apt-get install -y git-lfs
+git lfs install
+cd /root/autodl-tmp/isaaclab-experience/dependencies/Isaac-GR00T
+git lfs pull                                                # 拉真二进制 (~470 MB)
+find scripts/deployment -name "*.whl" -exec ls -la {} \;    # 应该看到 ~400 MB whl 文件</pre>
+
+<h2>4. uv + tensorrt 在无卡模式的坑 <span class="en">(uv sync OOMs without GPU)</span></h2>
+
+<div class="callout bad">
+<b>无卡模式下 <code>uv sync</code> 卡死在 tensorrt-cu12 build</b>：
+<pre>Failed to generate package metadata for tensorrt-cu12-libs ...
+  PermissionError: [Errno 13] Permission denied: 'nvidia-smi'</pre>
+原因：tensorrt-cu12-libs 的 setup.py 探测 GPU 能力时调 <code>nvidia-smi</code>，AutoDL 无卡模式权限阻止访问。
+</div>
+
+<h3>4.1 三条出路</h3>
+<table>
+<tr><th>方案</th><th>步骤</th><th>成本</th><th>推荐度</th></tr>
+<tr><td><b>C. 本机预下 + 离线 install</b>（v2 推荐）</td><td>本机 <code>prefetch_uv_cache.sh</code> 打包 uv cache → <code>scp_upload_bundle.sh</code> → 无卡模式 <code>uv_sync_offline.sh</code></td><td>本机 10-30 min 一次性 + scp 30 min；之后任意 AutoDL 机器 2-5 min 装完</td><td><span class="tag-good">🥇 最快最省</span></td></tr>
+<tr><td>A. 切 GPU 模式装一次（v1）</td><td>关机 → GPU → uv sync（含 tensorrt build + 代理限速 1 MB/s）30-60 min → 关机回无卡</td><td>~1 小时 GPU 租金（¥2-8）</td><td><span class="tag-warn">⚠️ 慢</span></td></tr>
+<tr><td>B. 修 pyproject 砍 tensorrt</td><td>编辑 Isaac-GR00T submodule 去掉 tensorrt-cu12 依赖；TensorRT 仅 inference 用，训练不需要</td><td>0 费用但要维护补丁；submodule 更新冲突</td><td><span class="tag-warn">⚠️ 折腾</span></td></tr>
+</table>
+
+<div class="callout good">
+<b>💡 v2 path C 详细流程</b>
+<br/>
+<ol>
+<li><b>本机一次性</b>：<code>bash LeIsaac/scripts/cloud/local/prefetch_uv_cache.sh</code> — 本机 uv sync（10-30 min，本机 FTTH 100 MB/s 不会被限速），打包 ~7 GB tar.gz</li>
+<li><b>scp 上传</b>：<code>SSHPASS=xxx bash LeIsaac/scripts/cloud/local/scp_upload_bundle.sh /tmp/n17_uv_cache_bundle_*.tar.gz root@host port</code> — ~30 min @ 5 MB/s</li>
+<li><b>AutoDL 无卡模式</b>：<code>cd /root/autodl-tmp && tar xzf n17_uv_cache_bundle_*.tar.gz</code></li>
+<li><b>离线安装</b>：<code>bash isaaclab-experience/LeIsaac/scripts/cloud/autodl/uv_sync_offline.sh /root/autodl-tmp</code> — 2-5 min，无网络</li>
+</ol>
+注意：本机必须有 nvidia-smi（或装 fake shim 让 tensorrt-cu12 wheel_stub 探测通过）。本机不需要真实 GPU 算力。
+</div>
+
+<h3>4.2 uv sync 命令本身</h3>
+
+<div class="callout bad">
+<b>⚠️ <code>uv sync --extra=gpu</code> 是错的</b>
+<br/>Isaac-GR00T pyproject.toml 的 <code>[project.optional-dependencies]</code> 只有 <code>dev</code>，没有 <code>gpu</code>。torch/flash-attn 在主依赖里，不是 extra。
+</div>
+
+<pre>cd /root/autodl-tmp/isaaclab-experience/dependencies/Isaac-GR00T
+source /etc/network_turbo &gt;/dev/null 2&gt;&amp;1     # 拉 torch 2.7.1 cu128 wheel 走代理
+uv sync                                          # 不传 --extra=gpu</pre>
+
+<h2>5. 磁盘策略 <span class="en">(disk budget for VLA finetune)</span></h2>
+
+<h3>5.1 实测占用分布</h3>
+
+<svg viewBox="0 0 980 360" xmlns="http://www.w3.org/2000/svg">
+  <text x="490" y="22" font-weight="bold" font-size="14" text-anchor="middle">N1.7 finetune 磁盘占用分布（140 GB 总盘）</text>
+
+  <!-- Fixed stack on left -->
+  <rect x="60" y="60" width="320" height="35" fill="#1f6feb" stroke="#1a1a1a"/>
+  <text x="220" y="83" text-anchor="middle" fill="white" font-size="12">venv (torch + flash-attn) — 10 GB</text>
+  <rect x="60" y="95" width="160" height="35" fill="#1a7f37" stroke="#1a1a1a"/>
+  <text x="140" y="118" text-anchor="middle" fill="white" font-size="11">Cosmos base — 5 GB</text>
+  <rect x="60" y="130" width="30" height="35" fill="#d29922" stroke="#1a1a1a"/>
+  <text x="75" y="153" text-anchor="middle" fill="white" font-size="10">DS 1G</text>
+  <rect x="60" y="165" width="60" height="35" fill="#999" stroke="#1a1a1a"/>
+  <text x="90" y="188" text-anchor="middle" fill="white" font-size="10">repo+misc 2G</text>
+
+  <text x="60" y="225" font-size="11" font-weight="bold">固定开销：18 GB</text>
+
+  <!-- Ckpts on right -->
+  <text x="500" y="50" font-size="12" font-weight="bold">save_only_model=True 时单 ckpt 12 GB</text>
+  <g>
+    <rect x="500" y="60" width="60" height="35" fill="#cf222e" stroke="#1a1a1a"/>
+    <text x="530" y="83" text-anchor="middle" fill="white" font-size="10">ckpt1</text>
+    <rect x="560" y="60" width="60" height="35" fill="#cf222e" stroke="#1a1a1a"/>
+    <text x="590" y="83" text-anchor="middle" fill="white" font-size="10">ckpt2</text>
+    <rect x="620" y="60" width="60" height="35" fill="#cf222e" stroke="#1a1a1a"/>
+    <text x="650" y="83" text-anchor="middle" fill="white" font-size="10">ckpt3</text>
+    <rect x="680" y="60" width="60" height="35" fill="#cf222e" stroke="#1a1a1a"/>
+    <text x="710" y="83" text-anchor="middle" fill="white" font-size="10">ckpt4</text>
+    <rect x="740" y="60" width="60" height="35" fill="#cf222e" stroke="#1a1a1a"/>
+    <text x="770" y="83" text-anchor="middle" fill="white" font-size="10">ckpt5</text>
+    <rect x="800" y="60" width="60" height="35" fill="#cf222e" stroke="#1a1a1a"/>
+    <text x="830" y="83" text-anchor="middle" fill="white" font-size="10">ckpt6</text>
+  </g>
+  <text x="500" y="120" font-size="11">smart prune 留 6 个：72 GB</text>
+
+  <!-- save_only=False -->
+  <text x="500" y="160" font-size="12" font-weight="bold">save_only_model=False 单 ckpt 25 GB</text>
+  <g>
+    <rect x="500" y="170" width="125" height="35" fill="#7c2222" stroke="#1a1a1a"/>
+    <text x="562" y="193" text-anchor="middle" fill="white" font-size="10">ckpt + opt 1</text>
+    <rect x="625" y="170" width="125" height="35" fill="#7c2222" stroke="#1a1a1a"/>
+    <text x="687" y="193" text-anchor="middle" fill="white" font-size="10">ckpt + opt 2</text>
+    <rect x="750" y="170" width="125" height="35" fill="#7c2222" stroke="#1a1a1a"/>
+    <text x="812" y="193" text-anchor="middle" fill="white" font-size="10">ckpt + opt 3</text>
+  </g>
+  <text x="500" y="230" font-size="11">smart prune 留 3 个：75 GB（够 resume）</text>
+
+  <!-- Total bar -->
+  <rect x="60" y="280" width="900" height="40" fill="#f0f0f0" stroke="#1a1a1a"/>
+  <rect x="60" y="280" width="117" height="40" fill="#1f6feb"/>
+  <text x="120" y="305" text-anchor="middle" fill="white" font-size="11">固定 18</text>
+  <rect x="177" y="280" width="463" height="40" fill="#cf222e"/>
+  <text x="408" y="305" text-anchor="middle" fill="white" font-size="11">ckpts ×6 = 72</text>
+  <rect x="640" y="280" width="320" height="40" fill="#e6f4ea"/>
+  <text x="800" y="305" text-anchor="middle" fill="#1a1a1a" font-size="11">余量 50 GB</text>
+  <text x="60" y="340" font-size="11" font-weight="bold">140 GB 总盘 = 18 (固定) + 72 (6 ckpts) + 50 (余量) ✅</text>
+</svg>
+
+<h3>5.2 推荐配方（save_only_model=True + LossDrivenPrune）</h3>
+
+<table>
+<tr><th>参数</th><th>值</th><th>理由</th></tr>
+<tr><td><code>save_steps</code></td><td>1000</td><td>10k step 出 10 个 ckpt，足够 best 选择</td></tr>
+<tr><td><code>save_only_model</code></td><td>True</td><td>砍 13 GB optimizer state，单 ckpt 25→12 GB</td></tr>
+<tr><td><code>save_total_limit</code></td><td>10</td><td>HF Trainer 兜底，配合 prune callback</td></tr>
+<tr><td>LossDrivenPrune <code>top_k</code></td><td>5</td><td>留 train_loss 最低的 5 个 + last 1 = 最多 6 个并存</td></tr>
+<tr><td>实际峰值占用</td><td>~90 GB / 140 GB</td><td>留 50 GB 给 HF cache、训练日志、临时文件</td></tr>
+</table>
+
+<h3>5.3 LossDrivenPruneCallback 实现</h3>
+
+<pre># 加到 launch_finetune_ckpt_n17.py 的 _patch_save_pruning() 旁边
+class LossDrivenPruneCallback(TrainerCallback):
+    """Keep top-K ckpts by training loss + always keep last 1.
+    AutoDL 上没有 sim 跑 closed-loop eval，用 train_loss 当代理信号。"""
+    def __init__(self, top_k=5):
+        self.top_k = top_k
+        self.ckpt_losses = {}  # step → loss
+
+    def on_save(self, args, state, control, **kwargs):
+        if state.log_history:
+            last = state.log_history[-1]
+            if 'loss' in last and last.get('step') == state.global_step:
+                self.ckpt_losses[state.global_step] = last['loss']
+        # 排名 + 选 winner
+        all_steps = sorted(self.ckpt_losses.keys())
+        last_step = all_steps[-1] if all_steps else None
+        sorted_by_loss = sorted(self.ckpt_losses.items(), key=lambda x: x[1])
+        keepers = set(s for s, _ in sorted_by_loss[:self.top_k])
+        if last_step:
+            keepers.add(last_step)
+        # 删 loser
+        out = args.output_dir
+        for d in os.listdir(out):
+            m = re.match(r'^checkpoint-(\d+)$', d)
+            if m and int(m.group(1)) not in keepers:
+                shutil.rmtree(os.path.join(out, d), ignore_errors=True)
+                print(f'[loss-prune] del ckpt-{m.group(1)} '
+                      f'(loss={self.ckpt_losses.get(int(m.group(1)), "?")})', flush=True)</pre>
+
+<h2>6. 模式切换 <span class="en">(no-GPU mode ↔ GPU mode workflow)</span></h2>
+
+<svg viewBox="0 0 980 320" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="ar2" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L9,3 z" fill="#555" />
+    </marker>
+  </defs>
+  <text x="490" y="22" font-weight="bold" font-size="14" text-anchor="middle">无卡 ↔ GPU 模式分工</text>
+
+  <!-- no-GPU mode -->
+  <rect x="50" y="60" width="380" height="230" rx="8" fill="#e6f4ea" stroke="#1a7f37" stroke-width="2"/>
+  <text x="240" y="85" text-anchor="middle" font-size="13" font-weight="bold">无卡模式（便宜，¥0.1-0.3/h）</text>
+  <text x="60" y="115" font-size="11" font-weight="bold">能做：</text>
+  <text x="65" y="135" font-size="10">✓ git clone 主仓 + submodules</text>
+  <text x="65" y="155" font-size="10">✓ git lfs pull（拉 LFS wheels）</text>
+  <text x="65" y="175" font-size="10">✓ hf download dataset（公开 repo）</text>
+  <text x="65" y="195" font-size="10">✓ curl 单流下 gated model 权重</text>
+  <text x="65" y="215" font-size="10">✓ 写 .bashrc，安装 uv，调脚本</text>
+  <text x="65" y="235" font-size="10">✓ 查训练日志、看 ckpt 列表</text>
+  <text x="60" y="265" font-size="11" font-weight="bold" fill="#cf222e">不能做：</text>
+  <text x="65" y="282" font-size="10" fill="#cf222e">✗ uv sync（tensorrt-cu12 build 需要 nvidia-smi）</text>
+
+  <!-- GPU mode -->
+  <rect x="550" y="60" width="380" height="230" rx="8" fill="#fff8e6" stroke="#d29922" stroke-width="2"/>
+  <text x="740" y="85" text-anchor="middle" font-size="13" font-weight="bold">GPU 模式（贵，¥1.5-8/h）</text>
+  <text x="560" y="115" font-size="11" font-weight="bold">必须做：</text>
+  <text x="565" y="135" font-size="10">✓ uv sync（含 tensorrt build）~10 min</text>
+  <text x="565" y="155" font-size="10">✓ 训练（10k step × N hours）</text>
+  <text x="565" y="175" font-size="10">✓ 推理 / GR00T server</text>
+  <text x="560" y="205" font-size="11" font-weight="bold">建议做：</text>
+  <text x="565" y="225" font-size="10">○ Smoke 50 step 验显存峰值（OOM 早暴露）</text>
+  <text x="565" y="245" font-size="10">○ 训练完后 best ckpt 上传 HF Hub</text>
+  <text x="565" y="265" font-size="10" fill="#cf222e">⚠️ 关机前确认 ckpt 已 push 或拉回本地</text>
+  <text x="565" y="285" font-size="10" fill="#cf222e">⚠️ 训练 4090 几乎打满，不能并行 eval</text>
+
+  <!-- arrow -->
+  <path d="M 430 175 L 545 175" stroke="#555" stroke-width="2" marker-end="url(#ar2)"/>
+  <text x="486" y="170" text-anchor="middle" font-size="10" fill="#555">关机 → 选 GPU → 开机</text>
+  <text x="486" y="186" text-anchor="middle" font-size="9" fill="#555">autodl-tmp 内容完全保留</text>
+</svg>
+
+<h3>6.1 切换 SOP</h3>
+
+<table>
+<tr><th>步骤</th><th>动作</th><th>注意</th></tr>
+<tr><td>1</td><td>无卡模式：clone repo、写 .bashrc、装 uv、下载基础模型</td><td>~30 min，¥0.1</td></tr>
+<tr><td>2</td><td>AutoDL 面板 → 关机</td><td>autodl-tmp 数据安全</td></tr>
+<tr><td>3</td><td>选 GPU 卡 + 开机</td><td>SSH 端口可能变（44911 → 13330），更新自动化脚本</td></tr>
+<tr><td>4</td><td>GPU 模式：<code>uv sync</code> + smoke 50 step</td><td>~30 min</td></tr>
+<tr><td>5</td><td>启动正式训练 + auto-eval</td><td>N hours，watchdog 监视 OOM/exit 139</td></tr>
+<tr><td>6</td><td>训完 → best ckpt 上传 HF Hub</td><td><b>必须做</b>，否则关机后 ckpt 还在 autodl-tmp 上但收钱</td></tr>
+<tr><td>7</td><td>关机 → 回无卡模式或释放实例</td><td>训完想做后续分析回无卡省钱</td></tr>
+</table>
+
+<h2>7. 故障 playbook <span class="en">(common failure modes + recovery)</span></h2>
+
+<table>
+<tr><th>症状</th><th>根因</th><th>对策</th></tr>
+<tr><td><code>Access denied. This repository requires approval.</code></td><td>endpoint 上没有 token（hf-mirror 不转发 Authorization）</td><td><code>HF_ENDPOINT=https://huggingface.co hf auth login --token hf_xxx</code></td></tr>
+<tr><td><code>httpx.RemoteProtocolError: Server disconnected</code></td><td>hf 客户端多 worker 被代理掐</td><td>降到 <code>--max-workers 2</code>，大文件改 curl</td></tr>
+<tr><td><code>Invalid zip file structure</code> (uv sync flash-attn)</td><td>git-lfs 没装，wheel 是 134 字节 pointer</td><td><code>apt install git-lfs &amp;&amp; git lfs pull</code></td></tr>
+<tr><td><code>tls handshake eof</code> on <code>download-r2.pytorch.org</code></td><td>PyTorch CDN 从国内本机不通（无 VPN/proxy）；uv 默认走 download.pytorch.org 拿 torch wheel</td><td><b>本机 sed pyproject 替 URL 到 aliyun mirror：<br/><code>sed -i 's|https://download.pytorch.org/whl/cu128|https://mirrors.aliyun.com/pytorch-wheels/cu128|g' pyproject.toml</code><br/>aliyun 实测 14 MB/s 稳定</b></td></tr>
+<tr><td><code>PermissionError: 'nvidia-smi'</code> (tensorrt-cu12)</td><td>无卡模式</td><td>关机切 GPU 模式装一次</td></tr>
+<tr><td>文件 4.6 GB 但 du 显示 128 MB</td><td>curl <code>-C -</code> resume 跨 session 写出 sparse 空洞</td><td>删除重下，curl 不要用 <code>-C -</code></td></tr>
+<tr><td>aria2c <code>CN:1 DL:0B</code> 卡死</td><td>多连接被代理速率限制</td><td>改 curl 单流</td></tr>
+<tr><td>下载 21 KB/s 巨慢</td><td>代理质量临时 degraded</td><td>① 公开 repo 切 hf-mirror.com ② <b>gated repo 且本机有 cache → 改 scp 直传，4.7 MB/s vs 21 KB/s，快 225×</b> ③ 真无路只能等</td></tr>
+<tr><td>50 GB 数据盘满</td><td>没扩容</td><td>面板扩容；旧机不能扩则克隆迁移到新机</td></tr>
+<tr><td>训练 OOM 22 GB / 24 GB 反复</td><td>4090 + Cosmos backbone</td><td>开 grad-ckpt + adafactor + per-step=2 + grad_accum=8</td></tr>
+<tr><td>训练 exit 139（SIGSEGV）</td><td>bnb paged_adamw_8bit + 显存压线的 cuda kernel 偶发崩</td><td>用 adafactor 代替 paged_adamw_8bit；watchdog 自动 resume</td></tr>
+</table>
+
+<h2>8. 实测速度对比 <span class="en">(measured throughput)</span></h2>
+
+<table>
+<tr><th>场景</th><th>工具</th><th>带宽</th><th>说明</th></tr>
+<tr><td>HF 公开 dataset</td><td><code>hf download --max-workers 8</code> (hf-mirror)</td><td><b>~12 MB/s</b></td><td>LeIsaac dataset 700MB / 57s</td></tr>
+<tr><td>HF gated model HEAD</td><td><code>curl</code> via AutoDL proxy</td><td>~1.5s 延迟</td><td>能用，但延迟高</td></tr>
+<tr><td>HF gated model bulk</td><td><code>hf download --max-workers 4</code> via proxy</td><td><b>常掉到 0</b></td><td>多连接被代理掐</td></tr>
+<tr><td><b>HF gated model bulk</b></td><td><b><code>curl</code> 单流 via proxy</b></td><td><b>~600 KB/s 稳定</b></td><td><b>4.6 GB Cosmos 用此路径</b></td></tr>
+<tr><td>HF gated model bulk</td><td><code>aria2c</code> 8 conn via proxy</td><td>0 B/s 卡死</td><td>速率限制</td></tr>
+<tr><td>github clone (主仓 shallow)</td><td><code>git clone --depth 1</code> via proxy</td><td>~5s</td><td>OK</td></tr>
+<tr><td>github Isaac-GR00T submodule</td><td><code>git clone</code> via proxy</td><td>~80s for ~500 MB</td><td>OK</td></tr>
+<tr><td>github LFS pull</td><td><code>git lfs pull</code> via proxy</td><td>~50s for 470 MB</td><td>OK</td></tr>
+<tr><td>uv sync (torch 2.7.1 cu128) — v1 在线</td><td><code>uv sync</code> via AutoDL proxy（GPU 模式）</td><td><b>~30-60 min</b> for ~10 GB（实测被代理限速到 1 MB/s）</td><td>GPU 模式必须，含 tensorrt build</td></tr>
+<tr><td><b>uv sync — v2 离线 bundle</b></td><td><b><code>uv_sync_offline.sh</code> + 本机预下 bundle</b></td><td><b>~2-5 min</b> install only</td><td><b>无卡模式可用；本机预下 10-30 min 一次性</b></td></tr>
+<tr><td><b>本机 download.pytorch.org → aliyun mirror</b></td><td>sed pyproject.toml URL → <code>https://mirrors.aliyun.com/pytorch-wheels/cu128</code></td><td><b>~14 MB/s</b>（100 MB 实测 7.4s）</td><td><b>国内本机 uv sync 必备；PyTorch CDN 不通时唯一路径</b></td></tr>
+<tr><td><b>本机已有 cache → AutoDL</b></td><td><b><code>scp</code> 直传</b></td><td><b>~4.7 MB/s</b>（受限于本地上传带宽）</td><td><b>代理 degrade 时救命方案；4.6 GB 约 15 min vs 代理 60h</b></td></tr>
+</table>
+
+<div class="callout good">
+<b>💡 救命方案：scp 直传</b>
+<br/>当 AutoDL 代理 degrade 到 KB/s 级别（实战遇到过 21 KB/s 持续 7+ min），且模型已在本地 HF cache 时，<b>直接 scp</b>：
+<pre>COSMOS=$(readlink -f ~/.cache/huggingface/hub/models--nvidia--Cosmos-Reason2-2B/snapshots/*/model.safetensors)
+sshpass -e scp -P &lt;port&gt; "$COSMOS" root@&lt;host&gt;:/root/autodl-tmp/cosmos_raw/model.safetensors</pre>
+4.6 GB 本机上传 (~5 MB/s FTTH) 约 15 min，比代理快 200×。bottleneck 是本地上传带宽，AutoDL ingress 不限速。
+</div>
+
+<h2>9. 持久化清单 <span class="en">(things to put in .bashrc)</span></h2>
+
+<pre>cat &gt;&gt; ~/.bashrc &lt;&lt;'EOF'
+# --- AutoDL HF acceleration (PUT THESE IN BASHRC, persists across reboots) ---
+export HF_ENDPOINT=https://hf-mirror.com           # 公开 repo 默认走镜像
+export HF_HOME=/root/autodl-tmp/hf_cache           # cache 落数据盘不爆系统盘
+export HF_XET_HIGH_PERFORMANCE=1                   # 替代已废弃的 HF_HUB_ENABLE_HF_TRANSFER
+export PATH=/root/.local/bin:/root/miniconda3/bin:$PATH
+
+# 用 gated repo 时手动 source /etc/network_turbo + 临时 HF_ENDPOINT=https://huggingface.co
+EOF</pre>
+
+<h2>10. 未实施的优化提议 <span class="en">(future work, not done yet)</span></h2>
+
+<h3>10.1 NVDEC 硬件视频解码 <span class="en">(boost GPU util from 30% → 60-80%)</span></h3>
+
+<div class="callout info">
+<b>背景</b>：VLA 训练 GPU util 通常只 30-40%，根因是 CPU bound — 每 batch 都要 torchcodec → FFmpeg 串行解 32-256 个 H.264 视频帧。Cosmos+DiT forward/backward 在 GPU 上只 ~0.5-1s，但 dataloader 准备 batch 要 3-5s。
+</div>
+
+<table>
+<tr><th>项</th><th>当前（CPU 解码）</th><th>NVDEC 改造后（预期）</th></tr>
+<tr><td>video decode 路径</td><td>torchcodec → libavcodec → CPU H.264 → CPU memcpy → GPU</td><td>torchcodec(device='cuda') → NVDEC 硬件单元 → GPU memory 直读</td></tr>
+<tr><td>每帧延迟</td><td>10-50ms / frame</td><td>1-3ms / frame</td></tr>
+<tr><td>CPU 负载</td><td>208 cores 满载（4-16 workers）</td><td>近闲（仅文件 IO）</td></tr>
+<tr><td>GPU util</td><td>30-40% avg（实测）</td><td>60-80% avg（理论）</td></tr>
+<tr><td>10k step 时长</td><td>~18h（per-step=8, A 配）</td><td>~6-9h 估</td></tr>
+</table>
+
+<h4>10.1.1 改造步骤</h4>
+
+<pre># gr00t/utils/video_utils.py 大约 line 96 附近：
+# torchcodec VideoDecoder 默认 CPU device，加 device="cuda" 参数
+
+from torchcodec.decoders import VideoDecoder
+decoder = VideoDecoder(video_path, device="cuda")    # ← 当前默认空，改成 "cuda"</pre>
+
+<h4>10.1.2 风险 / 验证清单</h4>
+
+<ol>
+<li><b>NVDEC 硬件兼容性</b>：PRO 6000 / 4090 / 4090D / A100 / H100 都有 NVDEC（NVENC 不重要），但某些 H.264 profile（High 10 / High 4:4:4）NVDEC 不支持。需 <code>ffprobe -v error -select_streams v:0 -show_entries stream=profile</code> 验证 LeIsaac 数据集 profile。</li>
+<li><b>torchcodec device 行为</b>：CUDA decoder 输出 tensor 在 GPU 上，转 numpy / albumentations 增强需要 .cpu()。要么把 augmentation 也搬 GPU（kornia 替代），要么接受这段 transfer overhead。</li>
+<li><b>多 dataloader worker 与 CUDA context</b>：每个 worker 进程 fork 后需要独立 init CUDA context，可能造成 GPU 内存碎片。建议从 workers=16 降到 4-8。</li>
+<li><b>验证方式</b>：smoke 50 step 测 GPU util（nvidia-smi --query-gpu=utilization.gpu --format=csv --loop=1）+ step time，目标 GPU util > 60%。</li>
+</ol>
+
+<h4>10.1.3 何时做</h4>
+
+<div class="callout">
+<b>不在当前 session 做</b>：当前 PRO 6000 + A 配（per-step=8, workers=4）已验证 6000 step 11h ¥77 可接受。NVDEC 改造需要 1-2h 验证 + 可能需要回滚，session 中段折腾性价比低。
+<br/><b>下次新机一开始就做</b>：先 smoke 验证 NVDEC 兼容，再启正式训练。预期 10k step 时间 ~6-9h vs 当前 18h，省 50% GPU 租金。
+</div>
+
+<h3>10.2 其他未实施提议</h3>
+
+<table>
+<tr><th>提议</th><th>预期收益</th><th>风险</th><th>优先级</th></tr>
+<tr><td>预解码 video 为 numpy .npy 落盘（一次性 CPU 投入消除每 batch decode）</td><td>GPU util ~60-70%，dataset 体积 ×5-10</td><td>磁盘空间 ×5（700MB→3.5GB），但训练时 IO 顺序读极快</td><td>中（与 NVDEC 二选一）</td></tr>
+<tr><td>FSDP 多卡分片（2× 4090D 48GB DDP）</td><td>~2× 速度，钱 ~平</td><td>多 GPU 实例 NCCL 配置 + lr 调整</td><td>中（适合做参数 sweep）</td></tr>
+<tr><td>QLoRA 4-bit backbone（trainable params 880M→100M）</td><td>显存 26GB→12GB，可上 24GB 4090</td><td>4-bit Cosmos 是否 stable 不确定</td><td>低（VRAM 已不是瓶颈）</td></tr>
+<tr><td>persistent_workers=True + prefetch_factor=4</td><td>消除 30 step 一次 shard 切换 stall</td><td>低，但 worker 内存占用变高</td><td>高（一行 patch，可顺手做）</td></tr>
+</table>
+
+<h2>11. 关联文档 <span class="en">(related docs / memories)</span></h2>
+
+<ul>
+<li><a href="gr00t_finetune_pick_orange.html">gr00t_finetune_pick_orange.html</a> — GR00T N1.5/N1.6/N1.7 微调主线</li>
+<li><a href="dp_inference_speedup_and_dynamic_timeout.html">dp_inference_speedup_and_dynamic_timeout.html</a> — DP DDIM swap + dynamic timeout</li>
+<li>memory <code>feedback-training-resume-chunks</code> — 长训练拆 5 段 resume</li>
+<li>memory <code>feedback-training-save-policy</code> — 长训练 ckpt 双层 prune</li>
+<li>memory <code>feedback-incremental-eval-during-training</code> — 1/10 quick eval 强制（AutoDL 无 sim 时改用 loss-driven prune）</li>
+<li>AutoDL 官方文档：<code>https://www.autodl.com/docs/network_turbo/</code></li>
+</ul>
+
+</body>
+</html>
