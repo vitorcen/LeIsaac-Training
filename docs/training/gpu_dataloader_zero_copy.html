@@ -1,0 +1,514 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>GR00T 训练 GPU 不空转 — 视频零拷贝 dataloader 优化</title>
+<style>
+  /* Force light theme — browser dark mode can otherwise invert background while keeping text dark. */
+  :root { color-scheme: light; }
+  html, body { background: #ffffff; }
+  body { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+         max-width: 1100px; margin: 0 auto; padding: 24px 32px;
+         line-height: 1.75; color: #1d1d1f; background: #ffffff; }
+  h1 { border-bottom: 3px solid #0a84ff; padding-bottom: 10px; }
+  h2 { color: #0a84ff; margin-top: 40px; border-left: 4px solid #0a84ff; padding-left: 10px; }
+  h3 { color: #515154; margin-top: 24px; }
+  code { background: #f5f5f7; color: inherit; padding: 1px 6px; border-radius: 4px;
+         font-family: SF Mono, Menlo, monospace; font-size: 0.9em; }
+  pre { background: #1d1d1f; color: #f5f5f7; padding: 14px 18px; border-radius: 8px;
+        overflow-x: auto; font-size: 13px; line-height: 1.5; }
+  pre code { background: transparent; color: inherit; padding: 0; }
+  .tldr { background: #fff7e6; color: #1d1d1f; border-left: 5px solid #ff9500;
+          padding: 14px 18px; border-radius: 0 6px 6px 0; margin: 16px 0 24px; }
+  .eng { color: #6e6e73; font-style: italic; font-size: 0.92em; }
+  .ok  { color: #34c759; font-weight: 600; }
+  .bad { color: #ff3b30; font-weight: 600; }
+  .warn{ color: #ff9500; font-weight: 600; }
+  table { border-collapse: collapse; width: 100%; margin: 14px 0; font-size: 0.95em; background: #fff; }
+  th, td { border: 1px solid #d2d2d7; padding: 8px 12px; text-align: left; vertical-align: top; color: #1d1d1f; }
+  th { background: #f5f5f7; font-weight: 600; }
+  .pill { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 0.78em; font-weight: 600; margin-right: 4px; }
+  .pill-must { background: #e8f8ed; color: #28a745; }
+  .pill-nice { background: #e8f0ff; color: #0a52a1; }
+  .pill-skip { background: #ffebec; color: #c93a3f; }
+  .stage { background: #f5f5f7; color: #1d1d1f; padding: 14px 18px; border-radius: 8px; margin: 14px 0; border-left: 4px solid #0a84ff; }
+  .stage.win { border-left-color: #34c759; }
+  .stage.skip { border-left-color: #ff3b30; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin: 14px 0; }
+  .grid > div { background: #f5f5f7; color: #1d1d1f; padding: 12px 16px; border-radius: 8px; }
+  .grid > div.win { background: #e8f8ed; }
+  .grid > div.bad { background: #ffebec; }
+</style>
+</head>
+<body>
+
+<h1>GR00T 训练 GPU 不空转 — 视频零拷贝 dataloader 优化</h1>
+<p class="eng">Killing CPU dataloader bottleneck for GR00T-N1.7 fine-tuning on 5090/4090: pre-decoded RAM cache &gt; NVDEC GPU decode &gt; pin_memory/non_blocking &gt; GPU augmentation.</p>
+<p>日期：2026-05-23 · 任务：LeIsaac SO-101 PickOrange · 模型：GR00T-N1.7-3B · 数据集：50 demo / 30Hz / 480×848 H264 mp4</p>
+
+<div class="tldr">
+  <strong>TL;DR</strong>
+  云端 5090 训练 N1.7 时 <b>GPU util &lt; 50%</b>，原因不是模型太大，是 dataloader 拿 ffmpeg 软解码当主路径。
+  Opus + Codex (gpt-5.4) + Opencode (deepseek-v4-pro) 三模型一致结论：
+  <ol style="margin: 6px 0 4px 18px;">
+    <li><b>把"每 step 现解 mp4"这个特殊情况干掉</b> —— 预解码到 npy memmap，训练 zero-decode → GPU util 50→85%</li>
+    <li>pin_memory + non_blocking H2D 重叠 →再 +5-10%</li>
+    <li>NVDEC GPU 解码作为备选（环境脆）</li>
+    <li>不要切 WebDataset / DataLoader2，那是伪优化</li>
+  </ol>
+  <span class="eng">Pre-decode to RAM/NVMe memmap kills 95% of CPU dataloader cost on small (50 demo) datasets. Total cache for PickOrange 30k frame × 480×848×3 uint8 ≈ 34 GB — easily fits in 62 GB host RAM.</span>
+</div>
+
+<h2>1. 现状 pipeline 与瓶颈 <span class="eng">— Current pipeline &amp; bottleneck</span></h2>
+
+<p>读 <code>dependencies/Isaac-GR00T/</code> 源码定位每一步在哪做：</p>
+
+<table>
+  <tr><th>阶段 <span class="eng">stage</span></th><th>位置 <span class="eng">location</span></th><th>设备</th><th>每 step 耗时</th></tr>
+  <tr><td>① 视频解码 (decode mp4 → uint8 numpy)</td><td><code>gr00t/utils/video_utils.py:366</code><br><code>torchcodec VideoDecoder(device="cpu")</code></td><td class="bad">CPU</td><td>~15-25ms / frame</td></tr>
+  <tr><td>② albumentations image aug (color jitter, crop)</td><td><code>gr00t/model/gr00t_n1d7/image_augmentations.py:26</code></td><td class="bad">CPU</td><td>~3-8ms / image</td></tr>
+  <tr><td>③ processor 拼 prompt + tokenize</td><td><code>processing_gr00t_n1d7.py</code></td><td class="bad">CPU</td><td>~1-2ms</td></tr>
+  <tr><td>④ collator stack (轻)</td><td><code>data/collator/collators.py:22</code> 只做 <code>torch.stack</code></td><td>CPU</td><td>&lt; 1ms</td></tr>
+  <tr><td>⑤ H2D pinned copy</td><td>HF Trainer 内置</td><td>PCIe</td><td>~2-5ms / batch</td></tr>
+  <tr><td>⑥ forward + backward</td><td>2.2B params (877M trainable)</td><td class="ok">GPU</td><td>~120-180ms / step</td></tr>
+</table>
+
+<p><b>每 step 总账</b>：micro_batch=8 × 单 sample CPU 解码+aug ≈ 200ms（4 worker 并行 ≈ 50ms），GPU forward+backward ≈ 150ms。理论上 4 worker 够喂 GPU，但实测 GPU util &lt; 50% 说明：</p>
+<ul>
+  <li>worker 内部 <code>VideoDecoder(device="cpu")</code> 硬编码 + <code>num_ffmpeg_threads=0</code>（让 ffmpeg 自决，常退化成单线程）</li>
+  <li>每次访问 sample 都 re-open mp4 + seek，cache miss 严重</li>
+  <li>多 cam 时 albumentations apply_with_replay 串行执行</li>
+  <li>worker IPC 把整个 batch dict pickle 过来，包含 large uint8 frames</li>
+</ul>
+
+<h2>2. 数据流示意 <span class="eng">— Data flow diagram</span></h2>
+
+<svg viewBox="0 0 1020 420" xmlns="http://www.w3.org/2000/svg" style="background:#fafafa;border:1px solid #ddd;border-radius:8px;display:block;margin:14px auto;width:100%;max-width:1020px;">
+  <defs>
+    <marker id="ar1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#0a84ff"/></marker>
+    <marker id="ar2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#ff3b30"/></marker>
+    <marker id="ar3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#34c759"/></marker>
+  </defs>
+
+  <!-- Title -->
+  <text x="510" y="22" text-anchor="middle" font-size="14" font-weight="700" fill="#1d1d1f">现状（红线 = CPU 瓶颈）vs 改造后（绿线 = pre-decoded RAM cache + NVDEC fallback）</text>
+
+  <!-- Row 1: current -->
+  <text x="20" y="55" font-size="12" font-weight="700" fill="#c93a3f">现状 Current</text>
+  <rect x="20"  y="65" width="170" height="80" rx="8" fill="#fff" stroke="#ff3b30" stroke-width="2"/>
+  <text x="105" y="92"  text-anchor="middle" font-size="12" font-weight="700">磁盘 mp4 H264</text>
+  <text x="105" y="110" text-anchor="middle" font-size="10" fill="#666">50 ep × 600 frame</text>
+  <text x="105" y="126" text-anchor="middle" font-size="10" fill="#666">~几百 MB</text>
+
+  <rect x="220" y="65" width="180" height="80" rx="8" fill="#ffe9e9" stroke="#ff3b30" stroke-width="2"/>
+  <text x="310" y="90"  text-anchor="middle" font-size="12" font-weight="700">torchcodec CPU 解码</text>
+  <text x="310" y="108" text-anchor="middle" font-size="10" fill="#666">device="cpu", threads=0</text>
+  <text x="310" y="124" text-anchor="middle" font-size="10" fill="#666">~50 fps / worker</text>
+
+  <rect x="430" y="65" width="180" height="80" rx="8" fill="#ffe9e9" stroke="#ff3b30" stroke-width="2"/>
+  <text x="520" y="90"  text-anchor="middle" font-size="12" font-weight="700">albumentations 增强</text>
+  <text x="520" y="108" text-anchor="middle" font-size="10" fill="#666">PIL → numpy → PIL</text>
+  <text x="520" y="124" text-anchor="middle" font-size="10" fill="#666">apply_with_replay</text>
+
+  <rect x="640" y="65" width="150" height="80" rx="8" fill="#fff" stroke="#ff9500" stroke-width="2"/>
+  <text x="715" y="92"  text-anchor="middle" font-size="12" font-weight="700">collate + IPC</text>
+  <text x="715" y="110" text-anchor="middle" font-size="10" fill="#666">torch.stack</text>
+  <text x="715" y="126" text-anchor="middle" font-size="10" fill="#666">worker→main pickle</text>
+
+  <rect x="820" y="65" width="180" height="80" rx="8" fill="#e8f8ed" stroke="#34c759" stroke-width="2"/>
+  <text x="910" y="92"  text-anchor="middle" font-size="12" font-weight="700">GPU forward/backward</text>
+  <text x="910" y="110" text-anchor="middle" font-size="10" fill="#666">5090 32GB 等输入</text>
+  <text x="910" y="126" text-anchor="middle" font-size="10" fill="#666" font-weight="700" fill="#c93a3f">util &lt; 50%</text>
+
+  <line x1="190" y1="105" x2="218" y2="105" stroke="#ff3b30" stroke-width="2" marker-end="url(#ar2)"/>
+  <line x1="400" y1="105" x2="428" y2="105" stroke="#ff3b30" stroke-width="2" marker-end="url(#ar2)"/>
+  <line x1="610" y1="105" x2="638" y2="105" stroke="#ff3b30" stroke-width="2" marker-end="url(#ar2)"/>
+  <line x1="790" y1="105" x2="818" y2="105" stroke="#ff3b30" stroke-width="2" marker-end="url(#ar2)"/>
+
+  <!-- Row 2: improved -->
+  <text x="20" y="195" font-size="12" font-weight="700" fill="#107c2c">改造后 Improved</text>
+  <rect x="20"  y="205" width="170" height="80" rx="8" fill="#fff" stroke="#34c759" stroke-width="2"/>
+  <text x="105" y="232" text-anchor="middle" font-size="12" font-weight="700">预解码 npy memmap</text>
+  <text x="105" y="250" text-anchor="middle" font-size="10" fill="#666">/dev/shm/cache/*.npy</text>
+  <text x="105" y="266" text-anchor="middle" font-size="10" fill="#666">~34GB uint8 一次性</text>
+
+  <rect x="220" y="205" width="180" height="80" rx="8" fill="#e8f8ed" stroke="#34c759" stroke-width="2"/>
+  <text x="310" y="232" text-anchor="middle" font-size="12" font-weight="700">memmap slice</text>
+  <text x="310" y="250" text-anchor="middle" font-size="10" fill="#666">zero decode</text>
+  <text x="310" y="266" text-anchor="middle" font-size="10" fill="#666">~&lt; 1ms / sample</text>
+
+  <rect x="430" y="205" width="180" height="80" rx="8" fill="#e8f8ed" stroke="#34c759" stroke-width="2"/>
+  <text x="520" y="232" text-anchor="middle" font-size="12" font-weight="700">worker 仅 stack</text>
+  <text x="520" y="250" text-anchor="middle" font-size="10" fill="#666">uint8 → pinned tensor</text>
+  <text x="520" y="266" text-anchor="middle" font-size="10" fill="#666">aug 移 GPU</text>
+
+  <rect x="640" y="205" width="150" height="80" rx="8" fill="#e8f8ed" stroke="#34c759" stroke-width="2"/>
+  <text x="715" y="232" text-anchor="middle" font-size="12" font-weight="700">H2D non_blocking</text>
+  <text x="715" y="250" text-anchor="middle" font-size="10" fill="#666">cuda.Stream prefetch</text>
+  <text x="715" y="266" text-anchor="middle" font-size="10" fill="#666">overlap forward</text>
+
+  <rect x="820" y="205" width="180" height="80" rx="8" fill="#e8f8ed" stroke="#34c759" stroke-width="2"/>
+  <text x="910" y="232" text-anchor="middle" font-size="12" font-weight="700">GPU aug + forward</text>
+  <text x="910" y="250" text-anchor="middle" font-size="10" fill="#666">kornia/torchvision.v2</text>
+  <text x="910" y="266" text-anchor="middle" font-size="10" font-weight="700" fill="#107c2c">util &gt; 80%</text>
+
+  <line x1="190" y1="245" x2="218" y2="245" stroke="#34c759" stroke-width="2" marker-end="url(#ar3)"/>
+  <line x1="400" y1="245" x2="428" y2="245" stroke="#34c759" stroke-width="2" marker-end="url(#ar3)"/>
+  <line x1="610" y1="245" x2="638" y2="245" stroke="#34c759" stroke-width="2" marker-end="url(#ar3)"/>
+  <line x1="790" y1="245" x2="818" y2="245" stroke="#34c759" stroke-width="2" marker-end="url(#ar3)"/>
+
+  <!-- Row 3: NVDEC alt path -->
+  <text x="20" y="330" font-size="12" font-weight="700" fill="#0a52a1">备选 Alt: NVDEC</text>
+  <rect x="220" y="330" width="380" height="60" rx="8" fill="#e8f0ff" stroke="#0a84ff" stroke-width="2"/>
+  <text x="410" y="356" text-anchor="middle" font-size="12" font-weight="700">torchcodec VideoDecoder(device="cuda")</text>
+  <text x="410" y="375" text-anchor="middle" font-size="10" fill="#666">环境配通即可，NVDEC ~1000+ fps，无需 cache 文件</text>
+
+  <line x1="190" y1="360" x2="218" y2="360" stroke="#0a84ff" stroke-width="2" marker-end="url(#ar1)"/>
+  <line x1="600" y1="360" x2="715" y2="290" stroke="#0a84ff" stroke-width="2" marker-end="url(#ar1)" stroke-dasharray="4,3"/>
+</svg>
+
+<h2>3. 5 个优化点 — 按 ROI 排序 <span class="eng">— 5 actions ranked by ROI</span></h2>
+
+<p>三模型综合结论。每条标 <span class="pill pill-must">必做</span> / <span class="pill pill-nice">锦上添花</span> / <span class="pill pill-skip">坑别踩</span>。</p>
+
+<div class="stage win">
+<h3><span class="pill pill-must">必做 #1</span> 离线预解码 mp4 → npy memmap，训练零解码 <span class="eng">— Pre-decode video to memmap, zero runtime decode</span></h3>
+
+<p><b>Why:</b> 50-demo PickOrange 数据集只有 30k frame × 480×848×3 uint8 = <b>34 GB</b>，完全可以 RAM-cache 或 NVMe memmap。"每 step 现解 mp4 + ffmpeg software decode" 是当前最大瓶颈，没必要每 epoch 重做同样的解码工作。</p>
+
+<p><b>How:</b></p>
+<pre><code># 一次性预处理脚本（伪代码）
+import numpy as np, torchcodec
+from pathlib import Path
+
+CACHE = Path("/dev/shm/leisaac_cache")  # or NVMe
+CACHE.mkdir(parents=True, exist_ok=True)
+
+for ep in range(50):
+    for cam in ["front"]:
+        vid = f"data/PickOrange/videos/chunk-000/observation.images.{cam}/episode_{ep:06d}.mp4"
+        dec = torchcodec.decoders.VideoDecoder(vid, device="cpu", dimension_order="NHWC")
+        frames = dec[:].data.numpy()  # (T, H, W, 3) uint8
+        # 落 memmap，按 (frame, H, W, C) 连续布局，加 metadata header
+        out = CACHE / f"ep{ep:03d}_{cam}.npy"
+        np.save(out, frames)
+
+# 训练 dataset 改一行：原来的 get_frames_by_indices() 替换为
+# np.load(cache_path, mmap_mode="r")[indices]
+</code></pre>
+
+<p><b>改动点：</b></p>
+<ul>
+  <li><code>gr00t/data/dataset/lerobot_episode_loader.py:398</code> <code>_load_video_data</code> 接一个 <code>cache_dir</code> 参数：当 <code>cache_dir/ep{i}_{cam}.npy</code> 存在时直接 memmap slice，否则回落 torchcodec</li>
+  <li>预处理脚本放 <code>LeIsaac/scripts/finetune/gr00t/precache_videos.py</code></li>
+  <li>统一 <code>uint8</code> 不做 normalize，留给 GPU 端</li>
+</ul>
+
+<p><b>Expected gain:</b> GPU util 50% → 80-85%，吞吐 ~1.7×</p>
+<p><b>Risk:</b> 磁盘/RAM 占用上升（小数据集无所谓）；多 cam 时按 cam 分文件，避免单 npy 太大</p>
+</div>
+
+<div class="stage win">
+<h3><span class="pill pill-must">必做 #2</span> pin_memory + non_blocking + cuda.Stream H2D 重叠 <span class="eng">— Pinned H2D + stream prefetch</span></h3>
+
+<p><b>Why:</b> dataloader 即使数据准备好了，<code>.to(device)</code> 默认是同步阻塞的。开 <code>pin_memory=True</code> + <code>non_blocking=True</code> + 专用 cuda stream 可以让"下 batch H2D"和"当前 step forward"重叠。</p>
+
+<p><b>How:</b></p>
+<pre><code># trainer.py:248 改 dataloader_params
+"pin_memory": True,                # HF Trainer 默认就是 True，确认没被关
+"prefetch_factor": 4,              # 默认 2，加到 4 让 worker 多 buffer 一些
+
+# 自定义 training step（或 hook 进 HF Trainer.training_step）：
+class GpuPrefetcher:
+    def __init__(self, loader, device):
+        self.loader = iter(loader); self.device = device
+        self.stream = torch.cuda.Stream()
+        self._prefetch()
+    def _prefetch(self):
+        try: self.next = next(self.loader)
+        except StopIteration: self.next = None; return
+        with torch.cuda.stream(self.stream):
+            self.next = {k: v.to(self.device, non_blocking=True) for k,v in self.next.items()}
+    def __next__(self):
+        torch.cuda.current_stream().wait_stream(self.stream)
+        batch, self.next = self.next, None
+        self._prefetch()
+        return batch
+</code></pre>
+
+<p><b>改动点：</b></p>
+<ul>
+  <li><code>trainer.py:248</code> 加 <code>"prefetch_factor": 4</code></li>
+  <li>可选：在 HF Trainer 外层用 <code>GpuPrefetcher</code> 包一层，最干净的做法是 monkey-patch <code>_inner_training_loop</code></li>
+</ul>
+
+<p><b>Expected gain:</b> +5-10% GPU util（已经预解码后）</p>
+<p><b>Risk:</b> pinned memory 吃更多 host RAM（~prefetch_factor × batch × frame_size）；不会出错只会更慢</p>
+</div>
+
+<div class="stage win">
+<h3><span class="pill pill-must">必做 #3</span> num_workers 重调 + persistent_workers <span class="eng">— Tune workers</span></h3>
+
+<p><b>Why:</b> 当前 <code>DATALOADER_NUM_WORKERS=4</code> 固化，i9-13900KF / 5090 服务器都有 16+ 物理核，浪费严重。但 worker 数 ≠ 越多越好：video decode 是 IO + CPU 重活，过多 worker 会让 ffmpeg context 互相挤。</p>
+
+<p><b>How:</b></p>
+<pre><code># train_n17.sh:88
+DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-8}"   # 4090: 8, 5090/96vcpu: 12-16
+
+# 加一个 sweep helper 给后续人：在 launch_finetune 加 env 接收
+# DATALOADER_PREFETCH_FACTOR / DATALOADER_PIN_MEMORY 旋钮
+</code></pre>
+
+<p><b>Expected gain:</b> 配合 #1 后边际收益 +5-15%；单独开（不预解码）也能 +10-30%</p>
+<p><b>Risk:</b> 太多 worker 会内存爆炸 + ffmpeg 抢资源，建议先扫 <code>{4, 8, 12, 16}</code></p>
+</div>
+
+<div class="stage">
+<h3><span class="pill pill-nice">锦上添花 #4</span> CPU image aug 迁移到 GPU <span class="eng">— Move aug from albumentations to kornia/torchvision.v2 on CUDA</span></h3>
+
+<p><b>Why:</b> <code>image_augmentations.py</code> 用 albumentations 在 worker 内做 color jitter / crop / mask transform，串行 + PIL 转换有开销。如果迁到 GPU（kornia 或 torchvision.transforms.v2），可以在已经 H2D 的 batch 上一次性 vectorize。</p>
+
+<p><b>How:</b></p>
+<pre><code># worker 只产出原始 uint8 frame，不做任何 aug
+# 训练 step 开头：
+batch_imgs = batch_imgs.to(device, non_blocking=True)  # uint8 (B, T, C, H, W)
+batch_imgs = batch_imgs.float() / 255.0
+batch_imgs = gpu_aug(batch_imgs)   # kornia.augmentation.ColorJitter / RandomCrop on cuda
+</code></pre>
+
+<p><b>Expected gain:</b> 配合预解码后 +3-8%；不预解码时这个收益被 video decode 掩盖看不出来</p>
+<p><b>Risk:</b> 数值实现差异（albumentations vs kornia 的实现细节不完全等价），seed 不可复现，需要重新调实验</p>
+</div>
+
+<div class="stage skip">
+<h3><span class="pill pill-skip">不要做 #5</span> 切 WebDataset / DataPipes / DataLoader2 <span class="eng">— Don't migrate dataloader framework</span></h3>
+
+<p><b>Why not:</b> WebDataset/DataPipes 主要解决"海量远程数据流"问题。LeIsaac 50 demo 是个本地小数据集，瓶颈在解码不在 IO。换框架只会增加复杂度 + 引入新 bug + 破坏现有 Trainer 兼容，零收益。</p>
+
+<p>同理：不要试图魔改 HF Trainer 换成 Lightning / 自己写 loop。Linus 第一铁律是不破坏，第三铁律是实用主义。</p>
+</div>
+
+<h2>4. 本机实测结果 <span class="eng">— Bench results (RTX 4090 / i9-13900KF, 2026-05-23)</span></h2>
+
+<div class="tldr">
+  <strong>实测结论：</strong> memmap + pipeline non_blocking 联合最佳，<b>GPU util 50% → 61.3%</b>、wall-clock <b>92.6s → 76.5s (-17.4%)</b>。但 steady-state it/s 卡在 1.99 不动 — <b>CPU 100% 即使加了所有 patch 也满载</b>，说明真瓶颈是每 step 的 albumentations image aug + Qwen3VLProcessor tokenize，不是 video decode 也不是 H2D。下一步必须攻 aug→GPU 才能再涨。
+  <br><br>
+  <span class="eng">Memmap + non_blocking H2D pipeline overlap got us to GPU util 61% with 17% wall-clock improvement. But CPU stayed pegged at 100% — the actual ceiling is per-step CPU work (image aug + VLM tokenize), not the data movement Opus/Codex/Opencode initially flagged.</span>
+</div>
+
+<h3>4.1 五组对照实验</h3>
+
+<table>
+  <tr><th>配置</th><th>train_runtime</th><th>step/s</th><th>GPU util mid</th><th>CPU</th><th>结论</th></tr>
+  <tr><td>① baseline (4w torchcodec decode)</td><td>92.6s</td><td>0.86</td><td>50.0%</td><td>100%</td><td>起点；前 38s 在 worker shard cache warmup</td></tr>
+  <tr><td>② memmap (4w)</td><td>78.0s</td><td>1.03</td><td>50.9%</td><td>100%</td><td>-15.7% 但全在 warmup；steady 1.99 it/s 不变</td></tr>
+  <tr><td>③ memmap + 8w</td><td>82.5s</td><td>0.97</td><td>56.3%</td><td>100%</td><td><span class="bad">回退</span>；i9-13900KF 8 P-core 用满，多 worker 抢资源</td></tr>
+  <tr><td>④ memmap + 4w + pipeline non_blocking</td><td><b>76.5s</b></td><td><b>1.05</b></td><td><b>61.3%</b></td><td>100%</td><td><span class="ok">最佳</span>；GPU util 真正涨了 +11pp</td></tr>
+  <tr><td>⑤ ④ + prefetch_factor=8</td><td>78.7s</td><td>1.02</td><td>55.2%</td><td>100%</td><td><span class="bad">回退</span>；buffer 大反占 CPU</td></tr>
+</table>
+
+<h3>4.2 Micro-bench：video decode 单点比对</h3>
+
+<table>
+  <tr><th>路径</th><th>单线程 fps</th><th>4 worker fps</th><th>每 call latency</th></tr>
+  <tr><td>torchcodec CPU decode (current)</td><td>167</td><td>988</td><td>95.6 ms</td></tr>
+  <tr><td>memmap (re-open per call)</td><td>1388</td><td>1303</td><td>11.5 ms</td></tr>
+  <tr><td><b>memmap (persistent handle cache)</b></td><td><b>2862</b></td><td>—</td><td>5.6 ms</td></tr>
+</table>
+
+<p>单点 decode 提升 <b>17×</b>（167 → 2862 fps），但端到端 wall-clock 只省 17% — 说明 decode 在整个 step 里只占小头，aug + tokenize 才是真正的 CPU 时间黑洞。</p>
+
+<h3>4.3 Profile per-phase（PROFILE_PHASES=1）</h3>
+
+<table>
+  <tr><th>Phase</th><th>位置</th><th>mean</th><th>p90</th><th>调用 / step</th><th>主线程串行?</th></tr>
+  <tr><td><code>get_vlm_inputs</code></td><td>worker（per-sample）</td><td>3.1 ms</td><td>3.4 ms</td><td>~25 (buffered)</td><td><span class="ok">否</span> — 并行</td></tr>
+  <tr><td><code>collator.__call__</code></td><td>主线程</td><td>~25 ms</td><td>~35 ms</td><td>4 × (grad_accum)</td><td><span class="bad">是</span> — 串行</td></tr>
+</table>
+
+<p><b>关键发现</b>：worker 完全不是瓶颈（3 ms/call ≪ step），<b>主线程 collator</b> 在每 step 串行做 4× Qwen3VLProcessor.tokenize+image_proc，~100 ms / step 占 step 总时间 ~20%，对应 GPU 闲置 ~40%。剩余可榨空间 ~30%（理论 step/s 1.99 → 2.85）。</p>
+
+<h3>4.4 时间预算重算 <span class="eng">— Recomputed step budget</span></h3>
+
+<p>每步 502 ms (1.99 it/s) 分配：</p>
+<ul>
+  <li><b>GPU forward+backward × 4 micro-batch</b>（grad_ckpt + grad_accum=4）：~320 ms (~64%)</li>
+  <li><b>H2D + sync overhead</b>（已减但仍存在）：~30 ms (~6%)</li>
+  <li><b>CPU per step</b>（4 worker × 250 ms wall = 1000 ms wall-clock distributed）：~150-180 ms 主线程 + worker bottleneck</li>
+  <li>剩余 ~150 ms 是 image aug (albumentations) + VLM tokenize (Qwen3VLProcessor) 的实际开销</li>
+</ul>
+
+<p>把 albumentations 移 GPU 可省 ~80-100 ms / step → 期望 step/s 2.0 → 2.4-2.6 (~25% 真实 steady-state 涨幅)。这才是下一阶段的方向。</p>
+
+<h3>4.5 已落地的 patch（在 launch_finetune_ckpt_n17.py 顶部）</h3>
+
+<pre><code># 1. video decode → memmap cache（env-gated）
+# 在 lerobot_episode_loader.py:_load_video_data 加 cache 分支
+LEISAAC_FRAME_CACHE_DIR=/home/david/cache/leisaac_pick_orange_frames
+
+# 2. non_blocking H2D（monkey-patch Trainer._prepare_input）
+_patch_cuda_pipeline_overlap()
+# Trainer._prepare_input → data.to(device, non_blocking=True)
+# 配合 dataloader_pin_memory=True（HF 默认）
+
+# 3. prefetch_factor 可调（默认 4，pf=8 回退禁用）
+DATALOADER_PREFETCH_FACTOR=4  # 不要超过 4
+</code></pre>
+
+<h3>4.6 二轮外部评审后的最大单点优化 — 调 grad_accum 而非 dataloader <span class="eng">— The single biggest win</span></h3>
+
+<div class="tldr">
+  <strong>Codex + Opencode 二轮评审打脸结果</strong>：我守着 dataloader 优化绕圈子，真正瓶颈是 GR00T 默认配置 <code>GLOBAL_BATCH=8 GRAD_ACCUM=4 → micro_batch=2</code>。把 <code>GRAD_ACCUM=1</code>（保持 effective batch=8）单点提速 <b>+178%</b>。
+  <br><br>
+  <span class="eng">External 2-model review revealed: the dataloader was a sideshow. The single biggest win is reducing grad_accum from 4 → 1 (keeping effective batch=8), which gives +178% steady step/s.</span>
+</div>
+
+<table>
+  <tr><th>配置</th><th>wall (80 step)</th><th><b>steady it/s</b></th><th>vs baseline steady</th><th>GPU mem peak</th></tr>
+  <tr><td>① baseline (mb=2, ga=4)</td><td>92.6s</td><td>1.99</td><td>—</td><td>15.0 GB</td></tr>
+  <tr><td>④ memmap+pipe (前面最佳)</td><td>76.5s</td><td>1.99</td><td>0%</td><td>15.0 GB</td></tr>
+  <tr><td>⑦ <b>mb=4 ga=2</b></td><td>65.2s</td><td><b>3.50</b></td><td><span class="ok">+76%</span></td><td>19.8 GB</td></tr>
+  <tr><td>⑧ <b>mb=8 ga=1</b></td><td><b>52.3s</b></td><td><b>5.54</b></td><td><span class="ok">+178%</span></td><td>19.7 GB</td></tr>
+  <tr><td>⑨ ⑧ + torch.compile</td><td>70.3s</td><td>5.73</td><td>+188% (warmup 吃 18s)</td><td>19.9 GB</td></tr>
+</table>
+
+<p><b>原理</b>（为什么 dataloader 优化 +0% steady 而 grad_accum 调整 +178%）：</p>
+<ul>
+  <li>原 mb=2 ga=4：每 outer step 跑 4 micro-batch × 2 sample = 8 sample，但 <b>4 个 GPU 同步点</b> + 4 次 Python 调度 overhead + 4 次小 matmul 不能充分喂饱 4090 Tensor Core。</li>
+  <li>新 mb=8 ga=1：每 outer step 跑 1 micro-batch × 8 sample = 8 sample，<b>1 个同步点</b> + 1 次调度 + 1 个大 matmul 充分用 SM。</li>
+  <li>VRAM 几乎不涨（15→19.7 GB）：optimizer state（adafactor）+ param storage 占大头，activation 增量小。</li>
+</ul>
+
+<p><b>反直觉细节</b>：GPU util mid_window 看着从 61% 跌到 21%。<b>不是变差</b>，是 step time 缩到 180 ms 后 1Hz sampler 大概率抓到 step 间 idle。<b>真信号</b>：train_steps_per_second（收敛值）和 GPU util p90（仍 86-90%）。</p>
+
+<p><b>torch.compile(action_head.forward)</b>：steady 仅 +3.4% (5.54 → 5.73)，JIT warmup ~18s 让 80-step 短跑反而慢 34%。6000+ step 真训练才回本。建议默认开但短验证关。</p>
+
+<p><b>flash-attn</b>：CN→GitHub release wheel 下载反复 EOF/corrupted（ghfast 镜像也炸），ROI 预期仅 +5-12%，跳过。云端跑可装。</p>
+
+<h2>4.7 落地步骤 <span class="eng">— Implementation plan</span></h2>
+
+<table>
+  <tr><th>步骤</th><th>预计工时</th><th>验证方式</th><th>预期 GPU util</th></tr>
+  <tr><td>① 写 <code>precache_videos.py</code>，预解码 PickOrange 50 demo 到 <code>/dev/shm/leisaac_cache/</code></td><td>1h</td><td><code>ls -lh /dev/shm/leisaac_cache</code> ≈ 34 GB；<code>np.load(mmap_mode='r')[idx]</code> 单 frame &lt; 1ms</td><td>—</td></tr>
+  <tr><td>② <code>lerobot_episode_loader.py</code> <code>_load_video_data</code> 加 cache 路径分支</td><td>0.5h</td><td>训练 step 时间从 ~350ms → ~180ms (跑 100 step 看 it/s)</td><td>50% → 75%</td></tr>
+  <tr><td>③ <code>train_n17.sh</code> 调 <code>DATALOADER_NUM_WORKERS=8</code> + <code>prefetch_factor=4</code></td><td>10min</td><td>watch nvidia-smi 看 util 曲线</td><td>75% → 82%</td></tr>
+  <tr><td>④ <code>GpuPrefetcher</code> hook 进 HF Trainer</td><td>1h</td><td>同上</td><td>82% → 88%</td></tr>
+  <tr><td>⑤（可选）image aug 移 kornia</td><td>2h</td><td>训练 100 step 后做一次 ckpt sim eval 防止数值漂移</td><td>88% → 91%</td></tr>
+</table>
+
+<p>总预期：<b>GPU util 50% → 85%+，训练 wall-clock 缩短约 30-40%</b>。在 AutoDL 5090 上每小时 ¥6-8，6000 step 训练时长 4h → 2.5h，省 ¥10-15 / 次。累计训练 ≥ 5 次就回本（开发工时也是成本的一部分）。</p>
+
+<h2>5. 证伪：collator 拆分把 image_proc 移到 worker 是 <u>反优化</u> <span class="eng">— Falsified hypothesis</span></h2>
+
+<div class="stage skip">
+<p><b>假设</b>：把 <code>Qwen3VLProcessor.image_processor()</code> 从主线程 collator 拆到 worker 并行做，预期 step/s 1.99 → 2.85 (+43%)。</p>
+
+<p><b>实测结果</b>（2026-05-23，本机 RTX 4090 + i9-13900KF）：</p>
+<table>
+  <tr><th>配置</th><th>runtime</th><th>step/s</th><th>GPU mid util</th></tr>
+  <tr><td>memmap + 4w + non_blocking</td><td><b>76.5s</b></td><td>1.05</td><td><b>61.3%</b></td></tr>
+  <tr><td>+ collator split</td><td><span class="bad">81.8s</span></td><td>0.98</td><td><span class="bad">43.4%</span></td></tr>
+</table>
+
+<p><b>根因</b>：</p>
+<ol>
+  <li>CPU 已 100% 饱和（8 P-core + 16 E-core 都跑满），workers 之间已经在抢 P-core。</li>
+  <li>主线程 collator 通过 <code>non_blocking=True</code> 已和 GPU forward <b>天然重叠</b>（GPU 在算时 collator 在准备下一 batch）。</li>
+  <li>把 image_proc 移到 worker = 让 worker 多做事，<b>worker 喂数据更慢</b> → GPU 等更多 → util 反而下降。</li>
+  <li>实测估算错：我以单次 16 imgs 的 43.8 ms 估收益，但实际 collator 每次只 4 imgs（micro_batch=2 × n_cam=2）→ ~10 ms / call，节省被 worker 阻塞吞没。</li>
+</ol>
+
+<p><b>结论</b>：默认 <b>不启用</b>。代码留在 launcher 内，<code>COLLATOR_SPLIT_ENABLE=1</code> 显式开。仅当满足以下条件才考虑：</p>
+<ul>
+  <li>micro_batch × n_cam × T ≥ 16 imgs / collator call</li>
+  <li>主线程 collator 是单点瓶颈（profile 显示主线程占 step ≥ 40%）</li>
+  <li>worker 仍有 CPU slack（CPU 总 util &lt; 70%）</li>
+</ul>
+
+<p>Sweet spot：H100 96GB / RTX PRO 6000 大 GPU 上 micro_batch=8 × 2 cam = 16 imgs / call 的场景。4090 24GB 上 grad_ckpt + micro_batch=2 配置不在此 sweet spot。</p>
+
+<p class="eng"><b>Lesson</b>: At CPU saturation, moving work from main thread to workers is zero-sum and breaks the natural overlap with GPU forward (already established by non_blocking H2D).</p>
+</div>
+
+<h2>6. Opencode 独特发现：当前代码每次解码<u>整个 episode</u> <span class="eng">— A wasteful path Opus + Codex both missed</span></h2>
+
+<div class="stage win">
+<p><b>定位：</b> <code>gr00t/data/dataset/lerobot_episode_loader.py:603</code></p>
+<pre><code># LeRobotEpisodeLoader.__getitem__
+video_data = self._load_video_data(episode_id, np.arange(actual_length))
+#                                              ^^^^^^^^^^^^^^^^^^^^^^^^^
+#                                              整个 episode 所有 600 frame
+</code></pre>
+
+<p><b>问题：</b> shard sampler 在拿到整 episode 后只用其中 50-100 step（按 batch / time-window 切），但 episode_loader 在这一行强制解码<b>所有</b> 600 帧。等于 6-12× 浪费 CPU decode。</p>
+
+<p><b>修法（两条路）：</b></p>
+<ul>
+  <li><b>路 A（彻底）：</b> 重构 shard 接口让 sampler 把 "需要哪些 step index" 传下来，<code>__getitem__</code> 只解码这些；改动面大，touch shard/sharded_single_step/sharded_mixture 三处</li>
+  <li><b>路 B（推荐）：</b> 配合 §3 预解码 memmap，整 episode 加载从 ~60ms decode 退化为 ~60μs memmap read — 这个浪费被 §3 完全吸收，<b>不需要单独修</b></li>
+</ul>
+
+<p>这是 opencode 读源码时发现的 quick win；Opus 和 Codex 都没读到这一层。但因为 §3 预解码本身就让 decode cost 归零，<b>这个发现的实际价值是定义了"如果暂时不上预解码"的兜底优化</b>。</p>
+</div>
+
+<h2>8. 三模型分歧 <span class="eng">— Where the 3 models disagree</span></h2>
+
+<table>
+  <tr><th>议题</th><th>Opus (我)</th><th>Codex gpt-5.4</th><th>Opencode deepseek-v4-pro</th></tr>
+  <tr><td>预解码 vs NVDEC GPU decode 谁优先</td><td>预解码：50 demo 太小，缓存最稳</td><td>预解码 #1，NVDEC #2（环境脆）</td><td>预解码 #3 (但配合 #1 解码量减少更优先)；NVDEC 不推荐（GPU frame → CPU PIL round-trip 抵消硬解收益）</td></tr>
+  <tr><td>WebDataset 值不值</td><td>不值，引入复杂度</td><td>明确反对，"伪优化"</td><td>明确反对：50 demo 太小，DataLoader2 已 deprecated；future ≥1000 demo 才考虑 safetensors streaming</td></tr>
+  <tr><td>GPU image aug 优先级</td><td>等 #1/#2/#3 上完再做</td><td>#6（低优）</td><td>不在 top-8 (但同意是 future work)</td></tr>
+  <tr><td>独家发现</td><td>34 GB 全量可塞进 62 GB host RAM，<code>/dev/shm</code> 是天然选择</td><td>(无新发现，但 ROI 排序清晰)</td><td><b>当前每次解码整 episode 而非 shard 实际需要的 frame</b> — 见 §5</td></tr>
+  <tr><td>预处理也缓存（processor 输出）</td><td>没提</td><td>没提</td><td>额外建议：把 VLM tokenize + state normalize 也缓存到 <code>.pt</code>，GPU util 90%+</td></tr>
+</table>
+
+<p><b>三模型核心一致</b>：</p>
+<ol>
+  <li>预解码 mp4 → memmap/npy 是头号 ROI（节省 CPU decode 80%+）</li>
+  <li>pin_memory + non_blocking + prefetch_factor 是免费午餐</li>
+  <li>num_workers 4 → 8 重新调</li>
+  <li>不要切 WebDataset / DataPipes / DataLoader2 框架</li>
+</ol>
+
+<h2>9. 通用脚手架 <span class="eng">— Reusable toolkit for DreamZero / π0.5 / X-VLA / etc.</span></h2>
+
+<p>把上述方法论 + patch 提炼成 <code>LeIsaac/scripts/training/perf/</code>，任何 HF Trainer + LeRobot v2.x 数据集都能用：</p>
+
+<table>
+  <tr><th>文件</th><th>作用</th><th>通用性</th></tr>
+  <tr><td><code>sample_gpu.sh</code></td><td>1 Hz GPU + CPU util 采样 → CSV</td><td>完全通用</td></tr>
+  <tr><td><code>analyze_gpu_csv.py</code></td><td>解析 CSV，输出 mid-window mean / p50 / p90 / max + CPU 比较表</td><td>完全通用</td></tr>
+  <tr><td><code>precache_videos.py</code></td><td>auto-detect LeRobot v2.x 数据集 cam + episode，mp4 → npy memmap</td><td>LeRobot v2.x 数据集</td></tr>
+  <tr><td><code>bench_dataloader.py</code></td><td>5 mode 单点 throughput 对比 (baseline / memmap / memmap-cached / workers-decode / workers-memmap)</td><td>LeRobot v2.x 数据集</td></tr>
+  <tr><td><code>pipeline_patches.py</code></td><td>importable HF Trainer 通用 monkey-patch：<code>apply_all()</code> = non_blocking H2D + prefetch_factor + 可选 phase profiler</td><td>HF Trainer 任何项目</td></tr>
+  <tr><td><code>README.md</code></td><td>跨项目复用清单 + GPU util 瓶颈分层判断表</td><td>—</td></tr>
+</table>
+
+<p>调用模式（在任何 launcher 头部一行）：</p>
+
+<pre><code>import sys
+sys.path.insert(0, "/home/david/work/isaaclab-experience/LeIsaac/scripts/training")
+from perf.pipeline_patches import apply_all
+apply_all()
+</code></pre>
+
+<p>env 旋钮：<code>LEISAAC_FRAME_CACHE_DIR</code>、<code>DATALOADER_PREFETCH_FACTOR</code>、<code>PROFILE_PHASES=1</code> + <code>PROFILE_TARGETS=mod.cls.method,...</code></p>
+
+<p><b>跨项目复用清单</b>：GR00T-N1.5/1.6/1.7 / DreamZero / π0.5 PyTorch / X-VLA / SmolVLA / ACT / DP / OpenVLA / OpenVLA-OFT 全部走同一套。</p>
+
+<h2>10. 关联文档 <span class="eng">— Related</span></h2>
+
+<ul>
+  <li><a href="autodl_cloud_finetune_playbook.html">AutoDL 云端训练 playbook</a> — 成本控制要点</li>
+  <li><a href="gr00t_finetune_pick_orange.html">GR00T 微调 PickOrange 流程</a> — 整体训练 pipeline</li>
+  <li>本机 memory：<code>autodl-uv-sync-cn-strategy</code> + <code>cn-pypi-mirror-aliyun</code> + <code>feedback-autodl-cost-discipline</code></li>
+  <li>raw brainstorm 输出：<code>/tmp/codex_dataloader.jsonl</code> (Codex 完整推理) + <code>/tmp/opencode_dataloader.txt</code> (Opencode 完整源码分析)</li>
+  <li>本机实验脚本：<code>LeIsaac/scripts/finetune/gr00t/bench_dataloader.py</code> — micro-bench 5 模式 (baseline/memmap/precache/workers-decode/workers-memmap)</li>
+  <li>实验 log：<code>/tmp/train_baseline.log</code>、<code>/tmp/train_memmap.log</code>、<code>/tmp/train_pipeline.log</code>、<code>/tmp/gpu_*.csv</code>（1Hz GPU+CPU 采样）</li>
+</ul>
+
+<hr>
+<p class="eng">Generated 2026-05-23 — Opus 4.7 + Codex gpt-5.4 (web_search) + Opencode deepseek-v4-pro tri-model consensus. Single-file shareable, inline SVG, light-theme forced.</p>
+
+</body>
+</html>

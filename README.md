@@ -5,6 +5,9 @@ _A fork of [LightwheelAI/leisaac](https://github.com/LightwheelAI/leisaac) (Apac
 
 ![ACT eval — SO-101 PickOrange](docs/assets/pick-orange.jpg)
 
+![Self-trained GR00T-N1.7 ckpt-6000 — 3/3 perfect pick-and-place](docs/assets/gr00t-n1.7-ckpt-6000.jpg)
+_自训 GR00T-N1.7 ckpt-6000：3/3 oranges placed @ 87s, BENCH 5-round = 14/15 (4/5 envs) — 平 hi-space N1.7 SOTA。HF: [`wsagi/GR00T-N1.7-PickOrange`](https://huggingface.co/wsagi/GR00T-N1.7-PickOrange)_
+
 - **Upstream / 原仓库**: https://github.com/LightwheelAI/leisaac
 - **Upstream docs**: https://lightwheelai.github.io/leisaac/
 - **本 fork**: https://github.com/vitorcen/LeIsaac
@@ -60,6 +63,7 @@ _Sort: strict Rounds DESC → 🍊 DESC → time ASC._
 | Policy | Params | `config.type` | Rounds | 🍊 | Pick rate | Avg round | Peak VRAM | Per-round detail |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | **[`hi-space/GR00T-N1.7-3B-Pick-Orange`](https://huggingface.co/hi-space/GR00T-N1.7-3B-Pick-Orange) (h=40, step_hz=60)** 🥇 ✅ | ~3B | `gr00t_n1_7` | **4/5** | **14/15** | **93.3%** | **69s** | 17.3 GB | 3🍊@35s✅ / 3🍊@35s✅ / 2🍊@180s / 3🍊@50s✅ / 3🍊@48s✅ |
+| **[`wsagi/GR00T-N1.7-PickOrange`](https://huggingface.co/wsagi/GR00T-N1.7-PickOrange) (自训 / ours, ckpt-6000, h=40, step_hz=60)** 🥇 ✅ | ~3B | `gr00t_n1_7` | **4/5** | **14/15** | **93.3%** | 116s | ~22 GB / 17.3 GB | 2🍊@180s / 3🍊@126s✅ / 3🍊@87s✅ / 3🍊@88s✅ / 3🍊@99s✅ |
 | **[`wsagi/GR00T-N1.6-PickOrange`](https://huggingface.co/wsagi/GR00T-N1.6-PickOrange) (自训 / ours, ckpt-6500, h=40)** 🥈 ✅ | ~3B | `gr00t_n1_6` | **4/5** | **13/15** | **86.7%** | 92s | ~22 GB / 17.3 GB | 3🍊@58s✅ / 3🍊@70s✅ / 1🍊@180s / 3🍊@28s✅ / 3🍊@126s✅ |
 | [`hi-space/GR00T-N1.6-3B-Pick-Orange`](https://huggingface.co/hi-space/GR00T-N1.6-3B-Pick-Orange) (h=40, step_hz=60) 🥉 ✅ | ~3B | `gr00t_n1_6` | 2/5 | 9/15 | 60.0% | 122s | 17.3 GB | 3🍊@31s✅ / 2🍊@41s✅ / 1🍊@180s / 1🍊@180s / 2🍊@180s |
 | [`wsagi/SmolVLA-PickOrange`](https://huggingface.co/wsagi/SmolVLA-PickOrange) **(自训 / ours, main=15k, sweep best)** ✅ | ~450M | `smolvla` | 2/5 | 8/15 | 53.3% | 133s | 10.0 GB | 3🍊@85s✅ / 1🍊@180s / 3🍊@42s✅ / 0🍊@180s / 1🍊@180s |

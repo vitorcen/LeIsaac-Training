@@ -167,6 +167,242 @@ def _patch_loss_driven_pruning():
 _patch_loss_driven_pruning()
 
 
+# CPU↔GPU pipeline parallelism: overlap H2D copy with previous step's forward/backward.
+# Default HF Trainer._prepare_input uses `data.to(device)` without non_blocking=True,
+# making H2D a synchronous step. With pin_memory=True (HF default) + non_blocking=True
+# + a dedicated CUDA stream prefetching the NEXT batch, GPU never waits for H2D.
+# See LeIsaac/docs/training/gpu_dataloader_zero_copy.html (必做 #2).
+def _patch_cuda_pipeline_overlap():
+    if os.environ.get("PIPELINE_OVERLAP_DISABLE", "0") == "1":
+        return
+    import torch
+    from collections.abc import Mapping
+    from transformers import Trainer
+
+    _orig_prepare_input = Trainer._prepare_input
+
+    def _patched_prepare_input(self, data):
+        # Non-blocking H2D: needs pin_memory=True on dataloader (HF default).
+        if isinstance(data, Mapping):
+            return type(data)({k: _patched_prepare_input(self, v) for k, v in data.items()})
+        elif isinstance(data, (tuple, list)):
+            return type(data)(_patched_prepare_input(self, v) for v in data)
+        elif isinstance(data, torch.Tensor):
+            if data.device.type == "cpu" and self.args.device.type == "cuda":
+                return data.to(self.args.device, non_blocking=True)
+            return data.to(self.args.device)
+        return data
+
+    Trainer._prepare_input = _patched_prepare_input
+    print("[gr00t-n17-train] patched Trainer._prepare_input → non_blocking=True (CPU↔GPU pipeline overlap)", flush=True)
+
+
+_patch_cuda_pipeline_overlap()
+
+
+# Bump dataloader prefetch_factor (HF default 2 → 4) so workers have more batches
+# queued ahead of the trainer. Only effective when CPU has slack between worker bursts.
+def _patch_prefetch_factor():
+    if os.environ.get("PREFETCH_FACTOR_DISABLE", "0") == "1":
+        return
+    pf = int(os.environ.get("DATALOADER_PREFETCH_FACTOR", "4"))
+    from gr00t.experiment.trainer import Gr00tTrainer
+
+    _orig_get_loader = Gr00tTrainer.get_train_dataloader
+
+    def _patched_get_loader(self):
+        loader = _orig_get_loader(self)
+        try:
+            loader.prefetch_factor = pf
+        except Exception as e:
+            print(f"[gr00t-n17-train] cannot override prefetch_factor: {e}", flush=True)
+        else:
+            print(f"[gr00t-n17-train] dataloader prefetch_factor → {pf}", flush=True)
+        return loader
+
+    Gr00tTrainer.get_train_dataloader = _patched_get_loader
+
+
+_patch_prefetch_factor()
+
+
+# Optional CPU phase profiler — enable with PROFILE_PHASES=1 to print collator + get_vlm_inputs latency.
+def _maybe_install_profile():
+    if os.environ.get("PROFILE_PHASES", "0") != "1":
+        return
+    import time, statistics
+    from collections import defaultdict
+    from gr00t.model.gr00t_n1d7.processing_gr00t_n1d7 import Gr00tN1d7DataCollator, Gr00tN1d7Processor
+
+    times = defaultdict(list)
+    _orig_collator = Gr00tN1d7DataCollator.__call__
+    _orig_get_vlm = Gr00tN1d7Processor._get_vlm_inputs
+
+    def _timed_collator(self, features):
+        t0 = time.perf_counter()
+        out = _orig_collator(self, features)
+        times["collator(main)"].append((time.perf_counter() - t0) * 1000)
+        if len(times["collator(main)"]) % 20 == 0:
+            for phase, vals in times.items():
+                v = vals[-50:]
+                p90 = sorted(v)[max(0, int(0.9 * len(v)) - 1)]
+                print(f"[profile] {phase}: n={len(vals)} mean50={statistics.mean(v):.1f}ms p90={p90:.1f}ms", flush=True)
+        return out
+
+    def _timed_get_vlm(self, image_keys, images, masks, image_transform, language):
+        t0 = time.perf_counter()
+        out = _orig_get_vlm(self, image_keys, images, masks, image_transform, language)
+        times["get_vlm_inputs(worker)"].append((time.perf_counter() - t0) * 1000)
+        return out
+
+    Gr00tN1d7DataCollator.__call__ = _timed_collator
+    Gr00tN1d7Processor._get_vlm_inputs = _timed_get_vlm
+    print("[gr00t-n17-train] PROFILE_PHASES=1 → timing collator + _get_vlm_inputs", flush=True)
+
+
+_maybe_install_profile()
+
+
+# Heavy CPU work moved from collator (main thread) into per-worker:
+# 本机 4090 实验 (2026-05-23) 证伪此优化 — CPU 已 100% 饱和时，把工作从主线程移到
+# worker 等于让 4 worker 抢同一批 P-core，net 反而 GPU util 50→43%、wall +7%。
+# Main-thread collator 和 GPU forward 通过 non_blocking H2D 已是天然重叠，没必要拆。
+#
+# **何时启用**: 当 micro_batch × n_cam ≥ 16 imgs / collator call 且主线程是单点瓶颈时
+# （比如 H100 96GB 上跑 micro_batch=8, n_cam=2 — image_processor 43.8 ms / call）。
+# 4090 配置 (micro_batch=2, n_cam=2 → 4 imgs/call) 不在此 sweet spot。
+#
+# 默认关闭；需要时设 COLLATOR_SPLIT_ENABLE=1 显式开。
+def _patch_collator_split_image_proc():
+    if os.environ.get("COLLATOR_SPLIT_ENABLE", "0") != "1":
+        return
+    import torch
+    import numpy as np
+    from PIL import Image
+    from gr00t.model.gr00t_n1d7.processing_gr00t_n1d7 import (
+        Gr00tN1d7Processor,
+        Gr00tN1d7DataCollator,
+    )
+
+    _orig_apply = Gr00tN1d7Processor._apply_vlm_processing
+
+    def _patched_apply(self, images, language):
+        # Per-sample worker path: do image_processor here in parallel via DataLoader workers.
+        pil_images = [Image.fromarray(np.transpose(v, (1, 2, 0))) for v in images]
+        conversation = [{
+            "role": "user",
+            "content": [
+                *[{"type": "image", "image": img} for img in pil_images],
+                {"type": "text", "text": language},
+            ],
+        }]
+        text = self.processor.apply_chat_template(
+            conversation, tokenize=False, add_generation_prompt=False
+        )
+        # Run image_processor per-sample (cheap: 0.8 ms / 1-img sample × N workers in parallel).
+        image_inputs = self.processor.image_processor(images=pil_images)
+        return {
+            "vlm_content": {
+                "text": text,
+                "n_images": len(pil_images),
+                "pixel_values_arr": np.asarray(image_inputs["pixel_values"]),
+                "image_grid_thw_arr": np.asarray(image_inputs["image_grid_thw"]),
+            }
+        }
+
+    _orig_collator = Gr00tN1d7DataCollator.__call__
+
+    def _patched_collator(self, features):
+        from transformers.feature_extraction_utils import BatchFeature
+        # Fast path: features carry pre-processed pixel_values from workers.
+        first_key_present = (
+            "vlm_content" in features[0]
+            and "pixel_values_arr" in features[0]["vlm_content"]
+        )
+        if not first_key_present:
+            return _orig_collator(self, features)
+
+        batch = {}
+        keys = list(set().union(*(elem.keys() for elem in features)))
+        for key in keys:
+            if key == "vlm_content":
+                # Concat workers' pre-computed image features + run text replacement + tokenize.
+                values = [elem[key] for elem in features if key in elem]
+                proc = self.processor
+                image_token = proc.image_token
+                merge_length = proc.image_processor.merge_size ** 2
+
+                texts = []
+                pixel_values_list = []
+                image_grid_thw_list = []
+                for v in values:
+                    text_i = v["text"]
+                    pv = v["pixel_values_arr"]
+                    grid = v["image_grid_thw_arr"]
+                    # Replace each <image> placeholder with the right number of image tokens.
+                    text_chars = []
+                    grid_idx = 0
+                    while image_token in text_i and grid_idx < grid.shape[0]:
+                        n_tok = int(grid[grid_idx].prod()) // merge_length
+                        text_i = text_i.replace(image_token, "<|placeholder|>" * n_tok, 1)
+                        grid_idx += 1
+                    text_i = text_i.replace("<|placeholder|>", image_token)
+                    texts.append(text_i)
+                    pixel_values_list.append(torch.as_tensor(pv))
+                    image_grid_thw_list.append(torch.as_tensor(grid))
+
+                tokenized = proc.tokenizer(text=texts, return_tensors="pt", padding=True)
+                batch.update({k: v for k, v in tokenized.items()})
+                batch["pixel_values"] = torch.cat(pixel_values_list, dim=0)
+                batch["image_grid_thw"] = torch.cat(image_grid_thw_list, dim=0)
+            elif key in ("pixel_values", "image_grid_thw", "attention_mask", "input_ids"):
+                # Should not appear at sample level when fast path is active.
+                continue
+            else:
+                values = [elem[key] for elem in features if key in elem]
+                batch[key] = torch.from_numpy(np.stack(values))
+        return BatchFeature(data={"inputs": batch})
+
+    Gr00tN1d7Processor._apply_vlm_processing = _patched_apply
+    Gr00tN1d7DataCollator.__call__ = _patched_collator
+    print("[gr00t-n17-train] patched _apply_vlm_processing (worker) + __call__ (collator) — image_proc → worker", flush=True)
+
+
+_patch_collator_split_image_proc()
+
+
+# torch.compile on action_head.forward — Isaac-GR00T's deployment benchmark uses this
+# (`scripts/deployment/benchmark_inference.py:542`); replicating in training is low-risk.
+# Expected +5-10% on top of bf16 + larger micro_batch (Codex + Opencode review consensus).
+# Default ON; set COMPILE_ACTION_HEAD_DISABLE=1 to skip.
+def _patch_compile_action_head():
+    if os.environ.get("COMPILE_ACTION_HEAD_DISABLE", "0") == "1":
+        return
+    import torch
+    from gr00t.experiment.trainer import Gr00tTrainer
+
+    _orig_init = Gr00tTrainer.__init__
+
+    def _patched_init(self, *args, **kwargs):
+        _orig_init(self, *args, **kwargs)
+        try:
+            head = self.model.action_head.model
+            if hasattr(head, "forward"):
+                head.forward = torch.compile(
+                    head.forward,
+                    mode=os.environ.get("COMPILE_MODE", "reduce-overhead"),
+                    dynamic=False,
+                )
+                print(f"[gr00t-n17-train] torch.compile(action_head.forward, mode={os.environ.get('COMPILE_MODE','reduce-overhead')})", flush=True)
+        except Exception as e:
+            print(f"[gr00t-n17-train] compile skipped: {e}", flush=True)
+
+    Gr00tTrainer.__init__ = _patched_init
+
+
+_patch_compile_action_head()
+
+
 if __name__ == "__main__":
     if "LOGURU_LEVEL" not in os.environ:
         os.environ["LOGURU_LEVEL"] = "INFO"

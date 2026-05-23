@@ -528,6 +528,11 @@ def main():
         # Set lazily on first inner-loop iter so it reflects post-warmup state.
         home_arm_pose: "torch.Tensor | None" = None
         home_return_armed = False  # set True once arm has clearly moved away from home
+        # Retracted-middle detector state
+        retracted_since: "float | None" = None
+        # Track placement-change time for placement-stability guard
+        last_placement_change_t = time.time()
+        prev_placed_sum = 0
         while simulation_app.is_running():
             # run everything in inference mode
             with torch.inference_mode():
@@ -574,11 +579,52 @@ def main():
                         home_return_armed = True
                     if home_return_armed and near_home:
                         home_return = True
-                if controller.reset_state or _skip_requested() or wall_capped or stuck or home_return:
+                # Retracted-middle detector: if shoulder_lift + elbow_flex are in
+                # the env's rest-pose range (±30° per joint), arm has structurally
+                # "put itself away" even if shoulder_pan / wrist_flex / wrist_roll
+                # are at non-rest angles. Catches "model placed N oranges, retracted
+                # but env.task_done waits for ALL 5 arm joints + gripper in rest →
+                # 180s wall_cap waste" cases (e.g. 3/3 placed but env didn't fire).
+                # Requires sustained retraction (3 seconds), so transient pass-through
+                # while reaching for next orange doesn't false-trigger.
+                # Trigger: placed_count is "stable" (no change for >= 5s) so retraction
+                # is interpreted as task-end not as mid-pickup waypoint.
+                # Rest pose (deg): shoulder_lift ≈ -100°, elbow_flex ≈ 90°
+                retracted_middle = False
+                if joint_history and len(joint_history) >= 3:
+                    # Track retraction onset across iters via closure on round-local list
+                    if 'retracted_since' not in dir():
+                        pass  # bootstrap handled by outer-scope variable
+                    last_jp = joint_history[-1][1]
+                    arm_jp = last_jp[:-1] if last_jp.numel() > 1 else last_jp
+                    if arm_jp.numel() >= 3:
+                        # joint order matches SINGLE_ARM_JOINT_NAMES:
+                        # shoulder_pan(0), shoulder_lift(1), elbow_flex(2), wrist_flex(3), wrist_roll(4)
+                        shoulder_lift_deg = float(arm_jp[1]) * 180.0 / 3.141592653589793
+                        elbow_flex_deg = float(arm_jp[2]) * 180.0 / 3.141592653589793
+                        in_retracted_range = (
+                            -130.0 <= shoulder_lift_deg <= -70.0
+                            and 60.0 <= elbow_flex_deg <= 120.0
+                        )
+                        if in_retracted_range:
+                            if retracted_since is None:
+                                retracted_since = time.time()
+                            elif (time.time() - retracted_since) >= 3.0:
+                                # 5s placement-stability guard
+                                placement_stable = (
+                                    time.time() - last_placement_change_t
+                                ) >= 5.0
+                                if placement_stable:
+                                    retracted_middle = True
+                        else:
+                            retracted_since = None
+                if controller.reset_state or _skip_requested() or wall_capped or stuck or home_return or retracted_middle:
                     reason = "wall_cap" if wall_capped else (
                         "home_return" if home_return else (
-                            "stuck" if stuck else (
-                                "file_skip" if _skip_requested() else "key_R"
+                            "retracted_middle" if retracted_middle else (
+                                "stuck" if stuck else (
+                                    "file_skip" if _skip_requested() else "key_R"
+                                )
                             )
                         )
                     )
@@ -620,6 +666,11 @@ def main():
                     placed_flags[0] = bool(f1)
                     placed_flags[1] = bool(f2)
                     placed_flags[2] = bool(f3)
+                    # update placement-stability tracker for retracted_middle detector
+                    cur_sum = sum(placed_flags)
+                    if cur_sum != prev_placed_sum:
+                        last_placement_change_t = time.time()
+                        prev_placed_sum = cur_sum
                     obs_dict, _, reset_terminated, reset_time_outs, _ = env.step(action)
                     if reset_terminated[0]:
                         success = True
