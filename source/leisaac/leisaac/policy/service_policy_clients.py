@@ -166,6 +166,85 @@ class Gr00tServicePolicyClient(ZMQServicePolicy):
         return torch.from_numpy(concat_action[:, None, :])
 
 
+class DreamZeroServicePolicyClient(ZMQServicePolicy):
+    """
+    Service policy client for DreamZero (NVIDIA GEAR Lab WAM, Wan2.1-I2V-14B + LoRA).
+    Wire matches GR00T N1.5 (ZMQ + msgpack-numpy), but obs/action keys use the LeIsaac
+    SO-101 xdof embodiment schema (single arm + gripper, 2 cameras: front + wrist).
+    """
+
+    def __init__(
+        self,
+        host: str = "localhost",
+        port: int = 5555,
+        timeout_ms: int = 60000,  # DreamZero NF4 inference ~6-25s/chunk on 4090, needs long timeout
+        camera_keys: list[str] = ["front", "wrist"],
+        modality_keys: list[str] = ["joint_pos", "gripper_pos"],
+    ):
+        super().__init__(host=host, port=port, timeout_ms=timeout_ms, ping_endpoint="ping")
+        self.camera_keys = camera_keys
+        self.modality_keys = modality_keys
+
+    def get_action(self, observation_dict: dict) -> torch.Tensor:
+        """Returns (T, 1, 6) action tensor matching LeIsaac SO-101 convention.
+
+        Wire: ZMQ REQ/REP, msgpack-numpy. Server expects:
+            {
+                "video.front": (B, H, W, 3) uint8,
+                "video.wrist": (B, H, W, 3) uint8,
+                "state.joint_pos": (B, 5) float32,
+                "state.gripper_pos": (B, 1) float32,
+                "annotation.task": [task_description_str],
+            }
+        Server returns:
+            {"action.joint_pos": (T, 5), "action.gripper_pos": (T, 1)} or list thereof.
+        """
+        obs_dict = {
+            f"video.{key}": observation_dict[key].cpu().numpy().astype(np.uint8)
+            for key in self.camera_keys
+        }
+
+        joint_pos = convert_leisaac_action_to_lerobot(observation_dict["joint_pos"])
+        obs_dict["state.joint_pos"] = joint_pos[:, 0:5].astype(np.float32)
+        obs_dict["state.gripper_pos"] = joint_pos[:, 5:6].astype(np.float32)
+        obs_dict["annotation.task"] = [observation_dict["task_description"]]
+
+        action_chunk = self.call_endpoint("get_action", obs_dict)
+        if isinstance(action_chunk, dict) and "error" in action_chunk and "action.joint_pos" not in action_chunk:
+            raise RuntimeError(f"DreamZero server error: {action_chunk['error']}")
+        if isinstance(action_chunk, list):
+            action_chunk = action_chunk[0]
+
+        arm = action_chunk["action.joint_pos"]
+        grip = action_chunk["action.gripper_pos"]
+
+        # Defensive ndarray decode (some msgpack-numpy variants leave dicts; reuse Gr00t pattern).
+        import msgpack_numpy as _mnp, io as _io
+
+        def _to_ndarray(x):
+            if isinstance(x, np.ndarray):
+                return x
+            if isinstance(x, dict):
+                ks = set(x.keys())
+                if "nd" in ks or b"nd" in ks:
+                    if "nd" in ks:
+                        x = {(k.encode() if isinstance(k, str) else k): v for k, v in x.items()}
+                    return _mnp.decode(x)
+                if "__ndarray_class__" in ks or b"__ndarray_class__" in ks:
+                    key = "as_npy" if "as_npy" in x else b"as_npy"
+                    return np.load(_io.BytesIO(x[key]), allow_pickle=False)
+            raise TypeError(f"Unexpected action type: {type(x).__name__}")
+
+        arm = _to_ndarray(arm)
+        grip = _to_ndarray(grip)
+        if arm.ndim == 3 and arm.shape[0] == 1:
+            arm = arm[0]      # (T, 5)
+            grip = grip[0]    # (T, 1)
+        concat_action = np.concatenate([arm, grip], axis=-1)  # (T, 6)
+        concat_action = convert_lerobot_action_to_leisaac(concat_action)
+        return torch.from_numpy(concat_action[:, None, :])
+
+
 class Gr00t16ServicePolicyClient(ZMQServicePolicy):
     """
     Service policy client for GR00T N1.6: https://github.com/NVIDIA/Isaac-GR00T

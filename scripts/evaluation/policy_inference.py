@@ -29,7 +29,7 @@ parser.add_argument(
     "--policy_type",
     type=str,
     default="gr00tn1.5",
-    help="Type of policy to use. support gr00tn1.5, gr00tn1.6, lerobot-<model_type>, openpi",
+    help="Type of policy to use. support gr00t (all releases, recommended), gr00tn1.5 (alias), gr00tn1.6, lerobot-<model_type>, openpi, pi05, dreamzero",
 )
 parser.add_argument("--policy_host", type=str, default="localhost", help="Host of the policy server.")
 parser.add_argument("--policy_port", type=int, default=5555, help="Port of the policy server.")
@@ -98,7 +98,7 @@ args_cli = parser.parse_args()
 def _check_policy_service_ready():
     """Fail fast if a remote policy server is not reachable."""
     needs_remote_service = (
-        args_cli.policy_type in {"gr00tn1.5", "gr00tn1.6", "openpi", "pi05"} or "lerobot" in args_cli.policy_type
+        args_cli.policy_type in {"gr00t", "gr00tn1.5", "gr00tn1.6", "openpi", "pi05"} or "lerobot" in args_cli.policy_type
     )
     if not needs_remote_service:
         return
@@ -197,7 +197,7 @@ class Controller:
 
 def preprocess_obs_dict(obs_dict: dict, model_type: str, language_instruction: str):
     """Preprocess the observation dictionary to the format expected by the policy."""
-    if model_type in ["gr00tn1.5", "gr00tn1.6", "lerobot", "openpi", "pi05"]:
+    if model_type in ["gr00t", "gr00tn1.5", "gr00tn1.6", "lerobot", "openpi", "pi05", "dreamzero"]:
         obs_dict["task_description"] = language_instruction
         return obs_dict
     else:
@@ -283,14 +283,18 @@ def main():
 
     # create policy
     model_type = args_cli.policy_type
-    if args_cli.policy_type == "gr00tn1.5":
+    # `gr00t` = flat-wire ZMQ client, works for all GR00T releases (N1.5/N1.6/N1.7).
+    # Release-specific behavior (action_horizon, wire envelope, etc.) is controlled by
+    # server_kind + GR00T_WRAP_OBSERVATION env var set in scripts/benchmark/run_one.sh,
+    # not by this policy_type. `gr00tn1.5` is kept as a back-compat alias.
+    if args_cli.policy_type in ("gr00t", "gr00tn1.5"):
         from isaaclab.sensors import Camera
         from leisaac.policy import Gr00tServicePolicyClient
 
         if task_type == "so101leader":
             modality_keys = ["single_arm", "gripper"]
         else:
-            raise ValueError(f"Task type {task_type} not supported when using GR00T N1.5 policy yet.")
+            raise ValueError(f"Task type {task_type} not supported for GR00T policy yet.")
 
         policy = Gr00tServicePolicyClient(
             host=args_cli.policy_host,
@@ -365,6 +369,19 @@ def main():
         from leisaac.policy import Pi05ServicePolicyClient
 
         policy = Pi05ServicePolicyClient(
+            host=args_cli.policy_host,
+            port=args_cli.policy_port,
+            timeout_ms=args_cli.policy_timeout_ms,
+            camera_keys=[key for key, sensor in env.scene.sensors.items() if isinstance(sensor, Camera)],
+        )
+    elif args_cli.policy_type == "dreamzero":
+        from isaaclab.sensors import Camera
+        from leisaac.policy import DreamZeroServicePolicyClient
+
+        if task_type != "so101leader":
+            raise ValueError(f"DreamZero only supports so101leader task currently (got {task_type}).")
+
+        policy = DreamZeroServicePolicyClient(
             host=args_cli.policy_host,
             port=args_cli.policy_port,
             timeout_ms=args_cli.policy_timeout_ms,
@@ -618,6 +635,13 @@ def main():
                                     retracted_middle = True
                         else:
                             retracted_since = None
+                # Allow env to disable home-pose-based terminators (useful for early-train
+                # DreamZero ckpts where action delta is small → arm sits at reset pose and
+                # would otherwise immediately trip retracted_middle / home_return).
+                import os as _os_local
+                if _os_local.environ.get("LEISAAC_DISABLE_RETRACT_DETECT", "0") == "1":
+                    home_return = False
+                    retracted_middle = False
                 if controller.reset_state or _skip_requested() or wall_capped or stuck or home_return or retracted_middle:
                     reason = "wall_cap" if wall_capped else (
                         "home_return" if home_return else (
