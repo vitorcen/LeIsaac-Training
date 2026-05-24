@@ -1,0 +1,559 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="color-scheme" content="light only">
+<title>DreamZero v2 训练方案 — 14B 视频骨干 + SO-101 救活计划</title>
+<style>
+  :root { color-scheme: light only; }
+  html { background: #ffffff; }
+  body {
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    max-width: 1100px; margin: 2em auto; padding: 1.5em 2em;
+    line-height: 1.7; color: #1a1a1a; background: #ffffff;
+  }
+  h1 { color: #111; border-bottom: 2px solid #333; padding-bottom: .3em; }
+  h2 { color: #111; border-bottom: 1px solid #bbb; padding-bottom: .2em; margin-top: 2em; }
+  h3 { margin-top: 1.5em; color: #1f3a6b; }
+  a  { color: #1565c0; }
+  a:hover { color: #0b3d80; }
+  code { background: #eef0f3; color: #1a1a1a; padding: 1px 5px; border-radius: 3px; font-size: 0.92em; border: 1px solid #d8dce2; }
+  pre { background: #f6f7f9; color: #1a1a1a; padding: 1em; border-radius: 4px; overflow-x: auto; font-size: 0.9em; line-height: 1.5; border: 1px solid #d8dce2; }
+  pre code { background: transparent; border: none; padding: 0; }
+  table { border-collapse: collapse; margin: 1em 0; width: 100%; background: #fff; color: #1a1a1a; }
+  th, td { border: 1px solid #c4c8cf; padding: .5em .85em; text-align: left; vertical-align: top; }
+  th { background: #e8ebf0; color: #111; }
+  blockquote { margin: 1em 0; padding: .6em 1em; border-left: 4px solid #555; background: #f6f7f9; color: #1a1a1a; }
+  hr { border: none; border-top: 1px solid #c4c8cf; margin: 2em 0; }
+  .tag { display: inline-block; background: #dde6f3; color: #1f3a6b; padding: 2px 9px; border-radius: 10px; font-size: 0.8em; margin-right: 4px; }
+  .tag-ok { display: inline-block; background: #d8efde; color: #1f6c34; padding: 2px 9px; border-radius: 10px; font-size: 0.8em; margin-right: 4px; }
+  .tag-bad { display: inline-block; background: #f9d6d6; color: #8b1a1a; padding: 2px 9px; border-radius: 10px; font-size: 0.8em; margin-right: 4px; }
+  .warn { background: #fdf3d1; border-left: 4px solid #b8860b; padding: .8em 1em; margin: 1em 0; color: #1a1a1a; }
+  .info { background: #dceefb; border-left: 4px solid #1f6cbd; padding: .8em 1em; margin: 1em 0; color: #1a1a1a; }
+  .ok   { background: #d8efde; border-left: 4px solid #1f8a3e; padding: .8em 1em; margin: 1em 0; color: #1a1a1a; }
+  .bad  { background: #f9d6d6; border-left: 4px solid #b71c1c; padding: .8em 1em; margin: 1em 0; color: #1a1a1a; }
+  .kv { display: grid; grid-template-columns: max-content 1fr; column-gap: .8em; row-gap: .25em; }
+  .kv b { color: #111; }
+  .en { color: #555; font-style: italic; font-size: 0.92em; display: block; margin-top: .15em; }
+  .en-inline { color: #555; font-style: italic; font-size: 0.92em; }
+  .diag { background: #fff; color: #1a1a1a; padding: .5em; border: 1px solid #e1e4e8; border-radius: 4px; margin: 1em 0; }
+  svg { display: block; margin: 0 auto; max-width: 100%; background: #fff; }
+  .tldr { background: #f0f7ff; border: 1px solid #b3d4f5; padding: 1em 1.5em; border-radius: 5px; margin: 1em 0; color: #1a1a1a; }
+</style>
+</head>
+<body>
+
+<h1>DreamZero v2 训练方案 — 14B 视频骨干 + SO-101 救活计划
+<span class="en">DreamZero v2 finetune recipe — closing the gap to GR00T on 50-demo SO-101 PickOrange</span></h1>
+
+<p>
+<span class="tag">DreamZero</span>
+<span class="tag">Wan2.1-I2V-14B</span>
+<span class="tag">LoRA</span>
+<span class="tag">SO-101</span>
+<span class="tag">PickOrange</span>
+<span class="tag">v2-finetune</span>
+<span class="tag-bad">v1: 0/3 placed @ ckpt-5k</span>
+<span class="tag-ok">target: ≥ GR00T 13/15</span>
+</p>
+
+<div class="tldr">
+<b>TL;DR — 这是设计 draft，不是承诺</b><br>
+v1 ckpt-3k/4k/5k 全 0/3 placed，GR00T-N1.7 同 50 demos 6500 step 拿 13/15。<b>但 Vizuara 公开 baseline (HF dreamzero-so101-lora) 我们也实测过"也很差"</b>（user 主动终止 eval）→ 这意味着 <b>架构层面在 50-demo SO-101 上本来就难启动</b>，不是单纯 v1 hyperparam 没调对。
+<br><br>
+v2 提出的 4 个改动（Vizuara head init / horizon sweep / REPA ablation / 分组 LR）<b>都是带验证条件的假设</b>，不是"按下就拿 5/15"的菜谱。每个变量必须先 single-variable 跑 5-round strict ≥ placed=1 才算证伪 null hypothesis。
+<span class="en">This is a design draft, not a promise. v1 fails (0/3), Vizuara public baseline also fails when we ran it. Each v2 change is a hypothesis with a falsification gate (5-round strict, placed≥1), not a recipe.</span>
+</div>
+
+<h2>0. 为什么必须有 v2 <span class="en">(Why v2 — v1 failure forensics)</span></h2>
+
+<div class="diag">
+<svg viewBox="0 0 1080 290" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#444"/>
+    </marker>
+  </defs>
+  <text x="540" y="22" text-anchor="middle" font-size="15" font-weight="700">50-demo SO-101 PickOrange — 3 路横评 (3-way comparison)</text>
+
+  <!-- GR00T row -->
+  <text x="40" y="62" font-size="13" font-weight="700" fill="#1f6c34">GR00T-N1.7 (1.7B)</text>
+  <rect x="200" y="46" width="160" height="34" rx="4" fill="#d8efde" stroke="#1f8a3e"/>
+  <text x="280" y="68" text-anchor="middle" font-size="12">init: 机器人预训先验</text>
+  <line x1="360" y1="63" x2="420" y2="63" stroke="#444" stroke-width="1.5" marker-end="url(#arr)"/>
+  <rect x="420" y="46" width="180" height="34" rx="4" fill="#d8efde" stroke="#1f8a3e"/>
+  <text x="510" y="68" text-anchor="middle" font-size="12">FT 6500 step on 50 demos</text>
+  <line x1="600" y1="63" x2="660" y2="63" stroke="#444" stroke-width="1.5" marker-end="url(#arr)"/>
+  <rect x="660" y="46" width="200" height="34" rx="4" fill="#a7e0b5" stroke="#1f8a3e" stroke-width="2"/>
+  <text x="760" y="68" text-anchor="middle" font-size="13" font-weight="700">13/15 placed ✓</text>
+
+  <!-- Vizuara public baseline (NEW) -->
+  <text x="40" y="132" font-size="13" font-weight="700" fill="#b8860b">Vizuara dreamzero-so101-lora</text>
+  <rect x="200" y="116" width="160" height="34" rx="4" fill="#fdf3d1" stroke="#b8860b"/>
+  <text x="280" y="138" text-anchor="middle" font-size="12">init: DreamZero 公开 ckpt</text>
+  <line x1="360" y1="133" x2="420" y2="133" stroke="#444" stroke-width="1.5" marker-end="url(#arr)"/>
+  <rect x="420" y="116" width="180" height="34" rx="4" fill="#fdf3d1" stroke="#b8860b"/>
+  <text x="510" y="138" text-anchor="middle" font-size="12">r=4 α=4 (作者发布权重)</text>
+  <line x1="600" y1="133" x2="660" y2="133" stroke="#444" stroke-width="1.5" marker-end="url(#arr)"/>
+  <rect x="660" y="116" width="200" height="34" rx="4" fill="#f3cf66" stroke="#b8860b" stroke-width="2"/>
+  <text x="760" y="138" text-anchor="middle" font-size="13" font-weight="700">"也很差" (user 主动终止)</text>
+
+  <!-- DreamZero v1 row -->
+  <text x="40" y="202" font-size="13" font-weight="700" fill="#c53030">DreamZero v1 自训 (14B+LoRA r=4)</text>
+  <rect x="200" y="186" width="160" height="34" rx="4" fill="#fed7d7" stroke="#c53030"/>
+  <text x="280" y="208" text-anchor="middle" font-size="12">init: 裸视频生成模型</text>
+  <line x1="360" y1="203" x2="420" y2="203" stroke="#444" stroke-width="1.5" marker-end="url(#arr)"/>
+  <rect x="420" y="186" width="180" height="34" rx="4" fill="#fed7d7" stroke="#c53030"/>
+  <text x="510" y="208" text-anchor="middle" font-size="12">FT ckpt-3k/4k/5k</text>
+  <line x1="600" y1="203" x2="660" y2="203" stroke="#444" stroke-width="1.5" marker-end="url(#arr)"/>
+  <rect x="660" y="186" width="200" height="34" rx="4" fill="#fc8181" stroke="#c53030" stroke-width="2"/>
+  <text x="760" y="208" text-anchor="middle" font-size="13" font-weight="700" fill="#fff">0/3 placed ✗ (arm 不动)</text>
+
+  <text x="540" y="262" text-anchor="middle" font-size="12" fill="#555" font-style="italic">关键观察：Vizuara 公开 baseline 也不行 → DreamZero 架构在 50-demo SO-101 上系统性难启动</text>
+  <text x="540" y="278" text-anchor="middle" font-size="12" fill="#555" font-style="italic">v2 的所有改动都必须先解释"为什么不会重蹈 Vizuara baseline 的覆辙"</text>
+</svg>
+</div>
+
+<div class="warn">
+<b>下表全是<u>未验证假设</u></b>，不是 v1→v2 必胜路径。每条 "Why" 都需要单变量 ablation 实测验证；多条同时改 = v1 教训重演。
+</div>
+
+<table>
+<thead><tr><th>维度</th><th>v1 (current)</th><th>v2 (proposed)</th><th>假设的 Why (待验证)</th></tr></thead>
+<tbody>
+<tr><td>action_head 起点</td><td>random init</td><td>Vizuara SO-101 LoRA head 初始化</td><td>假设：head 权重对"DiT hidden states 分布漂移"鲁棒。<b>需先 inspect 真 key/shape 对齐，再验是否优于 random</b></td></tr>
+<tr><td>action_head 容量</td><td>hidden=64, layers=4</td><td>hidden=256, layers=6</td><td>假设：64 维 + 14B backbone 不对称是 bottleneck。<b>没有 GR00T 同维度对照数据支撑</b></td></tr>
+<tr><td>action_horizon</td><td>24</td><td>sweep 8 / 16 / 24 / 40</td><td>GR00T-N1.7 h=40、N1.6 h=50、ACT h=100 都 work → <b>长 horizon ≠ mode collapse；24 不是显著嫌疑</b></td></tr>
+<tr><td>REPA loss</td><td>coeff=1.0 from step 0</td><td>先做 coeff=1.0 vs 0 ablation 对照</td><td>DreamZero 原 default = 1.0，作者可能 ablation 过。<b>不直接砍，先一组对照</b></td></tr>
+<tr><td>LR schedule</td><td>1e-4 constant after 5% warmup</td><td>分组：head 3e-4 / LoRA 2e-5，cosine</td><td>常识级改动 (DreamBooth/LoRA 经验)，但 50 demos 上效果未知</td></tr>
+<tr><td>LoRA rank</td><td>r=4, α=4</td><td>r=16, α=32</td><td>Vizuara r=4 自己也差 → r=4 不一定是 v1 卡点；r=16 也可能没用</td></tr>
+<tr><td>num_frames</td><td>33</td><td>33 (保持) / 17 (备选)</td><td>仅与 horizon sweep 联动调；不单独改</td></tr>
+<tr><td>训练阶段</td><td>一把端到端</td><td>Stage A 冻 DiT 只训 head → Stage B 联训</td><td>假设：先 head 收敛能避开 v1 stuck。<b>风险：Stage A 的 DiT 输出分布与 Stage B 不同 → head 可能学到 transient 解</b></td></tr>
+</tbody>
+</table>
+
+<h2>1. 根因分析 — 为什么 14B &lt; 1.7B <span class="en">(Root cause: why bigger lost)</span></h2>
+
+<h3>1.1 数据结构层 <span class="en">(Data-structure perspective)</span></h3>
+
+<div class="info">
+<b>"Linus 三问"自检：</b><br>
+<b>真问题还是假想？</b> 真问题。v1 三个连续 ckpt 全 0/3，arm barely moves，是 hard fail 不是 noise。<br>
+<b>有更简单方案吗？</b> 有 — 不重做整个 pipeline，<b>只换初始化 + 砍 horizon + 关 REPA</b> 三处。<br>
+<b>会破坏什么吗？</b> Vizuara head shape 需对齐 (max_state_dim=64, max_action_dim=32 一致 ✓)，其余都是 hyperparam 改动，零破坏。
+</div>
+
+<h3>1.2 特殊情况层 <span class="en">(Edge cases v1 fell into)</span></h3>
+
+<ul>
+<li><b>random head + frozen-ish DiT</b>：head 从零，LoRA 只调 19M / 14B = 0.14% → 梯度信号几乎全压在 head 上，但 head 容量 (hidden=64) 远不够吸收</li>
+<li><b>horizon=24 + 50 demos</b>：每个 chunk 24 帧目标 → 优化器学的是"24 帧平均动作"，对 imitation 等价于 mode collapse 到训练集均值（接近静止）</li>
+<li><b>REPA coeff=1.0</b>：repa loss 量级与 action loss 相当 → 早期 action loss 还没下降，REPA 已在拉视频表征，head 学不到 visuomotor 映射</li>
+</ul>
+
+<h3>1.3 复杂度层 <span class="en">(Complexity reduction)</span></h3>
+
+<p>v1 同时在做 4 件事：LoRA 适配 + 动作学习 + 视频动力学约束 (REPA) + 长时域块预测。
+对 50 demos，<b>"先做 1 件 (动作)，做对了再叠加其他"</b> 是唯一稳妥策略。</p>
+
+<h3>1.4 Vizuara head 复用悖论 <span class="en">(The Vizuara reuse paradox — must address head-on)</span></h3>
+
+<div class="bad">
+<b>事实</b>：Vizuara 公开 ckpt 完整推理 (含 DiT LoRA + head + REPA) 在 LeIsaac 上"也很差"，user 主动终止 eval。<br>
+<b>v2-A 提议</b>：从 Vizuara safetensors 抽 <i>仅 action_head 部分</i> 初始化，丢掉 Vizuara 的 DiT LoRA。<br>
+<b>悖论</b>：如果整个 Vizuara model 都不 work，凭什么相信"只用它的 head"反而能 work?
+<span class="en">If full Vizuara fails, why would Vizuara-head-only init succeed?</span>
+</div>
+
+<p><b>3 种可能的解释（按可信度排序）</b>：</p>
+
+<ol>
+<li><b>(50% likely) head 学到了 SO-101 关节 / gripper 量纲先验</b>。action_decoder 输出的 32-dim 包含 5 关节 + gripper + padding，从 random 学这个量纲映射本身需要数百 step，Vizuara 已替我们走完这段 — 即使 head 上游 (DiT hidden) 分布不同，量纲先验仍可能加速 v1 stuck 期出零动作的过渡。<b>验证</b>：v2-A 前 500 step 看 action L1 norm，&gt;0.05 → 至少 head bias 有效</li>
+<li><b>(30% likely) head init 是 random + Vizuara 折中的 noise</b>，效果跟 random 持平。<b>验证</b>：v2-A ckpt-500 与 v1 ckpt-500 横评，placed 差 ≤1 → null hypothesis 不拒</li>
+<li><b>(20% likely) head init 主动有害</b>（Vizuara head 期待的 DiT hidden 分布与 v2 frozen Wan 完全不同 → head 输出反向漂移）。<b>验证</b>：v2-A 前 500 step arm 不动 / 动作发散 → 立即放弃此条变量</li>
+</ol>
+
+<div class="info">
+<b>Decision gate</b>：v2-A 跑前 500 step quick eval + action norm 监控，三种解释中只要 #1 或 #2 出现就继续；#3 出现立即 abort 这条变量。<b>不允许在没 gate 的情况下 5k step 闷头跑</b>（v1 教训）。
+</div>
+
+<h2>2. v2 方案三大主轴 <span class="en">(v2 three primary changes)</span></h2>
+
+<div class="diag">
+<svg viewBox="0 0 1080 320" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="arr2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#444"/>
+    </marker>
+  </defs>
+  <text x="540" y="22" text-anchor="middle" font-size="15" font-weight="700">v2 训练流水线 (Two-stage finetune pipeline)</text>
+
+  <!-- Stage A box -->
+  <rect x="40" y="50" width="480" height="240" rx="8" fill="#f0f7ff" stroke="#1f6cbd" stroke-width="2"/>
+  <text x="280" y="75" text-anchor="middle" font-size="14" font-weight="700" fill="#1f6cbd">Stage A: 0 — 3000 step</text>
+  <text x="280" y="95" text-anchor="middle" font-size="12" fill="#555">"先让 arm 动起来" (Get the arm moving first)</text>
+
+  <rect x="70" y="115" width="180" height="36" rx="4" fill="#dceefb" stroke="#1f6cbd"/>
+  <text x="160" y="138" text-anchor="middle" font-size="12">DiT: ❄️ frozen (no LoRA grad)</text>
+
+  <rect x="70" y="160" width="180" height="36" rx="4" fill="#dceefb" stroke="#1f6cbd"/>
+  <text x="160" y="183" text-anchor="middle" font-size="12">CLIP / VAE / UMT5: ❄️ frozen</text>
+
+  <rect x="290" y="115" width="210" height="81" rx="4" fill="#a7c8e8" stroke="#1f6cbd" stroke-width="2"/>
+  <text x="395" y="138" text-anchor="middle" font-size="13" font-weight="700">action_head 🔥 TRAINED</text>
+  <text x="395" y="156" text-anchor="middle" font-size="11">init: Vizuara head 权重</text>
+  <text x="395" y="174" text-anchor="middle" font-size="11">hidden=256, layers=6</text>
+  <text x="395" y="190" text-anchor="middle" font-size="11">lr=3e-4 cosine</text>
+
+  <rect x="70" y="215" width="430" height="60" rx="4" fill="#fff" stroke="#1f6cbd" stroke-dasharray="4"/>
+  <text x="285" y="235" text-anchor="middle" font-size="12" font-weight="700">horizon=8 · repa_coeff=0 · num_frames=17</text>
+  <text x="285" y="255" text-anchor="middle" font-size="11" fill="#555">每 500 step quick eval (3 ep × 60s)</text>
+  <text x="285" y="270" text-anchor="middle" font-size="11" fill="#555">退出条件: placed ≥ 1 / 3 → 进 Stage B</text>
+
+  <!-- Arrow A → B -->
+  <line x1="525" y1="170" x2="555" y2="170" stroke="#444" stroke-width="2" marker-end="url(#arr2)"/>
+
+  <!-- Stage B box -->
+  <rect x="560" y="50" width="480" height="240" rx="8" fill="#f0fff4" stroke="#1f8a3e" stroke-width="2"/>
+  <text x="800" y="75" text-anchor="middle" font-size="14" font-weight="700" fill="#1f8a3e">Stage B: 3000 — 15000 step</text>
+  <text x="800" y="95" text-anchor="middle" font-size="12" fill="#555">"让 DiT 适配 SO-101 视觉" (Adapt DiT to SO-101)</text>
+
+  <rect x="590" y="115" width="180" height="36" rx="4" fill="#c1ebcd" stroke="#1f8a3e" stroke-width="2"/>
+  <text x="680" y="138" text-anchor="middle" font-size="12">DiT LoRA 🔥 r=16, α=32</text>
+
+  <rect x="590" y="160" width="180" height="36" rx="4" fill="#d8efde" stroke="#1f8a3e"/>
+  <text x="680" y="183" text-anchor="middle" font-size="12">CLIP / VAE / UMT5: ❄️ still frozen</text>
+
+  <rect x="810" y="115" width="210" height="81" rx="4" fill="#a7e0b5" stroke="#1f8a3e" stroke-width="2"/>
+  <text x="915" y="138" text-anchor="middle" font-size="13" font-weight="700">action_head 🔥 continue</text>
+  <text x="915" y="156" text-anchor="middle" font-size="11">lr=1e-4 cosine</text>
+  <text x="915" y="174" text-anchor="middle" font-size="11">DiT LoRA lr=2e-5</text>
+  <text x="915" y="190" text-anchor="middle" font-size="11">分组 LR (param groups)</text>
+
+  <rect x="590" y="215" width="430" height="60" rx="4" fill="#fff" stroke="#1f8a3e" stroke-dasharray="4"/>
+  <text x="805" y="235" text-anchor="middle" font-size="12" font-weight="700">horizon=8 (保持) · repa anneal 0→0.2</text>
+  <text x="805" y="255" text-anchor="middle" font-size="11" fill="#555">每 1000 step 5-round eval</text>
+  <text x="805" y="270" text-anchor="middle" font-size="11" fill="#555">退出条件: 连续 3 ckpt placed 不增长 → 停</text>
+</svg>
+</div>
+
+<h3>2.1 主轴 #1 — Vizuara action_head 初始化 <span class="en">(Init from pretrained robot head)</span></h3>
+
+<div class="warn">
+<b>纠正前版本错误结论</b>：原 doc 写 "Vizuara r=4 能 work → 架构没问题"。<u>事实是 Vizuara 本身也不 work</u>（见 §1.4）。重新表述：
+<br><br>
+<b>修正后的假设</b>：DreamZero 架构 + DiT LoRA + REPA 这一整套在 50-demo 上系统性难启动。
+<b>v2-A 不是"复刻 Vizuara 配方"</b>，而是<b>试试用 Vizuara head bias 给 random init 一个非零起点</b>，看是否能缩短 v1 前 2k step 的 stuck 期。
+<span class="en">v2-A is NOT "reproduce Vizuara recipe" (Vizuara also fails). It's "use Vizuara head as a non-zero warm-start to escape v1's stuck phase faster".</span>
+</div>
+
+<table>
+<thead><tr><th>组件</th><th>v1 来源</th><th>v2 来源</th><th>对齐性（待 inspect 验证）</th></tr></thead>
+<tbody>
+<tr><td>state_encoder</td><td>random</td><td>Vizuara <code>model.safetensors</code></td><td>⚠ 假设 shape 一致 — Vizuara 是否也用 max_state_dim=64 未确认，需 <code>safetensors.torch.load_file</code> 后 print keys + shapes 对比</td></tr>
+<tr><td>action_encoder</td><td>random</td><td>Vizuara</td><td>⚠ 同上，未确认 max_action_dim=32</td></tr>
+<tr><td>action_decoder</td><td>random</td><td>Vizuara</td><td>⚠ 同上</td></tr>
+<tr><td>vl_self_attention</td><td>random (4 layers / hidden=64)</td><td>Vizuara</td><td>⚠ 若 v2 把 hidden 升到 256 / layers 升到 6，<b>shape 不匹配 → init 报错</b>，必须二选一：Vizuara init 时保持 hidden=64 layers=4，或主动放弃 Vizuara init 走 hidden=256</td></tr>
+<tr><td>DiT LoRA</td><td>random</td><td>random（保持）</td><td>Vizuara DiT LoRA 已被实测无效（baseline 推理"也很差"），不复用</td></tr>
+</tbody>
+</table>
+
+<div class="bad">
+<b>设计冲突警告</b>：表格最后一行揭示 §2.1（Vizuara init）与 §2.2 暗含的 hidden=256 / layers=6 升级<u>互斥</u>。<br>
+<b>解决方案</b>：v2-A 必须先保持 hidden=64 layers=4，验完 Vizuara init 有没有效再决定是否升 head 容量。<b>不允许 head 升容量 + Vizuara init 同时改</b>。
+</div>
+
+<p><b>实现路径</b>（写到 <code>train_dreamzero_v2.sh</code>）：</p>
+
+<pre><code># 1. 下载 Vizuara safetensors 到 cloud
+huggingface-cli download Vizuara/dreamzero-so101-lora model.safetensors \
+    --local-dir /root/autodl-tmp/vizuara-so101
+
+# 2. 在 train.py 加载流程前 inject head weights：
+python -c "
+from safetensors.torch import load_file
+state = load_file('/root/autodl-tmp/vizuara-so101/model.safetensors')
+# 过滤出 action_head 相关 key (state_enc / action_enc / action_dec / vl_self_attn)
+head_keys = {k: v for k, v in state.items()
+             if any(p in k for p in ['state_enc', 'action_enc', 'action_dec', 'vl_self'])}
+import torch
+torch.save(head_keys, '/root/autodl-tmp/vizuara_head_init.pt')
+print(f'extracted {len(head_keys)} head keys')
+"
+
+# 3. 训练命令加 +action_head_init_path
+"$TORCHRUN" ... \
+    +action_head_init_path=/root/autodl-tmp/vizuara_head_init.pt \
+    ...</code></pre>
+
+<h3>2.2 主轴 #2 — action_horizon sweep（不是 24→8 一刀切）<span class="en">(Horizon sweep, not a fixed reduction)</span></h3>
+
+<div class="bad">
+<b>纠正前版本错误</b>：原 doc 用"horizon=24 害人 / 起点数 ×3 / mode collapse" 论证砍到 8。<u>横评数据反着站</u>：
+<ul>
+<li>GR00T-N1.7 action_horizon = <b>40</b> → 14/15 placed 🥇</li>
+<li>GR00T-N1.6 action_horizon = <b>50</b> → 13/15 placed</li>
+<li>ACT action_horizon = <b>100</b> → 8/15 placed</li>
+<li>SmolVLA / X-VLA / N1.5 horizon 32-50 均能 work</li>
+</ul>
+<b>结论</b>：长 horizon ≠ mode collapse；horizon=24 不是 v1 的显著嫌疑。砍到 8 没有先验证据支持。
+</div>
+
+<div class="info">
+<b>修正方案：horizon sweep，不预设答案</b>
+<br><br>
+v2-B 跑 4 个 horizon ∈ {8, 16, 24, 40}，其余 hyperparam 锁定为 v2-A 的胜出配置。<br>
+每个跑到 ckpt-2k，做 5-round strict eval，比较 first-placed step + 5k step placed/15。<br>
+<b>如果 horizon=24 不显著差于其他三档</b>，则保持 v1 默认，省一次实验预算 ¥30。
+</div>
+
+<p>对应 config 改动（仅 sweep 时）：</p>
+
+<pre><code># groot/vla/configs (Hydra override) — sweep 一组
+action_horizon: ∈ {8, 16, 24, 40}
+num_action_per_block: 同 action_horizon
+num_frames: 33 (保持，独立变量)
+# frame_seqlen 由 num_frames × (W/8 × H/8 / patch=4) 计算
+# 33 × (40 × 22 / 4) = 33 × 220 = 7260 (原 v1 值，保持)</code></pre>
+
+<p><b>推理端同步影响</b>（horizon 改了必须连带改的下游）：</p>
+<ul>
+<li><code>server/dreamzero_leisaac/server.py:200</code> <code>--action-horizon</code> default</li>
+<li><code>server/eval_dreamzero.sh</code> <code>ACTION_HORIZON</code></li>
+<li>LeIsaac client query 频率 = horizon / step_hz；horizon=8 + 60Hz → 133ms 一次 query，要确认 server 推理时间 &lt; 133ms 不然 stuck</li>
+<li><code>policy_timeout_ms</code> = max(8000, horizon × per_step_inference_ms × 1.5)</li>
+</ul>
+
+<h3>2.3 主轴 #3 — REPA ablation（不直接关）<span class="en">(REPA ablation, not blanket disable)</span></h3>
+
+<div class="warn">
+<b>纠正前版本错误</b>：原 doc 直接说"REPA 在抢梯度，前期是噪声不是信号"，直接砍掉。<u>这是猜测，没有证据</u>：
+<ul>
+<li>DreamZero 论文 default repa_coeff = 1.0，作者很可能已 ablation 过</li>
+<li>Vizuara baseline 默认开 REPA 也"很差"，但不开 REPA 是否更差未知</li>
+<li>"REPA 在学 image→DINO feature" 这条逻辑链对 imitation 不必然是干扰 — DINO feature 是稳定 visual prior，可能反而帮新场景泛化</li>
+</ul>
+</div>
+
+<div class="info">
+<b>修正方案：REPA 二选一对照组</b>，不预设结论
+<br><br>
+v2-C 单变量跑两个 run：repa_coeff = 1.0 (v1 default) 和 repa_coeff = 0.0，其余配置相同，只跑到 ckpt-2k，5-round strict 比较。
+<br>
+<b>如果差距 ≤ 1 placed</b>：保持 v1 default = 1.0，不改。
+<b>如果 0.0 显著更好</b>：再考虑 anneal schedule。
+</div>
+
+<pre><code># v2-C 对照 run #1: repa_coeff=1.0 (v1 default 保持)
+# v2-C 对照 run #2: repa_coeff=0.0
+# 其余 (lr / horizon / lora rank / head init) 都 freeze 为 v2-A 胜出值</code></pre>
+
+<h2>3. 副轴改动 — LR / rank / schedule <span class="en">(Secondary changes — apply only after primary axis validated)</span></h2>
+
+<div class="warn">
+<b>纠正</b>：原表写 "Vizuara r=4 能 work 是因为基于 400-demo 已训过" — 这是错的，Vizuara 公开 ckpt 我们实测"也很差"。删除所有以"Vizuara work"为前提的论证。
+<br><br>
+副轴改动<b>只在主轴 #1/#2/#3 至少一项 validated 后</b>才考虑叠加。否则等于 v1 教训重演（一把改 8 个变量）。
+</div>
+
+<table>
+<thead><tr><th>参数</th><th>v1</th><th>v2 候选</th><th>状态</th></tr></thead>
+<tbody>
+<tr><td>LoRA rank</td><td>4</td><td>4 (保持) → 后期可试 16</td><td>Vizuara r=4 baseline 也差，r=4 不一定是 v1 卡点 → <b>v2-A/B/C 期保持 r=4</b></td></tr>
+<tr><td>LoRA alpha</td><td>4</td><td>4 (保持)</td><td>同上，r 不动 α 也不动</td></tr>
+<tr><td>LR (head)</td><td>1e-4</td><td>1e-4 (保持) → 后期试 3e-4</td><td>DreamBooth 经验仅参考，50 demos 上未必适用</td></tr>
+<tr><td>LR (LoRA)</td><td>1e-4</td><td>1e-4 (保持)</td><td>分组 LR 待 §4 launcher 补丁完成后才能改</td></tr>
+<tr><td>schedule</td><td>constant</td><td>cosine 可叠加</td><td>低风险常识改动，可在 v2-A 同步开</td></tr>
+<tr><td>warmup_ratio</td><td>0.05</td><td>0.05 (保持)</td><td>无证据需改</td></tr>
+<tr><td>weight_decay</td><td>1e-5</td><td>1e-5 (保持)</td><td>head 不升容量就不动 reg</td></tr>
+<tr><td>max_steps</td><td>20000</td><td>看 ckpt 趋势</td><td>不预设 — auto_eval gate 3 连 0 即 abort</td></tr>
+<tr><td>save_steps</td><td>2000</td><td>500-1000</td><td>密集 ckpt 利于 gate 早判 abort</td></tr>
+</tbody>
+</table>
+
+<div class="info">
+<b>原则</b>：保守改动 (cosine, save_steps) 可在 v2-A 同步开；激进改动 (LoRA r↑, head hidden↑, 分组 LR) 必须等主轴 validated 后单独叠加 ablation。
+</div>
+
+<h2>4. 训练命令骨架 <span class="en">(Launcher skeleton — NOT ready to run)</span></h2>
+
+<div class="bad">
+<b>⚠ 不可直接 copy-paste 跑</b>。下面所有 <code>+xxx</code> 都是 v2 新增 Hydra override，<u>dreamzero-repo 当前没实现</u>，必须先做 §6.2 三处 patch。<br>
+此处骨架仅用于<b>表达 v2-A 单变量实验</b>该长什么样，不是 production launcher。
+</div>
+
+<h3>4.1 v2-A 单变量 (Vizuara head init only)</h3>
+
+<pre><code>#!/bin/bash
+# v2-A: 在 v1 基础上只改一件事 — head init from Vizuara
+# 其余 (horizon=24, repa=1.0, r=4, α=4, lr=1e-4) 保持 v1 一致
+#
+# Hardware: 1× RTX Pro 6000 96GB
+# ETA: ~5h (训练) + 每 500 step quick eval
+
+set -e
+export HYDRA_FULL_ERROR=1
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+VIZUARA_HEAD=/root/autodl-tmp/vizuara_head_init.pt  # 见 §6.1 抽取脚本
+
+"$TORCHRUN" --nproc_per_node 1 --standalone groot/vla/experiment/experiment.py \
+    # ↓↓↓ 与 v1 train_dreamzero_bf16_lora.sh 完全相同的参数 ↓↓↓
+    report_to=none data=dreamzero/leisaac_relative train_architecture=lora \
+    num_frames=33 action_horizon=24 num_views=2 \
+    model=dreamzero/vla model/dreamzero/action_head=wan_flow_matching_action_tf \
+    seed=42 training_args.learning_rate=1e-4 \
+    output_dir=/root/autodl-tmp/dreamzero_v2A \
+    per_device_train_batch_size=1 max_steps=5000 save_steps=500 \
+    bf16=true tf32=true frame_seqlen=7260 \
+    image_resolution_width=320 image_resolution_height=176 \
+    leisaac_data_root=/root/autodl-tmp/leisaac-pick-orange-h264 \
+    # ... (其余 v1 参数复用)
+    \
+    # ↓↓↓ v2-A 唯一新增 (需补丁 §6.2.1) ↓↓↓
+    "+action_head_init_path=$VIZUARA_HEAD"
+</code></pre>
+
+<div class="info">
+<b>v2-A gate</b>：跑到 step 500，做 1-round quick eval + 看 <code>action.joint_pos</code> L1 norm。
+<ul>
+<li>arm 动作 norm &gt; 0.05 且 placed ≥ 1 → 进 v2-B (sweep horizon)</li>
+<li>norm &gt; 0.05 但 placed = 0 → 跑到 step 2k 再判</li>
+<li>norm &lt; 0.01 (arm 不动) → 立即 abort，回到 §1.4 选项 #3</li>
+</ul>
+</div>
+
+<h3>4.2 后续 v2-B/C 骨架（视 v2-A 结果决定）</h3>
+
+<p>不预先列代码。流程：</p>
+<ol>
+<li>v2-A 跑通 → fork 4 个 run sweep horizon ∈ {8, 16, 24, 40}</li>
+<li>选 horizon 胜出值 → 再 fork 2 个 run sweep repa_coeff ∈ {0, 1.0}</li>
+<li>都收敛 → 才考虑 head 升容量 / LoRA r=16 / 分组 LR</li>
+</ol>
+<p>每一步都<b>单变量 + gate</b>，不预写到 launcher。</p>
+
+<h3>4.3 VRAM 预算（粗算，待实测）<span class="en">(VRAM budget — rough estimate)</span></h3>
+
+<table>
+<thead><tr><th>组件</th><th>v1 (实测峰值)</th><th>v2-A (Vizuara init only)</th><th>v2-final (升 head + r=16)</th></tr></thead>
+<tbody>
+<tr><td>Wan2.1-I2V-14B bf16 + ZeRO-2 offload</td><td>~55 GB</td><td>~55 GB (不变)</td><td>~55 GB (不变)</td></tr>
+<tr><td>action_head 参数</td><td>~10 M</td><td>~10 M (shape 不变)</td><td>~60 M (hidden 64→256, layers 4→6)</td></tr>
+<tr><td>LoRA 参数</td><td>~19 M (r=4)</td><td>~19 M</td><td>~76 M (r=16)</td></tr>
+<tr><td>activations (frame_seqlen=7260)</td><td>~30 GB</td><td>~30 GB</td><td>~35-40 GB (head 中间激活 ~16×)</td></tr>
+<tr><td><b>合计峰值</b></td><td><b>~85 GB / 96 GB</b></td><td><b>~85 GB</b></td><td><b>~95 GB ⚠ 接近上限</b></td></tr>
+</tbody>
+</table>
+
+<div class="warn">
+<b>OOM fallback ladder</b>（v2-final 真 OOM 时按序降级）：
+<ol>
+<li>head <code>hidden_size</code> 256 → 128（参数减 4×，激活减 4×）</li>
+<li><code>num_frames</code> 33 → 17（activations 减半，但需 horizon 联动）</li>
+<li>LoRA rank 16 → 8</li>
+<li>切 H100 80GB 多卡（最后手段，运维成本翻倍）</li>
+</ol>
+v2-A 完全沿用 v1 显存 footprint，不会 OOM。
+</div>
+
+<h2>5. 预期结果 + 实验顺序 <span class="en">(Expected outcomes &amp; experiment order)</span></h2>
+
+<div class="bad">
+<b>纠正前版本错误</b>：原 doc 给"v2-A 2-4/15 / v2-B 4-6/15 / v2-full 7-10/15"等具体数字预期，<u>零证据</u>。
+违反 user 强调的"负面结果如实写" + "5-round strict 是唯一标准" 原则。<b>删除所有数字预期</b>，改成 falsification gate。
+</div>
+
+<table>
+<thead><tr><th>实验</th><th>改动 (单变量)</th><th>Gate 通过条件 (5-round strict)</th><th>云端成本</th></tr></thead>
+<tbody>
+<tr><td>baseline (v1)</td><td>—</td><td>已知 0/15 (3 ckpt 实测)</td><td>已花</td></tr>
+<tr><td>v2-A</td><td>仅 Vizuara head init</td><td>ckpt-2k strict placed ≥ 1 → pass；否则 abort</td><td>¥30 (~5h)</td></tr>
+<tr><td>v2-B</td><td>v2-A pass 后 sweep horizon ∈ {8,16,24,40}</td><td>至少 1 个 horizon strict placed ≥ 2 → pass</td><td>¥30 × 4 = ¥120 (并行 1 卡 sequential)</td></tr>
+<tr><td>v2-C</td><td>v2-B 胜出 horizon + repa ∈ {0, 1.0}</td><td>差距 &gt; 2 placed → 选优；≤ 2 → 视为 noise 保 default</td><td>¥30 × 2 = ¥60</td></tr>
+<tr><td>v2-D</td><td>v2-C 胜出 + 升 head hidden 256 / LoRA r=16 / 分组 LR</td><td>strict placed 显著高于 v2-C → pass；否则保留 v2-C 配置</td><td>¥45 × 3 = ¥135 (每改动独立 ablation)</td></tr>
+</tbody>
+</table>
+
+<div class="info">
+<b>总预算</b>：最差全跑完 ~¥345。<b>最常见情况</b>：v2-A 早期 abort (~¥10)，整个 v2 路径终结，转 pivot (X-VLA 复用 / 换 1.7B backbone 类似 GR00T)。
+<br><br>
+<b>核心原则</b>（v1 教训）：每次只动 1 个变量；每 500 step quick eval (3 ep × 60s)；连续 3 个 ckpt placed=0 直接 abort 不再追投。
+<span class="en">Single-variable ablation, 500-step quick-eval gate, 3-consecutive-0 abort rule. Worst case ~¥345; most likely v2-A aborts early at ¥10 and we pivot.</span>
+</div>
+
+<h3>5.1 Pivot 选项（v2 全失败时）</h3>
+
+<ul>
+<li><b>Option A</b>: 放弃 14B Wan，复用 X-VLA / GR00T-N1.6 验证过的 1.7B-scale VLA 架构（已知能 work）</li>
+<li><b>Option B</b>: 增加 demo 量（50 → 200+），看是否是数据 bottleneck</li>
+<li><b>Option C</b>: 联系 DreamZero 作者问 Vizuara baseline 是否原本就不为 sim eval 设计 (可能 real-robot 才达标)</li>
+</ul>
+
+<h2>6. 实施清单 <span class="en">(Implementation checklist)</span></h2>
+
+<h3>6.1 云端准备</h3>
+<pre><code># 在云端 (root@connect.westd.seetacloud.com -p 38181)
+huggingface-cli download Vizuara/dreamzero-so101-lora model.safetensors \
+    --local-dir /root/autodl-tmp/vizuara-so101
+
+# 抽 head keys
+python /root/autodl-tmp/extract_vizuara_head.py</code></pre>
+
+<h3>6.2 dreamzero-repo 补丁 (3 处)</h3>
+<ol>
+<li><code>groot/vla/experiment/experiment.py</code>: 支持 <code>action_head_init_path</code>，训练 init 后 <code>model.load_state_dict(head_state, strict=False)</code></li>
+<li>同文件: 支持 <code>freeze_dit=true</code>，trainer setup 前 <code>for p in model.action_head.diffusion_model.parameters(): p.requires_grad=False</code></li>
+<li>同文件: 支持 <code>lora_lr_multiplier</code>，optimizer param groups 拆 head/lora 两组</li>
+</ol>
+
+<h3>6.3 本地 server / inference 同步</h3>
+
+<p><b>v2-A 阶段（horizon 不动 + head 不升容量）</b>：无需任何 server / inference 改动，原 v1 server 直接吃 v2-A ckpt。</p>
+
+<p><b>v2-B 阶段（horizon sweep）</b>：每次切 horizon 都要同步：</p>
+<ul>
+<li><code>server/dreamzero_leisaac/server.py:200</code> <code>--action-horizon</code> default 改为当前 sweep 值</li>
+<li><code>server/eval_dreamzero.sh</code> <code>ACTION_HORIZON</code> env 改</li>
+<li><code>LeIsaac/scripts/inference/dreamzero/dreamzero_policy.py</code> <code>action_horizon=...</code> 改</li>
+<li><b>policy_timeout_ms 重算</b>：horizon=8 时 client query 频率 = 8/60Hz = 133ms，server inference 必须 &lt; 133ms 不然 stuck；若 inference 仍 ~8s/chunk → 必须改成"等满 chunk 才发"模式或降 step_hz</li>
+<li><code>STUCK_WINDOW_S</code>：v1 已 99999 禁用，保持</li>
+</ul>
+
+<p><b>v2-D 阶段（head 升容量）</b>：</p>
+<ul>
+<li><code>LeIsaac/scripts/inference/dreamzero/dreamzero_inference_loader.py</code>: meta-init shape 同步 <code>hidden_size</code> / <code>vl_self_attn.num_layers</code></li>
+<li><code>experiment_cfg/conf.yaml</code>: <code>WANPolicyHeadConfig</code> 字段同步，否则 ckpt load 报 shape mismatch</li>
+</ul>
+
+<div class="info">
+<b>检查清单</b>（每个 v2 阶段切换前必跑）：
+<ol>
+<li>scp 新 ckpt 到 laptop</li>
+<li>sanity script 确认 adapter keys 完整（参考 v1 verify_adapter.py）</li>
+<li>local Python repl 试 <code>DreamZeroLeIsaacPolicy(...)</code> 构造不报 shape 错</li>
+<li>1-round quick eval 看 arm 是否动 + placed</li>
+<li>过了再上 5-round strict</li>
+</ol>
+</div>
+
+<h2>7. 关联 <span class="en">(Related memories &amp; docs)</span></h2>
+<ul>
+<li><code>dreamzero_finetune.html</code> — v1 训练设计文档 (NF4 vs BF16, 显存测算, hyperparam 选型)</li>
+<li><code>dreamzero-leisaac-train-debug-2026-05-23.md</code> — v1 训练 9-坑全过</li>
+<li><code>dreamzero-phase2-server-integration.md</code> — Phase 2 server 集成 + OOM 破局</li>
+<li><code>feedback-dreamzero-per-ckpt-eval-cycle.md</code> — 每 ckpt scp+eval cycle policy</li>
+<li><code>feedback-incremental-eval-during-training.md</code> — 训练期 quick eval 强制 (10 等分 watchdog)</li>
+</ul>
+
+<hr>
+
+<div class="kv">
+<b>作者</b><span>Opus 4.7 + Codex GPT-5.4 (DeepSeek opencode binary 损坏，本轮缺席)</span>
+<b>日期</b><span>2026-05-24 (v1 草稿) → 2026-05-24 (v2 修订：Opus 自评后大改)</span>
+<b>状态</b><span>📝 设计 draft v2，<b>多处假设待 ablation 验证</b>，不是 production launcher</span>
+<b>v2 修订点</b><span>① 直面 Vizuara baseline 也差 (§0, §1.4) ② horizon 改 sweep (§2.2) ③ REPA 改对照组 (§2.3) ④ 删数字预期改 falsification gate (§5) ⑤ 加 VRAM 重算 (§4.3) ⑥ §4 launcher 标"骨架不可跑" ⑦ §6.3 分阶段同步清单</span>
+</div>
+
+</body>
+</html>

@@ -1,0 +1,169 @@
+# @package _global_
+# DreamZero training config for LeIsaac SO-101 PickOrange.
+# Drop this into dreamzero-repo/groot/vla/configs/data/dreamzero/leisaac_relative.yaml
+# so Hydra picks it via `data=dreamzero/leisaac_relative`.
+
+defaults:
+  - dreamzero/base_48_wan_fine_aug_relative
+  - _self_
+
+max_state_dim: 64
+use_global_metadata: false
+relative_action: true
+relative_action_per_horizon: false
+# SO-101 = 1 arm + 1 gripper; matches state/action key names from convert_leisaac_to_gear.sh
+relative_action_keys:
+  - joint_pos
+  - gripper_pos
+max_chunk_size: 5
+dataset_shard_sampling_rate: 0.1
+mixture_dataset_cls: groot.vla.data.dataset.lerobot_sharded.ShardedLeRobotMixtureDataset.from_mixture_spec
+single_dataset_cls: groot.vla.data.dataset.lerobot_sharded.ShardedLeRobotSubLangSingleActionChunkDatasetDROID
+
+# Path overridden via CLI: leisaac_data_root=/path/to/leisaac-pick-orange
+leisaac_data_root: ???
+
+################################################################################
+# xdof (LeIsaac SO-101: 1 arm + 1 gripper, 2 cams, 30 fps, 60 demo)
+# state 6 dims, action 6 dims, 2 views: front + wrist
+################################################################################
+
+modality_config_xdof:
+  video:
+    _target_: groot.vla.data.dataset.ModalityConfig
+    delta_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]
+    eval_delta_indices: [0]
+    modality_keys:
+      - video.front
+      - video.wrist
+  state:
+    _target_: groot.vla.data.dataset.ModalityConfig
+    delta_indices: [0]
+    modality_keys:
+      - state.joint_pos
+      - state.gripper_pos
+  action:
+    _target_: groot.vla.data.dataset.ModalityConfig
+    delta_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
+    modality_keys:
+      - action.joint_pos
+      - action.gripper_pos
+  language:
+    _target_: groot.vla.data.dataset.ModalityConfig
+    delta_indices: [0]
+    modality_keys:
+      - annotation.task
+
+transform_xdof:
+  _target_: groot.vla.data.transform.ComposedModalityTransform
+  transforms:
+    # Video transforms
+    - _target_: groot.vla.data.transform.VideoToTensor
+      apply_to: ${modality_config_xdof.video.modality_keys}
+    - _target_: groot.vla.data.transform.VideoCrop
+      apply_to: ${modality_config_xdof.video.modality_keys}
+      scale: 0.95
+      mode: random
+    - _target_: groot.vla.data.transform.VideoResize
+      apply_to: ${modality_config_xdof.video.modality_keys}
+      height: ${image_resolution_height}
+      width: ${image_resolution_width}
+      interpolation: linear
+    - _target_: groot.vla.data.transform.VideoColorJitter
+      apply_to: ${modality_config_xdof.video.modality_keys}
+      brightness: 0.3
+      contrast: 0.4
+      saturation: 0.5
+      hue: 0.08
+    - _target_: groot.vla.data.transform.VideoToNumpy
+      apply_to: ${modality_config_xdof.video.modality_keys}
+
+    # State transforms
+    - _target_: groot.vla.data.transform.StateActionToTensor
+      apply_to: ${modality_config_xdof.state.modality_keys}
+    - _target_: groot.vla.data.transform.StateActionTransform
+      apply_to: ${modality_config_xdof.state.modality_keys}
+      normalization_modes:
+        state.joint_pos: q99
+        state.gripper_pos: q99
+
+    # Action transforms
+    - _target_: groot.vla.data.transform.StateActionToTensor
+      apply_to: ${modality_config_xdof.action.modality_keys}
+    - _target_: groot.vla.data.transform.StateActionTransform
+      apply_to: ${modality_config_xdof.action.modality_keys}
+      normalization_modes:
+        action.joint_pos: q99
+        action.gripper_pos: q99
+
+    # ConcatTransform
+    - _target_: groot.vla.data.transform.ConcatTransform
+      video_concat_order: ${modality_config_xdof.video.modality_keys}
+      state_concat_order: ${modality_config_xdof.state.modality_keys}
+      action_concat_order: ${modality_config_xdof.action.modality_keys}
+
+    # Model-specific transform
+    - ${model_specific_transform}
+
+################################################################################
+# Register xdof into the dispatch dicts (preserve existing embodiments)
+################################################################################
+
+modality_configs:
+  oxe_droid: ${modality_config_oxe_droid}
+  agibot: ${modality_config_agibot}
+  yam: ${modality_config_yam}
+  xdof: ${modality_config_xdof}
+
+transforms:
+  oxe_droid: ${transform_oxe_droid}
+  agibot: ${transform_agibot}
+  yam: ${transform_yam}
+  xdof: ${transform_xdof}
+
+metadata_versions:
+  oxe_droid: '0221'
+  agibot: '0221'
+  yam: '0221'
+  xdof: '0221'
+
+fps:
+  yam: 30
+  xdof: 30
+
+################################################################################
+# Train dataset spec
+################################################################################
+
+train_dataset:
+  _target_: ${mixture_dataset_cls}
+  _convert_: object
+  mixture_spec:
+    - dataset_path:
+        xdof:
+          - ${leisaac_data_root}
+      dataset_weight: 1.0
+      distribute_weights: true
+
+  dataset_class: ${single_dataset_cls}
+  all_modality_configs: ${modality_configs}
+  all_transforms: ${transforms}
+  metadata_versions: ${metadata_versions}
+  fps: ${fps}
+  dataset_kwargs:
+    # Use decord. LeIsaac's original mp4 is AV1 → must re-encode to H.264 first:
+    #   bash convert_leisaac_to_gear.sh /root/autodl-tmp/leisaac-pick-orange
+    #   ffmpeg -y -i orig.mp4 -c:v libx264 -preset ultrafast -crf 18 -pix_fmt yuv420p new.mp4
+    # See scripts_finetune_dreamzero/reencode_av1_to_h264.sh.
+    # ffmpeg backend is *catastrophically* slow (1 subprocess/frame, 8-10h/shard).
+    video_backend: decord
+    use_global_metadata: ${use_global_metadata}
+    max_chunk_size: ${max_chunk_size}
+    relative_action: ${relative_action}
+    relative_action_keys: ${relative_action_keys}
+    relative_action_per_horizon: ${relative_action_per_horizon}
+  mixture_kwargs:
+    training: true
+    balance_dataset_weights: false
+    seed: 42
+    shard_sampling_rate: ${dataset_shard_sampling_rate}

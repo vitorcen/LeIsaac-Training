@@ -37,9 +37,20 @@
 <body>
 
 <h1>OpenVLA-OFT QLoRA 微调计划</h1>
-<p class="meta">SO-101 PickOrange · 第 6 个 fine-tune baseline · pivot from vanilla OpenVLA · 2026-05-18</p>
+<p class="meta">SO-101 PickOrange · 第 6 个 fine-tune baseline · pivot from vanilla OpenVLA · 2026-05-18（原稿）· 2026-05-24（战略校准）</p>
 <p class="en">Migration plan: vanilla OpenVLA-7B (discrete token, autoregressive) → OpenVLA-OFT (continuous L1, parallel decode, chunked actions).
 The goal is to break the step_hz=5 ceiling and the gripper-precision floor we hit on vanilla.</p>
+
+<div class="callout bad">
+<b>⛔ 2026-05-24 状态 · Status update：从未执行 · 战略优先级低 · 设计仍正确但需校准</b>
+<ul>
+<li><b>0 行代码落地</b>：本 plan 写于 vanilla ckpt-2000 阶段，原 "pivot 决策点 = ckpt-5000 GUI" 从未触发——vanilla 全程 0/9 后整个 OpenVLA 路径放弃，pivot 走向 X-VLA（亦失败）→ 最终落到 GR00T-N1.7。OFT 自始至终是 paper plan</li>
+<li><b>当前主线</b>: DreamZero v2-A（gated）+ GR00T-N1.7 ckpt sweep（已 41/60 🥇）。OFT 不在 critical path</li>
+<li><b>战略真实期望（20-round 严格制校准）</b>：见 §8 重做表。最乐观 path A bf16 LoRA + fork moojink 期望 15-30/60，仍只到 leaderboard 中位，<b>不解决主线问题</b></li>
+<li><b>vanilla 根因继承风险</b>：vanilla 0/9 的诊断根因 = torch 2.3 + <code>trust_remote_code</code> 的 Prismatic VLM ckpt 加载 bug。OFT 同样基于 Prismatic 自定义类，<b>必须先做冒烟验证</b>（见 §6 新增 P-1）</li>
+<li><b>本文档保留</b>作为 ① OFT 架构与 codex review 的设计参考、② 若主线全废后的 "7B VLA 最后一搏" backup plan</li>
+</ul>
+</div>
 
 <h2>0. TL;DR</h2>
 <div class="callout good">
@@ -181,23 +192,38 @@ The goal is to break the step_hz=5 ceiling and the gripper-precision floor we hi
 
 <p><b>实操建议</b>：先 cat <code>moojink/openvla-7b-oft-finetuned-libero-spatial</code> 的 <code>config.json</code> 看 <code>ACTION_DIM</code> 等超参是不是真写死。如果是，**spatial 跟 combined 选一个都行**。等 ckpt-5000 vanilla GUI 结果出来再确认 pivot。</p>
 
-<h2>4. 资源估算 — QLoRA 在 24GB 4090</h2>
+<h2>4. 资源估算 — 三套硬件路径对比</h2>
 
-<div class="callout good">
-<b>结论：QLoRA 是正确选择（同 vanilla 链路，零工程成本）。</b>
+<div class="callout">
+<b>2026-05-24 修订</b>：原文只算 4090 + QLoRA（"零工程成本"）。但既然有 AutoDL vGPU-48GB 选项，<b>bf16 LoRA + path A (fork moojink) 是更对路的选择</b>——直接复用官方栈，规避 risk #3（"自造 QLoRA-OFT"）。下表给出三套完整路径对比。
 </div>
 
 <table>
-<tr><th>项</th><th>bf16 LoRA</th><th><b>QLoRA NF4</b></th></tr>
-<tr><td>Base 7-8B 权重</td><td>~14-16 GB</td><td><b>~3.8 GB</b></td></tr>
-<tr><td>Action expert MLP（OFT 新增）</td><td>~0.3 GB</td><td>~0.3 GB</td></tr>
-<tr><td>LoRA r=32 q/v</td><td>~0.4 GB</td><td>~0.4 GB</td></tr>
-<tr><td>Optimizer (AdamW fp32)</td><td>~0.8 GB</td><td>~0.8 GB</td></tr>
-<tr><td>Activations (batch=4, chunk=8, no grad_ckpt)</td><td>~10-12 GB</td><td>~10-12 GB</td></tr>
-<tr><td><b>合计</b></td><td><b>~26-30 GB</b> <span class="tag-bad">❌ OOM</span></td><td><b>~15-17 GB</b> <span class="tag-good">✅ OK</span></td></tr>
+<tr><th>项</th><th>4090 + QLoRA NF4 + path B/C</th><th><b>vGPU-48GB + bf16 LoRA + path A</b></th><th>A6000 48G + bf16 LoRA + path A</th></tr>
+<tr><td>Base 7-8B 权重</td><td><b>~3.8 GB</b></td><td>~14-16 GB</td><td>~14-16 GB</td></tr>
+<tr><td>Action expert MLP (OFT 新增)</td><td>~0.3 GB</td><td>~0.3 GB</td><td>~0.3 GB</td></tr>
+<tr><td>LoRA r=32 q/v</td><td>~0.4 GB</td><td>~0.4 GB</td><td>~0.4 GB</td></tr>
+<tr><td>Optimizer (AdamW fp32, LoRA only)</td><td>~0.8 GB</td><td>~0.8 GB</td><td>~0.8 GB</td></tr>
+<tr><td>Activations (batch / chunk=8)</td><td>~10-12 GB (b=4)</td><td>~14-18 GB (b=8-16)</td><td>~14-18 GB (b=8-16)</td></tr>
+<tr><td><b>峰值合计</b></td><td><b>~15-17 GB</b> ✅</td><td><b>~30-36 GB</b> ✅ (余 12-18 GB)</td><td><b>~30-36 GB</b> ✅</td></tr>
+<tr><td>训练栈</td><td>HF Trainer + bnb 4-bit + 自写 OFT logic（path B/C）</td><td><b>moojink 官方 DDP + bf16 LoRA (path A)</b></td><td>同左</td></tr>
+<tr><td>risk #3（非官方栈）</td><td><span class="tag-bad">命中</span></td><td><span class="tag-good">规避</span></td><td><span class="tag-good">规避</span></td></tr>
+<tr><td>训练时长 (10k step)</td><td>~6h</td><td>~3-5h</td><td>~3-5h</td></tr>
+<tr><td>成本</td><td>本机免费</td><td>~¥6-15（5h × ¥1.5-3/h vGPU-48GB）</td><td>~¥12-15（5h × ¥2.5-3/h）</td></tr>
+<tr><td>额外工程</td><td>必须自写 bidirectional mask + L1 head 适配</td><td>主要工程 = LeRobot v3 parquet → RLDS 转换 + 6D 适配</td><td>同左</td></tr>
+<tr><td>推荐</td><td>🟡 仅当本地全离线、不允许租云</td><td>🥇 <b>首选</b>（用最少 ¥ 走最正官方栈）</td><td>🥈 备选（贵 2×）</td></tr>
 </table>
 
-<p>注：OFT 训练时不再 AR decode（label 也是连续 float），但 chunk=8 让 sequence length 增加（虽然只是 8 个 token vs 6 个），influence 不大。</p>
+<div class="callout good">
+<b>修订结论</b>：能上 AutoDL 就走 <b>vGPU-48GB + bf16 LoRA + path A</b>。理由：
+<ul>
+<li>避免自造一个 QLoRA-OFT 分支（risk #3 直接消除）</li>
+<li>能跑 batch=8-16，10k step 提前 1-3h 完工</li>
+<li>¥6-15 比一周自写 + 调 bidirectional mask 便宜得多</li>
+<li>moojink 的官方 RLDS 训练栈 ≥ 自己魔改的可信度</li>
+</ul>
+但代价 = LeRobot v3 parquet → RLDS 数据转换是大坑（见 §6 P0c 选项 A 注），需单独 1-2h 写转换 + 1h smoke。
+</div>
 
 <h2>5. 代码改动清单（vs 现有 OpenVLA scaffold）</h2>
 
@@ -251,8 +277,21 @@ def __getitem__(self, idx):
 
 <h2>6. 修订后的训练计划 — 增加前置 contract 验证</h2>
 
+<div class="callout bad">
+<b>P-1 新增（2026-05-24 必须先于 P0a）</b> · vanilla 0/9 根因 = torch 2.3 + <code>trust_remote_code</code> 的 Prismatic VLM ckpt 加载 bug。OFT 同样基于 Prismatic 自定义类（moojink 用 <code>configuration_prismatic.py</code> + <code>modeling_prismatic.py</code> 远程 import）。<b>不先证明能完整加载所有 weights，往下做所有 phase 都白做。</b>
+</div>
+
 <table>
 <tr><th>Phase</th><th>步骤</th><th>时间预算</th><th>codex worry 对应</th></tr>
+<tr><td><b>P-1</b></td><td><b>trust_remote_code 加载冒烟</b>：
+<pre>from transformers import AutoModelForVision2Seq
+m = AutoModelForVision2Seq.from_pretrained(
+    "moojink/openvla-7b-oft-finetuned-libero-spatial",
+    trust_remote_code=True, torch_dtype=torch.bfloat16)
+# 必须打印：① 0 个 unexpected key；② 0 个 missing key（除 action_head/proprio_projector 这两个 SO-101 要 random-init 的）
+# 在 transformers={4.40.1, 4.46.x}、torch={2.3.1, 2.7.1+cu126}、peft={0.11.1, 0.14.x} 4 个组合上验
+</pre>
+若任一组合出 missing-keys / shape-mismatch / silent skip，<b>必须先解决再启动 P0a</b>。可借鉴 vanilla 根因解法：固定 transformers 版本或 disable trust_remote_code 改本地 fork Prismatic 类</td><td>~1h</td><td>🔴 vanilla 根因继承</td></tr>
 <tr><td><b>P0a</b></td><td><b>读 moojink/openvla-oft 的 <code>modeling_prismatic.py + action_heads.py + datasets.py + train_utils.py + constants.py</code> 5 个文件，钉死 <code>ACTION_DIM / PROPRIO_DIM / NUM_ACTIONS_CHUNK / action slot layout / bidirectional mask</code> 的真实实现</b></td><td>~2h</td><td>🔴 #1</td></tr>
 <tr><td><b>P0b</b></td><td><b>写 OFT contract spec：钉死 (a) 我们的 6D action / 6D state / chunk=8 配置，(b) action_head/proprio_projector 必须 random init，(c) time alignment = <code>[a_t, ..., a_{t+7}]</code> + tail padding = repeat-last，(d) wire format = (chunk=8, 6) per ZMQ blocking call</b></td><td>~1h</td><td>🔴 #1,#2 + time-align</td></tr>
 <tr><td><b>P0c</b></td><td><b>路径决策</b>：fork moojink + 改 6D vs 在 vanilla scaffold 里自写 OFT-style chunk training（不用 moojink modeling 代码）</td><td>~30min</td><td>🔴 #3</td></tr>
@@ -286,27 +325,62 @@ def __getitem__(self, idx):
 <tr><td>🟢 训练 crash 模式跟 vanilla 一样</td><td>高</td><td>低</td><td>watchdog + auto-resume + ckpt validity 全套复用</td></tr>
 </table>
 
-<h2>8. 跟 vanilla OpenVLA 的横评对比预期</h2>
+<h2>8. 横评预期（2026-05-24 用 20-round 严格制重做）</h2>
+
+<div class="callout">
+<b>校准</b>：原文用 3-round / 9-ep 预测，单 5-round σ=6.4%（per memory <code>feedback-20round-strict-benchmark.md</code>）。当前 leaderboard 已用 20-round 严格制：
+<ul>
+<li>自训 N1.7 🥇 <b>41/60 (68%)</b></li>
+<li>hi-space N1.7 <b>40/60 (67%)</b></li>
+<li>SmolVLA 15k <b>15/60 (25%)</b></li>
+<li>vanilla OpenVLA <b>0/60</b>（实测，5 ckpts × 9 ep × 多 precision）</li>
+</ul>
+要进 leaderboard 中位至少 30/60。下表按 path 重新校准期望。
+</div>
 
 <table>
-<tr><th>指标</th><th>vanilla OpenVLA-7B（ckpt-10000）</th><th>OpenVLA-OFT QLoRA（目标）</th></tr>
-<tr><td>Strict Rounds 完成数</td><td>0/3 ~ 1/3（预测）</td><td><b>1/3 ~ 2/3</b></td></tr>
-<tr><td>橙子完成数</td><td>~2/9（gripper 闭不到位）</td><td><b>4/9 ~ 6/9</b></td></tr>
-<tr><td>step_hz</td><td>5 Hz</td><td><b>30 Hz</b></td></tr>
-<tr><td>Latency / 等效 action</td><td>240 ms</td><td><b>~5-10 ms</b>（chunk 摊薄）</td></tr>
-<tr><td>Peak VRAM</td><td>~18 GB</td><td>~17 GB</td></tr>
+<tr><th>路径</th><th>修了 vanilla 哪些根因</th><th>残留瓶颈</th><th>期望（20-round 严格 / 60 oranges）</th><th>vs leaderboard 位置</th></tr>
+<tr><td><b>QLoRA + path C</b>（伪 OFT，仅 chunk-L1 patch）</td><td>① gripper bin 量化（连续 L1）</td><td>latency 没修（仍 240ms / 仍 step_hz=5）；trust_remote_code 风险</td><td><b>5-12 / 60</b></td><td>末位 < SmolVLA</td></tr>
+<tr><td><b>QLoRA + path B</b>（自写 bidirectional + chunk）</td><td>① + ② parallel decode</td><td>非官方栈 risk；50 demo 数据稀缺；trust_remote_code 风险</td><td><b>10-20 / 60</b></td><td>SmolVLA 上下浮动</td></tr>
+<tr><td>🥇 <b>vGPU-48GB bf16 LoRA + path A</b>（fork moojink）</td><td>① + ②，且走官方栈</td><td>50 demo 稀缺；6D embodiment gap（heads random-init）；trust_remote_code 风险</td><td><b>15-30 / 60</b></td><td>SmolVLA → leaderboard 中位</td></tr>
+<tr><td>任意路径，trust_remote_code bug 未解决</td><td>无（ckpt 加载错位）</td><td>同 vanilla</td><td><b>0 / 60</b></td><td>同 vanilla 死</td></tr>
 </table>
 
-<p>排序按 <code>[[feedback-benchmark-table-sort]]</code>：Rounds DESC → 🍊 DESC → time ASC。OFT 如果做出来应该能挤进 leaderboard 中位。</p>
+<table>
+<tr><th>指标</th><th>vanilla OpenVLA（实测）</th><th>OFT path A 目标</th><th>OFT path A 真实 worst-case</th></tr>
+<tr><td>20-round 严格 oranges</td><td>0/60</td><td><b>30/60</b></td><td>15/60</td></tr>
+<tr><td>step_hz 闭环</td><td>5 Hz（被 latency 限制）</td><td><b>30 Hz</b></td><td>30 Hz（chunk 摊薄理论可达）</td></tr>
+<tr><td>Latency / 等效 action</td><td>240 ms</td><td><b>~5-10 ms</b>（chunk=8 摊薄）</td><td>同左</td></tr>
+<tr><td>Peak VRAM</td><td>~18 GB</td><td>~30-36 GB (bf16 LoRA)</td><td>同左</td></tr>
+<tr><td>对 leaderboard 影响</td><td>末位（与 0 同义）</td><td>挤进中位</td><td>仅追平 SmolVLA，仍远低 N1.7</td></tr>
+</table>
 
-<h2>9. 当前训练状态 (vanilla, for reference)</h2>
+<div class="callout bad">
+<b>关键判断</b>：OFT 即便完美做出 path A，期望也只到 leaderboard <b>中位</b>，无法挑战 N1.7 41/60 🥇。<b>这是结构性 50-demo 数据稀缺 + embodiment gap 决定的</b>，跟 OFT 架构升级无关。<br/>
+所以 OFT 的真实价值 = "证明 7B VLA 这一档在我们 dataset 上能做到 SmolVLA 水平"，<b>不是冲榜</b>。决策时按这个标尺 calibrate 投入产出比。
+</div>
+
+<p>排序按 <code>[[feedback-benchmark-table-sort]]</code>：Rounds DESC → 🍊 DESC → time ASC。</p>
+
+<h2>9. <s>当前训练状态 (vanilla, for reference)</s> — 已 stale (2026-05-24)</h2>
+
+<div class="callout bad">
+<b>2026-05-24 历史回放</b>：本节原文写于 2026-05-18 vanilla ckpt-2050 阶段。后续真实路径：
+<ul>
+<li>vanilla 继续训到 ckpt-10000+，5 ckpts × 9 ep 全 <b>0/45</b>（4-bit/8-bit/bf16 三种 mode 都 0）</li>
+<li>codex 诊断根因 = torch 2.3 + trust_remote_code 的 Prismatic VLM ckpt 加载 bug</li>
+<li><b>原 "ckpt-5000 pivot 决策点" 从未触发</b>——直接放弃 OpenVLA 整条线，pivot 到 X-VLA</li>
+<li>X-VLA 也证伪（见 <code>xvla-bodydesc-negative.md</code>），最终落到 GR00T-N1.7（41/60 🥇）</li>
+<li>OFT plan 自始至终 0 行代码落地</li>
+</ul>
+</div>
 
 <table>
-<tr><th>项</th><th>值</th></tr>
-<tr><td>当前 step</td><td>~2050 / 10000（resume from ckpt-2000）</td></tr>
-<tr><td>Loss</td><td>2.89（still 慢速下降）</td></tr>
-<tr><td>下一里程碑</td><td>ckpt-5000 GUI 验证收敛</td></tr>
-<tr><td>Pivot 决策点</td><td>ckpt-5000 GUI 结果 — 若仍"差一点"夹不下去，立刻杀掉 vanilla 训练，全力 OFT</td></tr>
+<tr><th>项</th><th><s>原值</s></th><th>2026-05-24 真值</th></tr>
+<tr><td>当前 step</td><td><s>~2050 / 10000</s></td><td>已 abort（vanilla 跑完 10k+ 后整条放弃）</td></tr>
+<tr><td>Loss</td><td><s>2.89</s></td><td>历史无意义</td></tr>
+<tr><td>下一里程碑</td><td><s>ckpt-5000 GUI 验证</s></td><td>OFT P-1 trust_remote_code 加载冒烟（若决定启动）</td></tr>
+<tr><td>Pivot 决策点</td><td><s>ckpt-5000 GUI 结果</s></td><td>当前主线 = DreamZero v2-A + GR00T-N1.7 ckpt sweep；OFT = backup</td></tr>
 </table>
 
 <h2>10. 关联记忆 / Linked memory</h2>

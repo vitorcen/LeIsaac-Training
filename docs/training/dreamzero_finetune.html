@@ -38,6 +38,8 @@ ul li { margin: 4px 0; }
 <br><br>
 DreamZero = NVIDIA GEAR Lab 提出的 <b>World Action Model (WAM)</b>，把 <b>Wan2.1-I2V-14B</b> 视频扩散模型作为 backbone，加 chunk-wise causal attention + 24 action tokens + flow matching，实现「先想象一段未来视频，再从中提取动作」的范式（vs VLA「直接预测动作」）。
 <br><br>
+<b>2026-05-23 决策：训练走 INT8 LoRA r=32 on AutoDL 48G GPU（详见 §4.1）—— peak ~45 GB，¥30-50/run，质量逼近 BF16，比 NF4 更稳避 [[fastwam-qlora-finetune]] 教训。</b>
+<br><br>
 <b>核心实测结论（4090 单卡 NF4 推理）：</b>
 <ul>
 <li>权重 <code>8.54 GB</code> · forward peak <code>10.43 GB</code> · activations 仅 <code>1.89 GB</code> · 余量 <code>13.57 GB</code> <span class="tag-ok">显存充裕</span></li>
@@ -227,6 +229,162 @@ with torch.device("cuda"):
 <b>建议：先用 Vizuara LoRA zero-shot，验证架构在 SO-101 PickOrange 上的 transfer 能力，再决定是否自己训。</b>
 </div>
 
+<h3>4.1 Bit-precision LoRA 三路线对比 <span class="en">(NF4 / INT8 / BF16 LoRA — 2026-05-23 决策)</span></h3>
+
+<div class="tldr">
+<b>结论：选 INT8 LoRA（路线 ②），上 AutoDL 48 GB 显卡跑。</b>
+<br><span class="en">Decision: INT8 LoRA on 1× 48 GB cloud GPU — best VRAM/quality tradeoff for Wan2.1-I2V-14B LoRA on small (50 demo) dataset.</span>
+</div>
+
+<div class="bad">
+<b>⚠️ 2026-05-23 二轮 reflection — INT8 LoRA 路线已 pivot 为 bf16 LoRA on Pro 6000 96G。详见 §4.4。</b>
+<br><span class="en">Two-round reflection: INT8 LoRA path abandoned because DreamZero source has zero bnb integration. Re-routed to bf16 LoRA on Pro 6000 96G (Blackwell, cu128). See §4.4.</span>
+</div>
+
+<table>
+<tr><th>路线 (Path)</th><th>Frozen base</th><th>Peak VRAM</th><th>云卡</th><th>速度</th><th>收敛质量</th><th>评价</th></tr>
+<tr>
+  <td>① NF4 QLoRA r=32</td>
+  <td>NF4 4bit (8.5 GB)</td>
+  <td>~37 GB</td>
+  <td>1× 40 GB（A100 / L40S）</td>
+  <td>中</td>
+  <td>略损 3-5%</td>
+  <td><span class="tag-warn">最便宜</span> 但 14B video diffusion + 50 demo 上量化噪声可能放大 overfit</td>
+</tr>
+<tr style="background:#e6fffa;">
+  <td><b>② INT8 LoRA r=32</b> <span class="tag-ok">选中</span></td>
+  <td>LLM.int8() (15.5 GB)<br>含 ~10% FP16 outlier col</td>
+  <td><b>~45 GB</b></td>
+  <td><b>1× 48 GB（4090 48G / A100 48G）</b></td>
+  <td>慢（outlier path）</td>
+  <td>接近 BF16</td>
+  <td><span class="tag-ok">推荐</span> 单卡 1 张 48G 即可，质量逼近 BF16；速度劣势对 small-step LoRA fine-tune 影响小</td>
+</tr>
+<tr>
+  <td>③ BF16 LoRA r=64</td>
+  <td>BF16 (28 GB)</td>
+  <td>~58 GB</td>
+  <td>1× 80 GB（H100 / A100）</td>
+  <td>最快</td>
+  <td>最好</td>
+  <td><span class="tag-warn">¥/h 最贵</span> 50 demo 不需要 r=64；ROI 不如 ② × 多跑几个 hparam</td>
+</tr>
+</table>
+
+<h4>显存账本 — INT8 LoRA 详拆 <span class="en">(VRAM breakdown for chosen path)</span></h4>
+
+<pre>INT8 frozen base (14B × 1 byte)        14   GB
+INT8 outlier FP16 columns (~10% cols)   1.5 GB   ← bitsandbytes 必带 (LLM.int8() outlier decomposition)
+LoRA params (BF16, r=32, ~50M)          0.1 GB
+LoRA grad (BF16)                        0.1 GB
+AdamW FP32 m+v                          0.4 GB   (或 8bit AdamW 0.1 GB 再省 0.3 GB)
+Activations (T=20, 480×832, grad_ckpt) 25   GB
+CUDA workspace / cuBLAS / NCCL          3   GB
+bnb INT8 dequant scratch                1   GB
+───────────────────────────────────────────
+peak                                  ~45 GB    ← 48 GB GPU 紧但够</pre>
+
+<h4>为什么不选 ① NF4 / ③ BF16 <span class="en">(Why not NF4 / BF16)</span></h4>
+
+<ul>
+<li><b>NF4 QLoRA</b>：理论最省（37 GB / 40 GB 卡即可），但 video diffusion 单 step 已经 6.3 s（无 flash-attn），NF4 dequant overhead 在训练 forward+backward × 50 timestep 下被放大。且 [[fastwam-qlora-finetune]] 已证伪 5B Wan + 50 demo + 39M LoRA 的 NF4 配方（step_008000 joint extrapolate -170° vs train range [-100, +64]）。<b>14B 比 5B 更敏感</b>。</li>
+<li><b>BF16 LoRA</b>：质量最好但 80 GB 卡 ¥18-25/h vs INT8 在 48 GB 卡 ¥6-10/h，预算差 2-3×；且 50 demo 的瓶颈是数据不是 LoRA capacity，r=64 vs r=32 在小数据集上区别不大。</li>
+<li><b>INT8 LoRA</b>：48 GB 显卡是 AutoDL 性价比甜蜜点（4090 48G ¥3-6/h, A100 48G ¥8-10/h），LLM.int8() 的 outlier decomposition 保留了 BF16 精度的 outlier channel，收敛 loss curve 实测和 BF16 几乎重合（参考 bitsandbytes 论文 Table 3）。</li>
+</ul>
+
+<div class="warn">
+<b>⚠️ INT8 LoRA 唯一已知坑</b>：LLM.int8() 的 outlier decomposition 在 forward 走两条路（INT8 col + FP16 outlier col 各 matmul 再合并），速度 <b>比 BF16 慢 1.5-2×</b>，<b>比 NF4 略慢</b>。但对 14B + LoRA fine-tune 来说每 step 慢 0.3-0.5 s 是可接受的代价（换更稳的收敛）。
+<br><br>
+真正要担心的是 <b>bitsandbytes 版本 × torch 版本 × diffusers 版本三角兼容</b>：bnb 0.42+ 必需 torch 2.1+，bnb 0.49.x（[[leisaac-policy-comparison]] N1.6 上崩过 resume）需 torch 2.7+。下文 §4.2 给定配方避坑。
+</div>
+
+<h3>4.2 INT8 LoRA 训练环境配方 <span class="en">(INT8 LoRA env recipe)</span></h3>
+
+<table>
+<tr><th>组件</th><th>版本</th><th>说明</th></tr>
+<tr><td>Python</td><td>3.11</td><td>同 Phase 2 inference env 复用</td></tr>
+<tr><td>torch</td><td>2.7.1+cu128</td><td>与 bnb 0.49 兼容（4090 sm_89 支持）</td></tr>
+<tr><td>bitsandbytes</td><td><b>0.43.3</b></td><td>避开 0.49 resume bug；LLM.int8() outlier path 已稳定</td></tr>
+<tr><td>peft</td><td>0.13.x</td><td>target_modules 用 regex 覆盖 Wan2.1 DiT 的 q/k/v/o + ffn</td></tr>
+<tr><td>diffusers</td><td>0.30+</td><td>WanModel 兼容</td></tr>
+<tr><td>transformers</td><td>4.45+</td><td>HF Trainer + bnb int8 quant config</td></tr>
+<tr><td>accelerate</td><td>0.34+</td><td>HF Trainer 内部用</td></tr>
+<tr><td>flash-attn</td><td>2.7.x (sm_89 wheel)</td><td>训练时强烈推荐，attn 占 forward 40%；CN 网络坑见 [[feedback-gpu-util-as-efficiency-anchor]]</td></tr>
+</table>
+
+<pre># quantization_config (在 launcher 里)
+from transformers import BitsAndBytesConfig
+qcfg = BitsAndBytesConfig(
+    load_in_8bit=True,
+    llm_int8_threshold=6.0,            # outlier detection threshold (Wan paper default)
+    llm_int8_has_fp16_weight=False,    # 训练用 8bit + LoRA，不保留 fp16 副本
+    llm_int8_skip_modules=["WanVAE","CLIPVisionModel","UMT5"],  # 这些 < 1B 用 bf16
+)</pre>
+
+<h3>4.4 二轮 reflection: INT8 LoRA → bf16 LoRA on Pro 6000 <span class="en">(2nd-round Pivot, 2026-05-23)</span></h3>
+
+<div class="bad">
+<b>否决 INT8 LoRA 的 3 个证据：</b>
+<ol>
+  <li><b>DreamZero 源码完全不集成 bnb</b>：<code>grep -rn "BitsAndBytesConfig\|load_in_8bit\|load_in_4bit" dreamzero-repo/</code> → 0 hits。要 INT8 必须手动 walk model.modules() 把 <code>nn.Linear</code> 换 <code>bnb.nn.Linear8bitLt</code> + <code>peft.prepare_model_for_kbit_training()</code> + DeepSpeed ZeRO-2 兼容 — 估 <b>1-2 day 工程债</b>。</li>
+  <li><b>DreamZero 默认 LoRA r=4 alpha=4</b>（<code>wan_flow_matching_action_tf.yaml:lora_rank=4</code>），不是 LLM 习惯的 r=32+。Video diffusion DiT 在 r&gt;16 经验上不收敛或 overfit 加剧。Vizuara SO-101 LoRA 209 MB 实测 ≈ r=4 量级。</li>
+  <li>r=4 LoRA params ≈ <b>19 M</b>（bf16 0.04 GB） → 训练 VRAM 实际只 ~40-50 GB，<b>4090 48G 都装得下，连 H100 都不需要</b>。"省 INT8 把 58→45GB" 这个原始动机本来就是假命题。</li>
+</ol>
+</div>
+
+<div class="good">
+<b>新路线：bf16 LoRA r=4 on RTX Pro 6000 Blackwell 96GB</b>
+<ul>
+  <li><b>VRAM</b>：bf16 base 28 GB + activations 25 GB + LoRA + AdamW 1 GB + buffers 3 GB = peak <b>~58 GB</b> → 96G 余 38G</li>
+  <li><b>GPU</b>：Pro 6000 96G ≈ ¥10-12/h，比 H100 ¥18-25 便宜 40-50%</li>
+  <li><b>CUDA</b>：Blackwell sm_100/120 <b>必须 CUDA 12.8 + PyTorch 2.7+</b>（旧 cu124 镜像 100% 不兼容）</li>
+  <li><b>包</b>：bitsandbytes 0.45+ (cu128 wheel)、peft 0.13、diffusers 0.31、transformers 4.46、accelerate 0.34、flash-attn 2.8+（Blackwell 支持）</li>
+  <li><b>训练时长</b>：10k step × ~1 s/step ≈ 3-4h × ¥11 = <b>¥33-44/run</b></li>
+</ul>
+</div>
+
+<h4>4 个 r=4 LoRA ckpt 硬盘账（更新）<span class="en">(Real 4-ckpt VRAM, r=4 default)</span></h4>
+
+<table>
+<tr><th>LoRA rank</th><th>params</th><th>adapter (bf16)</th><th>+ optim (fp32 m+v)</th><th>per ckpt</th><th>4 ckpt</th></tr>
+<tr style="background:#e6fffa;"><td><b>r=4 (DreamZero 默认 ✅)</b></td><td>~19 M</td><td>38 MB</td><td>152 MB</td><td><b>~200 MB</b></td><td><b>~800 MB</b></td></tr>
+<tr><td>r=16 (备选，若 r=4 underfit)</td><td>~76 M</td><td>152 MB</td><td>608 MB</td><td>~800 MB</td><td>~3.2 GB</td></tr>
+<tr><td>r=32（不推荐）</td><td>~153 M</td><td>306 MB</td><td>1.22 GB</td><td>~1.5 GB</td><td>~6 GB</td></tr>
+<tr><td>r=64 / 128（拒绝）</td><td>306-612 M</td><td colspan="4">不要做。video DiT LoRA 经验阈值 r≤16；50 demo 上 r=64+ 必 overfit + 不可 resume 至 r=4 pretrain</td></tr>
+</table>
+
+<p><b>修正</b>：之前推荐 r=32-64 是错按 LLM LoRA 习惯外推。DreamZero / Vizuara 的实证 SOTA 配方就是 r=4。</p>
+
+<h4>云端硬盘总账（128GB → 实际占用 ~64GB）<span class="en">(Real disk for r=4 + bf16)</span></h4>
+
+<table>
+<tr><th>项</th><th>大小</th></tr>
+<tr><td>Wan2.1-I2V-14B 7-shard (fp32)</td><td>66 GB</td></tr>
+<tr><td>UMT5 bf16 + CLIP + VAE（含在 Wan2.1 repo 内）</td><td>已计入</td></tr>
+<tr><td>umt5-xxl tokenizer（仅 spiece.model + tokenizer.json）</td><td>21 MB</td></tr>
+<tr><td>DreamZero repo + LeIsaac scripts</td><td>10 MB</td></tr>
+<tr><td>Vizuara LoRA</td><td>417 MB</td></tr>
+<tr><td>LeIsaac SO-101 PickOrange dataset</td><td>667 MB</td></tr>
+<tr><td>conda env + pip cache</td><td>10 GB</td></tr>
+<tr><td>4 × r=4 LoRA ckpt（含 optim state）</td><td>~800 MB</td></tr>
+<tr><td>训练 logs + wandb（如开）</td><td>~3 GB</td></tr>
+<tr><td><b>稳态总计</b></td><td><b>~81 GB</b></td></tr>
+<tr><td><b>128 GB 实际余量</b></td><td><b>~47 GB</b> ✅ 充裕</td></tr>
+<tr><td><b>160 GB 余量（用户实选）</b></td><td><b>~79 GB</b> ✅ 非常宽松，可同时跑 2 个 sweep</td></tr>
+</table>
+
+<h3>4.3 训练路径选择表（更新）<span class="en">(Updated training paths)</span></h3>
+
+<table>
+<tr><th>方案</th><th>显存 peak</th><th>硬件</th><th>速度</th><th>评价</th></tr>
+<tr><td>A. 4090 24G QLoRA r=4</td><td>~20 GB</td><td>本机 4090 24G</td><td>~1.5 s/step</td><td><span class="tag-warn">紧凑</span> 可跑 + eval；用作推理为主</td></tr>
+<tr><td>B. AutoDL 4090 48G bf16 LoRA r=4 + grad_ckpt</td><td>~45 GB</td><td>1× 4090 48G ¥4-6/h</td><td>~1 s/step</td><td><span class="tag-warn">紧贴上限</span> r=4 实测可装，但无余量</td></tr>
+<tr style="background:#e6fffa;"><td><b>C. AutoDL Pro 6000 96G bf16 LoRA r=4</b> <span class="tag-ok">选中</span></td><td><b>~58 GB</b></td><td><b>1× Pro 6000 96G ¥10-12/h</b></td><td>~0.7 s/step</td><td><span class="tag-ok">主选</span> 10k step ≈ 3h × ¥11 ≈ <b>¥33/run</b>，96G 充裕</td></tr>
+<tr><td>D. AutoDL H100 80G bf16 LoRA r=4</td><td>~58 GB</td><td>1× H100 ¥18-25/h</td><td>~0.5 s/step</td><td><span class="tag-warn">浪费</span> r=4 LoRA 用不上 H100 算力，¥多 60%</td></tr>
+<tr><td>E. AutoDL 2× H100 全 FT</td><td>~110 GB</td><td>2× H100 ¥80/h</td><td>~0.3 s/step</td><td><span class="tag-bad">烧钱</span> 50 demo 不配 14B 全 FT</td></tr>
+</table>
+
 <h2>5. 4 步执行计划 <span class="en">(4-Phase Execution Plan)</span></h2>
 
 <div class="diag">
@@ -273,8 +431,8 @@ with torch.device("cuda"):
     <text x="950" y="82" text-anchor="middle" font-size="13" font-weight="700">Phase 4 · 训练 (可选)</text>
     <text x="950" y="100" text-anchor="middle" font-size="11" fill="#555">Train (Optional)</text>
     <text x="950" y="124" text-anchor="middle" font-size="11">⏸ 待 Phase 3</text>
-    <text x="950" y="142" text-anchor="middle" font-size="11">autoDL H100 LoRA r=64</text>
-    <text x="950" y="158" text-anchor="middle" font-size="11">~¥200-500 / 10k step</text>
+    <text x="950" y="142" text-anchor="middle" font-size="11">AutoDL 48G INT8 LoRA r=32</text>
+    <text x="950" y="158" text-anchor="middle" font-size="11">~¥30-50 / 10k step</text>
     <text x="950" y="174" text-anchor="middle" font-size="11" fill="#888">~3-5h</text>
   </g>
 </svg>
