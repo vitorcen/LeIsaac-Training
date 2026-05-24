@@ -66,26 +66,31 @@ class Gr00tServicePolicyClient(ZMQServicePolicy):
             }
         """
 
-        # GR00T server launched with --use-sim-policy-wrapper expects:
-        #   - data envelope: {"observation": flat_obs}
-        #   - flat obs with shape (B, T, H, W, C) for video and (B, T, D) for state
-        #     (T = obs horizon delta_indices length, typically 1 for SO-101)
-        # Need to add a T=1 axis to each modality before sending.
-        wrapped_obs = {}
-        for k, v in obs_dict.items():
-            if isinstance(v, np.ndarray):
-                if k.startswith("video."):
-                    # (B, H, W, C) -> (B, 1, H, W, C)
-                    wrapped_obs[k] = v[:, None].astype(np.uint8) if v.ndim == 4 else v.astype(np.uint8)
-                elif k.startswith("state."):
-                    # (B, D) -> (B, 1, D), float32 (wrapper requires float32 not float64)
-                    wrapped_obs[k] = v[:, None].astype(np.float32) if v.ndim == 2 else v.astype(np.float32)
+        # Wire variants:
+        #   - N1.5 raw (inference_service.py): {data: flat_obs} with (B, H, W, C) uint8 + (B, D) float
+        #   - N1.6/N1.7 with --use-sim-policy-wrapper (Gr00tSimPolicyWrapper):
+        #       {data: {"observation": flat_obs}} with (B, T, H, W, C) + (B, T, D) float32
+        # Default: N1.5 raw. Set GR00T_WRAP_OBSERVATION=1 (auto-exported by run_one.sh
+        # for gr00tn1.6/gr00tn1.7 server kinds) to switch to wrapper envelope.
+        import os as _os
+        wrap_obs = _os.environ.get("GR00T_WRAP_OBSERVATION", "0") == "1"
+        if wrap_obs:
+            # Sim-policy-wrapper path: add T=1 axis + float32 + observation envelope
+            wrapped_obs = {}
+            for k, v in obs_dict.items():
+                if isinstance(v, np.ndarray):
+                    if k.startswith("video.") and v.ndim == 4:
+                        wrapped_obs[k] = v[:, None].astype(np.uint8)   # (B,1,H,W,3)
+                    elif k.startswith("state.") and v.ndim == 2:
+                        wrapped_obs[k] = v[:, None].astype(np.float32) # (B,1,D)
+                    else:
+                        wrapped_obs[k] = v
                 else:
                     wrapped_obs[k] = v
-            else:
-                wrapped_obs[k] = v
-
-        action_chunk = self.call_endpoint("get_action", {"observation": wrapped_obs})
+            action_chunk = self.call_endpoint("get_action", {"observation": wrapped_obs})
+        else:
+            # N1.5 raw path: send flat_obs as-is, no T axis insertion
+            action_chunk = self.call_endpoint("get_action", obs_dict)
         if isinstance(action_chunk, dict) and "error" in action_chunk and "action.single_arm" not in action_chunk:
             raise RuntimeError(f"GR00T server error: {action_chunk['error']}")
 

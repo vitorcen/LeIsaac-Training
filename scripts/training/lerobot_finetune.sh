@@ -172,11 +172,15 @@ if [[ "${AUTO_EVAL}" == "1" ]]; then
     elif [[ -n "${BASE_MODEL:-}" ]]; then
         case "${BASE_MODEL,,}" in
             *smolvla*)      EVAL_POLICY_TYPE="lerobot-smolvla" ;;
+            *pi05*|*pi0*)   EVAL_POLICY_TYPE="lerobot-pi05" ;;
             *)              EVAL_POLICY_TYPE="lerobot-act" ;;  # best-effort
         esac
     else
         EVAL_POLICY_TYPE="lerobot-act"
     fi
+    # Race condition: OUTPUT_DIR may not exist yet (lerobot-train creates it lazily).
+    # If we redirect to $OUTPUT_DIR/auto_eval.log before mkdir, nohup silently dies.
+    mkdir -p "${OUTPUT_DIR}"
     OUTPUT_DIR="${OUTPUT_DIR}" POLICY_TYPE="${EVAL_POLICY_TYPE}" \
         EVAL_HORIZON="${EVAL_HORIZON}" \
         nohup bash "${REPO_ROOT}/scripts/training/eval_watcher.sh" \

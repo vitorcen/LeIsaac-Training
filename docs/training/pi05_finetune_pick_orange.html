@@ -48,6 +48,13 @@ flow-matching action generation. ~3.36B total params, our smallest "true" VLA in
 关键问题：<b>action_horizon=50 是 trap，正确值 35</b>（chunk-execution mismatch）。我们的小数据（50 demo）训出来过拟合明显。
 </div>
 
+<div class="callout bad">
+<b>🔴 2026-05-24 后续：PyTorch expert-only FT 也失败（leaderboard 末位）</b><br/>
+从 MLX 5M LoRA 改成 <b>PyTorch 693M expert-only FT + freeze VLM</b>（GR00T 范式），跑了 10k step + 13 ckpt sweep + ckpt-2000 strict 20-round = <b>1/60 (1.7%)</b>，仍 leaderboard 末位低 SmolVLA 15×。
+根因锁定为 <b>SigLIP@224 vision bottleneck</b>（PaliGemma 硬编码 224，橙子缩后 ≤1 SigLIP patch）。
+详见独立报告 <a href="pi05_pytorch_expert_ft_negative.html"><code>pi05_pytorch_expert_ft_negative.html</code></a>。
+</div>
+
 <h2>1. 架构核心</h2>
 
 <table>
@@ -216,6 +223,60 @@ flow-matching action generation. ~3.36B total params, our smallest "true" VLA in
 <tr><td>cumulative steps</td><td>5000</td><td>第一轮自训</td></tr>
 <tr><td>训练侧</td><td>MLX (Apple Silicon)</td><td>4090 上跑 LoRA OOM，搬 M-series 上训</td></tr>
 <tr><td>推理侧</td><td>MLX server @ 192.168.3.238</td><td>SSH 远程 server，client 在 4090</td></tr>
+</table>
+
+<h2>2.5 16-bit 重训资源估算 · bf16 retraining resource budget</h2>
+<p class="en">Cloud GPU memory + disk budget for retraining π0.5 in bf16 (the "16-bit" path, vs MLX 4-bit / int8 quant deployments).</p>
+
+<div class="callout">
+<b>背景：</b> 第一轮 v1-v3 走的是 MLX (Apple Silicon) 自训 + 远端部署，4-bit / int8 量化 + LoRA on M-series；
+"16-bit 重训" 是切回 <b>CUDA + PyTorch bf16</b>（与 SmolVLA / X-VLA 同栈），便于纯 PyTorch pipeline + auto-eval watcher (<code>scripts/training/lerobot_finetune.sh AUTO_EVAL=1</code>) 集成。
+</div>
+
+<h3>2.5.1 两种 PyTorch 训练模式 · bf16 LoRA vs bf16 full FT</h3>
+
+<table>
+<tr><th>项</th><th><b>bf16 LoRA (推荐)</b></th><th>bf16 full FT</th></tr>
+<tr><td>Base model (3.36B params, bf16, 2 byte/param)</td><td>~6.7 GB</td><td>~6.7 GB</td></tr>
+<tr><td>LoRA adapter (~5M params q/v_proj on VLM + expert)</td><td>~0.01 GB</td><td>—</td></tr>
+<tr><td>Gradients</td><td>~0.01 GB (LoRA only)</td><td>~6.7 GB (all params bf16)</td></tr>
+<tr><td>Optimizer (AdamW fp32 master + m + v)</td><td>~0.06 GB</td><td>~40 GB (3.36B × 12 byte)</td></tr>
+<tr><td>Activations (batch=1, chunk=50 action sequence, 2 cam × 224 img, grad_ckpt)</td><td>~6-8 GB</td><td>~6-8 GB</td></tr>
+<tr><td>Flow-matching 去噪缓冲 (10 step VLM-KV cache 训练侧也常驻)</td><td>~1-2 GB</td><td>~1-2 GB</td></tr>
+<tr><td>CUDA workspace / 碎片化</td><td>~1-2 GB</td><td>~2-3 GB</td></tr>
+<tr><td><b>VRAM 峰值合计</b></td><td><b>~16-20 GB</b> ✅ 4090 OK</td><td><b>~58-62 GB</b> ⚠️ 需 80G 卡</td></tr>
+<tr><td>推荐 GPU</td><td><b>RTX 4090 24G / A6000 48G</b></td><td><b>A800 / A100 80G / H100 80G</b></td></tr>
+<tr><td>AutoDL 单价 (2026-05)</td><td>~¥1.5-2/h (4090) / ~¥2.5-3/h (A6000)</td><td>~¥6-8/h (A800) / ~¥10/h (H100)</td></tr>
+</table>
+
+<div class="callout good">
+<b>为何 π0.5 16-bit 比 OpenVLA 16-bit 友善一档：</b>
+<ul>
+<li>π0.5 参数量 3.36B vs OpenVLA 7.6B → base 占用 6.7G vs 15.2G，差 8.5 GB</li>
+<li>π0.5 chunk=50 action 序列在 expert 这一侧 activations 会比 OpenVLA AR decode 大 ~2 GB，但 base 节省的 8.5 GB 抵消有余</li>
+<li>4090 24G 可装 bf16 LoRA（第一轮 MLX 是因 chunk=50 + cross-attn KV cache 没 offload 才 OOM；切 PyTorch grad-ckpt + batch=1 后能装）</li>
+<li>full FT 仍需 80G 卡 —— 3.36B 的 fp32 AdamW state 单独就 40 GB</li>
+</ul>
+</div>
+
+<h3>2.5.2 数据盘空间预算 · Disk budget (bf16 LoRA)</h3>
+
+<table>
+<tr><th>用途</th><th>大小</th><th>说明</th></tr>
+<tr><td>HF base model 下载 (<code>lerobot/pi05_base</code> 或 <code>physical-intelligence/pi05</code>)</td><td>~7-8 GB</td><td>PaliGemma 2B + Gemma-300M expert + SigLIP-So400m，bf16 safetensors</td></tr>
+<tr><td>Dataset (LeRobot v3.0)</td><td>~1-2 GB</td><td>60 ep × 2 cam × 30 fps；与 SmolVLA / X-VLA / ACT 共享同份</td></tr>
+<tr><td>每个 ckpt (LoRA adapter + AdamW state + trainer state)</td><td>~1 GB</td><td>仅 LoRA 5M 时裸 adapter ~20 MB；含 optimizer + RNG + scheduler 膨到 ~1 GB</td></tr>
+<tr><td>保留 3-4 个 ckpt（rolling，每 5k step 一存）</td><td><b>~3-4 GB</b></td><td><code>save_total_limit=3</code>，10k step 训练对应 2-3 个滚动 ckpt</td></tr>
+<tr><td>tensorboard / wandb local cache / 训练日志</td><td>~2-3 GB</td><td>flow-matching loss + per-step grad norm，相对 lerobot 标配</td></tr>
+<tr><td>buffer（OS swap / pip cache / 临时解压 / video frame cache）</td><td><b>+20 GB</b></td><td>详见 [[feedback-training-save-policy]] —— 不预留会触发 ENOSPC SIGSEGV</td></tr>
+<tr><td><b>合计 · Total</b></td><td><b>~33-38 GB</b></td><td>AutoDL 数据盘 50G 即可（OpenVLA 需 100G，π0.5 因 base 小 50% 省一档）</td></tr>
+</table>
+
+<table>
+<tr><th>项</th><th>值</th></tr>
+<tr><td>Dataset</td><td>60 ep × ~600 frame ≈ 36k samples</td></tr>
+<tr><td>预计训练时长 (bf16 LoRA, batch=1, grad_accum=8, lr=2.5e-5, chunk=50)</td><td>10k step → <b>5-8 h on RTX 4090 24G</b>（grad-ckpt 开销 + chunk=50 flow loop）</td></tr>
+<tr><td>预计训练时长 (bf16 LoRA on A6000 48G, batch=2)</td><td>10k step → <b>3-5 h</b>（batch=2 摊薄 activations 仅多 1-2 GB）</td></tr>
 </table>
 
 <h2>3. Eval 参数 + chunk-execution mismatch</h2>

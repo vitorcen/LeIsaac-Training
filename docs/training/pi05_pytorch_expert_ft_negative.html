@@ -1,0 +1,300 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>π0.5 PyTorch Expert-Only FT — Negative Result (2026-05-24)</title>
+<style>
+  :root { color-scheme: light; }
+  body {
+    font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: #fff; color: #1a1a1a;
+    max-width: 1000px; margin: 28px auto; padding: 0 22px; line-height: 1.6;
+  }
+  h1 { border-bottom: 2px solid #1a1a1a; padding-bottom: 6px; }
+  h2 { margin-top: 36px; border-left: 4px solid #1f6feb; padding-left: 10px; }
+  h3 { margin-top: 24px; color: #1f6feb; }
+  .en { color: #555; font-style: italic; font-size: 0.92em; }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0; font-size: 0.94em; background:#fff; color:#1a1a1a; }
+  th, td { border: 1px solid #d0d7de; padding: 6px 10px; text-align: left; vertical-align: top; }
+  th { background: #f0f3f6; }
+  code, pre { font-family: "JetBrains Mono", Menlo, Consolas, monospace; }
+  pre { background: #f3f3f3; color:#1a1a1a; padding: 12px; border-radius: 4px; overflow-x: auto; font-size: 0.88em; }
+  code { background: #f3f3f3; color:#1a1a1a; padding: 1px 5px; border-radius: 3px; }
+  .tag-good { color: #1a7f37; font-weight: 600; }
+  .tag-warn { color: #d29922; font-weight: 600; }
+  .tag-bad  { color: #cf222e; font-weight: 600; }
+  .callout { border-left: 4px solid #d29922; background: #fff8e6; color:#1a1a1a; padding: 10px 14px; margin: 14px 0; }
+  .callout.bad { border-color: #cf222e; background: #ffeef0; }
+  .callout.good { border-color: #1a7f37; background: #e6f4ea; }
+  svg { display: block; margin: 14px auto; background:#fff; }
+  ul { padding-left: 22px; }
+  li { margin: 4px 0; }
+  .meta { color: #555; font-size: 0.9em; }
+  .verdict { font-size: 1.05em; font-weight: 600; padding: 14px 18px; margin: 18px 0; border-radius: 6px;
+             background:#ffeef0; color:#cf222e; border:2px solid #cf222e; }
+</style>
+</head>
+<body>
+
+<h1>π0.5 PyTorch Expert-Only FT — Negative Result</h1>
+<p class="meta">SO-101 PickOrange · 2026-05-24 · Phase 1.5 + 2 + 20-round strict</p>
+<p class="en">Documentation of a negative-but-instructive experiment: pivoted from MLX 5M LoRA (0/15) to PyTorch
+693M expert-only FT with frozen VLM (GR00T-style recipe). Trained to 10k step. Final 20-round strict result:
+1/60 oranges. The hypothesis "5M→693M trainable will recover SmolVLA-tier results" is falsified.</p>
+
+<div class="verdict">
+🔴 <b>VERDICT</b>: π0.5 PyTorch expert-only FT does <b>NOT</b> work on LeIsaac SO-101 PickOrange.
+20-round strict E(🍊)/ep = <b>1.7%</b> (1/60). Leaderboard rank: <b>6/6 (last, below SmolVLA by 15×)</b>.
+</div>
+
+<h2>0. TL;DR · Why this matters</h2>
+
+<table>
+<tr><th>主张 / Claim</th><th>结果 / Result</th></tr>
+<tr>
+  <td>切回主流 PyTorch + 693M expert FT (vs 5M MLX LoRA) → 至少 SmolVLA 同档</td>
+  <td><span class="tag-bad">❌ FALSIFIED — 实际 15× 不如 SmolVLA</span></td>
+</tr>
+<tr>
+  <td>3-round eval (ckpt-2000) 拿到 2/9 是 "training works" 的信号</td>
+  <td><span class="tag-bad">❌ 是 Bernoulli noise（同 ckpt 20-round 跑出 1/60）</span></td>
+</tr>
+<tr>
+  <td>训练到 10k step（vs 2500）会突破 0/9 平台</td>
+  <td><span class="tag-bad">❌ 8/8 后期 ckpt 仍 0/9（Phase 2 EP_S=120 sweep）</span></td>
+</tr>
+<tr>
+  <td>180s wall_cap (vs 90s) 给慢 policy 留时间 → 救回若干 placed</td>
+  <td><span class="tag-warn">🟡 部分有效：ckpt-2000 在 180s 出 1 颗，但跨 20 round 仍 0.05/ep</span></td>
+</tr>
+</table>
+
+<h2>1. 实验配置 · Setup</h2>
+
+<table>
+<tr><th>项</th><th>值</th></tr>
+<tr><td>Base model</td><td><code>lerobot/pi05_base</code> (PaliGemma-2B + Gemma-300M expert + SigLIP-So400m)</td></tr>
+<tr><td>Trainable</td><td><b>693.4 M</b> (gemma_expert 18 layers 425M + lm_head 263M + norm 3M)</td></tr>
+<tr><td>Frozen</td><td>3.45 B (PaliGemma full：vision_tower 412M + language_model 2508M + lm_head 527M + projector 2M)</td></tr>
+<tr><td>Total</td><td>4.14 B</td></tr>
+<tr><td>关键 flag</td><td><code>--policy.train_expert_only=true --policy.freeze_vision_encoder=true --policy.gradient_checkpointing=true</code></td></tr>
+<tr><td>Dataset</td><td>LightwheelAI/leisaac-pick-orange — 60 ep × 600 frame ≈ 36k samples (LeRobot v3.0)</td></tr>
+<tr><td>Optimizer</td><td>AdamW, peak LR=2.5e-5, cosine + warmup 1k</td></tr>
+<tr><td>Batch / Schedule</td><td>batch=1, no grad-accum (lerobot-train 不支持), chunk_size=50, n_action_steps=50</td></tr>
+<tr><td>Dtype</td><td>bf16 (base + grads + trainable expert)</td></tr>
+<tr><td>Hardware</td><td>RTX 4090 24G, ~15 GB peak during train</td></tr>
+<tr><td>Train speed</td><td><b>4.4 step/s</b> (≈ 0.22 s/step), 10k step ≈ 38 min total</td></tr>
+<tr><td>Camera mapping</td><td>rename <code>front→base_0_rgb</code>, <code>wrist→right_wrist_0_rgb</code>; pi05 内置 <code>missing_img → -1 padding + mask=0</code> (modeling_pi05.py:1195)</td></tr>
+<tr><td>Inference horizon</td><td>35 (chunk 50 但只消费前 35 — 沿用 MLX 验证过的甜点)</td></tr>
+<tr><td>Eval rounds</td><td>3-round sweep (×13 ckpt) + 20-round strict (×1 ckpt-2000)</td></tr>
+<tr><td>EP_S / WALL_S</td><td><b>120s / 180s</b> (leaderboard 标准)</td></tr>
+</table>
+
+<h2>2. 三阶段结果 · Three-Phase Results</h2>
+
+<h3>Phase 1.5 — 2500-step initial (90s wall_cap)</h3>
+<table>
+<tr><th>ckpt</th><th>oranges</th><th>rounds</th><th>note</th></tr>
+<tr><td>500</td><td>0/9</td><td>0/3</td><td>wall_cap × 3</td></tr>
+<tr><td>1000</td><td>0/9</td><td>0/3</td><td>wall_cap × 3</td></tr>
+<tr><td>1500</td><td>0/9</td><td>0/3</td><td>wall_cap × 3</td></tr>
+<tr><td>2000</td><td>0/9</td><td>0/3</td><td>wall_cap × 3</td></tr>
+<tr><td>2500</td><td>0/9</td><td>0/3</td><td>wall_cap × 3</td></tr>
+</table>
+<p>5/5 全 0/9 at 90s wall_cap。Action 输出合理（rad 范围 -1.1~1.5）但 arm 没法在 90s 完成抓+放。</p>
+
+<h3>Phase 2 — Resume 2500→10000 + EP_S=120/WALL_S=180 sweep</h3>
+<table>
+<tr><th>ckpt</th><th>oranges</th><th>rounds</th><th>变化</th></tr>
+<tr><td>500-1500</td><td>0/9 × 3</td><td>0/3</td><td>同 Phase 1.5</td></tr>
+<tr><td><b>2000</b></td><td><b>2/9</b></td><td>0/3</td><td><span class="tag-warn">🟡 首次非零</span> (placed=[F,F,T] + [F,T,F])</td></tr>
+<tr><td>2500</td><td>0/9</td><td>0/3</td><td>退回</td></tr>
+<tr><td>3000-10000 (8 ckpt)</td><td>0/9 × 8</td><td>0/3</td><td>全 wall_cap</td></tr>
+</table>
+<p><b>13 ckpts × 9 ep = 117 ep, 仅 2 placed (1.7%)</b>。ckpt-2000 单点 2/9 看似 outlier。</p>
+
+<h3>Phase 3 — ckpt-2000 strict 20-round (60 episode)</h3>
+
+<svg width="900" height="280" viewBox="0 0 900 280" xmlns="http://www.w3.org/2000/svg">
+  <text x="450" y="22" text-anchor="middle" font-size="14" font-weight="bold">ckpt-2000 strict 20-round distribution</text>
+
+  <!-- Y axis -->
+  <line x1="80" y1="50" x2="80" y2="230" stroke="#666" stroke-width="1.5"/>
+  <text x="50" y="55" text-anchor="end" font-size="10">100%</text>
+  <text x="50" y="105" text-anchor="end" font-size="10">75%</text>
+  <text x="50" y="140" text-anchor="end" font-size="10">50%</text>
+  <text x="50" y="195" text-anchor="end" font-size="10">25%</text>
+  <text x="50" y="232" text-anchor="end" font-size="10">0%</text>
+
+  <line x1="80" y1="230" x2="850" y2="230" stroke="#666" stroke-width="1.5"/>
+
+  <!-- Bars: P(0)=95%, P(1)=5%, P(2)=0%, P(3)=0% -->
+  <rect x="150" y="59" width="140" height="171" fill="#cf222e" stroke="#7a1118" stroke-width="2"/>
+  <text x="220" y="50" text-anchor="middle" font-size="14" font-weight="bold" fill="#cf222e">95%</text>
+  <text x="220" y="250" text-anchor="middle" font-size="12" font-weight="bold">P(0) = 19/20</text>
+
+  <rect x="330" y="221" width="140" height="9" fill="#d29922" stroke="#8a5a00" stroke-width="2"/>
+  <text x="400" y="218" text-anchor="middle" font-size="14" font-weight="bold" fill="#d29922">5%</text>
+  <text x="400" y="250" text-anchor="middle" font-size="12" font-weight="bold">P(1) = 1/20</text>
+
+  <rect x="510" y="229" width="140" height="1" fill="#999" stroke="#666" stroke-width="2"/>
+  <text x="580" y="218" text-anchor="middle" font-size="14" font-weight="bold" fill="#666">0%</text>
+  <text x="580" y="250" text-anchor="middle" font-size="12" font-weight="bold">P(2) = 0/20</text>
+
+  <rect x="690" y="229" width="140" height="1" fill="#999" stroke="#666" stroke-width="2"/>
+  <text x="760" y="218" text-anchor="middle" font-size="14" font-weight="bold" fill="#666">0%</text>
+  <text x="760" y="250" text-anchor="middle" font-size="12" font-weight="bold">P(3) = 0/20</text>
+
+  <text x="450" y="275" text-anchor="middle" font-size="11" fill="#555">E(🍊)/ep = 0.05/3 = 1.7% · σ(5-round) = 3.3% · worst-case = -0.25/15</text>
+</svg>
+
+<table>
+<tr><th>Metric</th><th>Value</th></tr>
+<tr><td>Rounds total</td><td>20</td></tr>
+<tr><td>Episodes total</td><td>60 (20 rounds × 3 oranges)</td></tr>
+<tr><td>Oranges placed</td><td><b>1/60 (1.7%)</b></td></tr>
+<tr><td>Round success (env task_done)</td><td>0/20</td></tr>
+<tr><td>P(placed=k=0)</td><td>95.0% (19/20)</td></tr>
+<tr><td>P(placed=k=1)</td><td>5.0% (1/20 — Ep 8 placed=[F,T,F])</td></tr>
+<tr><td>P(placed=k=2)</td><td>0.0%</td></tr>
+<tr><td>P(placed=k=3)</td><td>0.0%</td></tr>
+<tr><td>σ(5-round sub-sample)</td><td>0.50 (3.3%)</td></tr>
+<tr><td>Worst-case (mean−1σ)/15</td><td><b>−0.25</b> (实际可能仍 0)</td></tr>
+</table>
+
+<p>Per-episode raw: <code>[0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]</code></p>
+
+<h3>对照 — vs strict leaderboard (2026-05-24)</h3>
+
+<table>
+<tr><th>Rank</th><th>Model</th><th>E(🍊)/ep</th><th>worst-case/15</th></tr>
+<tr><td>1 🥇</td><td>wsagi/GR00T-N1.7</td><td>68.3%</td><td>9.29</td></tr>
+<tr><td>2 🥈</td><td>hi-space/GR00T-N1.7</td><td>66.7%</td><td>6.54</td></tr>
+<tr><td>3 🥉</td><td>GR00T-N1.5 LightwheelAI</td><td>58.3%</td><td>3.63</td></tr>
+<tr><td>4</td><td>SmolVLA (other) edge-inference</td><td>25.0%</td><td>2.49</td></tr>
+<tr><td>5</td><td>SmolVLA self main=15k</td><td>25.0%</td><td>2.49</td></tr>
+<tr><td>6 (last)</td><td><b>π0.5 PyTorch expert-2k</b></td><td><b>1.7%</b></td><td><b>−0.25</b></td></tr>
+</table>
+
+<p>π0.5 expert-FT 与 SmolVLA <b>同 dataset + 同 60 demo + 同 LeRobot 框架 + 同 EP_S=120 / WALL_S=180</b>，但 E(🍊) 低 15×。这把 "trainable params 多 = 收益高" 假设彻底证伪。</p>
+
+<h2>3. 失败根因分析 · Root Cause</h2>
+
+<div class="callout bad">
+<b>H6 (最有力嫌疑) — SigLIP@224 vision bottleneck on small objects</b><br/>
+π0.5 用 SigLIP-So400m 强制 224×224 输入。LeIsaac dataset 原 640×480 被 aspect-preserving 缩到 168×224
++ 28px 上下黑边。橙子原图 30-50 px 直径，缩后 <b>10-17 px = SigLIP patch_size=14 的 0.7-1.2 patch</b>。
+Vision encoder 拿到的 "橙子 token" 信息量极低，conditioning 给 expert 的视觉信号近乎噪声。
+<br/><br/>
+对照 SmolVLA 用 512×512 SigLIP，橙子 24-40 px = 1.7-2.9 patch，**3-5× 视觉信号** → 8/15 leaderboard 同档可达。
+<br/><br/>
+<b>这不能通过更多训练步数或更大 trainable params 解决 —— vision encoder 看不到细节，下游怎么训都白训。</b>
+</div>
+
+<h3>其他次要嫌疑（已部分排除）</h3>
+
+<table>
+<tr><th>假设</th><th>权重</th><th>状态</th><th>证据</th></tr>
+<tr>
+  <td>H1: Camera perspective mismatch (DROID base_0_rgb vs LeIsaac front)</td>
+  <td>初估 40%</td>
+  <td>降级到 ~15%</td>
+  <td>pi05 内置 missing-cam padding 工作正常；ckpt-2000 那一颗 placed 证明系统能产生 valid action，不是 100% garbage</td>
+</tr>
+<tr>
+  <td>H2: 2500 step 太短</td>
+  <td>初估 30%</td>
+  <td>排除</td>
+  <td>训到 10k step 后 8 个新 ckpt 仍 0/9（Phase 2）</td>
+</tr>
+<tr>
+  <td>H3: empty_cameras=0 但模型期待 3 cam</td>
+  <td>初估 15%</td>
+  <td>降级到 ~5%</td>
+  <td>modeling_pi05.py:1195 自动 -1 pad；其他 SmolVLA 也只 2 cam 但工作正常</td>
+</tr>
+<tr>
+  <td>H4: horizon=35 在 PyTorch 不对</td>
+  <td>初估 10%</td>
+  <td>未直接验证</td>
+  <td>从 MLX 沿用；如果换 h=16/50/chunk_size 可能不同但价值不大</td>
+</tr>
+<tr>
+  <td>H5: wire protocol / action norm bug</td>
+  <td>初估 5%</td>
+  <td>排除</td>
+  <td>action 值 -1.1~1.5 rad 合理范围；ep 8 placed 1 颗证明 wire 通</td>
+</tr>
+<tr>
+  <td><b>H6: SigLIP@224 vision bottleneck</b></td>
+  <td><b>新发现 ~80%</b></td>
+  <td><b>主因</b></td>
+  <td>π0.5 输入 224 vs SmolVLA 512；橙子尺寸映射到 ≤1 patch；hardcoded by PaliGemma 不可调</td>
+</tr>
+</table>
+
+<h2>4. 可能的修复路径（已评估，不推荐继续投入）</h2>
+
+<table>
+<tr><th>路径</th><th>工作量</th><th>预期收益</th><th>推荐</th></tr>
+<tr>
+  <td>A. 软升 image_resolution 224→384（位置 embed bilinear 插值）</td>
+  <td>1 行 config + 重训 10k step + 30 min</td>
+  <td>不确定（pretrained pos embed 插值后 attention pattern 会扭曲，downstream Gemma 没见过 729 tokens）</td>
+  <td>🟡 可试但不一定 work</td>
+</tr>
+<tr>
+  <td>B. 换 PaliGemma-448 / PaliGemma2-448 base + 重训 pi05_base 预训</td>
+  <td>百万级 H100-hours</td>
+  <td>需要 PI 公司级算力</td>
+  <td>❌ 不可行</td>
+</tr>
+<tr>
+  <td>C. 把 PaliGemma vision tower 换 DINOv2 @ 384/512，重训 projector</td>
+  <td>~OpenVLA-OFT 规模工程</td>
+  <td>等于另起炉灶</td>
+  <td>❌ 不在 LeIsaac 范围</td>
+</tr>
+<tr>
+  <td><b>D. 接受 H6 是 π0.5 架构上限，pivot 别的实验</b></td>
+  <td>—</td>
+  <td>—</td>
+  <td><span class="tag-good">✅ 推荐</span></td>
+</tr>
+</table>
+
+<h2>5. 副产物 · Infrastructure Side-Effects (已修复)</h2>
+
+<table>
+<tr><th>#</th><th>Bug</th><th>修法</th></tr>
+<tr><td>1</td><td><code>lerobot_finetune.sh</code> watcher race condition: <code>nohup ... > $OUTPUT_DIR/auto_eval.log</code> 在 OUTPUT_DIR 建立前 silent fail</td><td>+1 行 <code>mkdir -p $OUTPUT_DIR</code></td></tr>
+<tr><td>2</td><td><code>eval_watcher.sh</code> 默认 <code>LEROBOT_PYTHON=lerobot-v040/bin/python</code>，v040 不认 pi05 新字段 <code>train_expert_only</code></td><td>显式 export <code>LEROBOT_PYTHON</code> + <code>LEROBOT_REPO</code></td></tr>
+<tr><td>3</td><td>4B model serial eval OOM：policy_server 不卸载旧 ckpt 直接加新的 → 24G 卡爆</td><td>每 ckpt kill+restart server（写在 <code>/tmp/pi05_serial_eval_ep120.sh</code>）</td></tr>
+<tr><td>4</td><td>baselines.tsv 新增 <code>pi05-expert-2k</code> row，server_kind=lerobot, h=35</td><td>strict run_one_strict.sh 全自动跑通</td></tr>
+</table>
+
+<h2>6. 教训 · Lessons</h2>
+
+<div class="callout">
+<ol>
+<li><b>3-round eval 信号不可信</b> —— ckpt-2000 在 3-round 2/9，在 20-round 1/60。9-episode 样本下 5% 阳性率会偶尔出 2/9 的 outlier。任何"sota / breakthrough"声称必须 ≥ 20-round 验证（[[feedback-20round-strict-benchmark]] 强制规则再次验证）</li>
+<li><b>大模型 trainable params 多不是万灵药</b> —— 693M trainable π0.5 vs 100M trainable SmolVLA 在同 dataset 上差 15×，<b>vision encoder 才是瓶颈</b></li>
+<li><b>Vision resolution 是 VLA 性能上限的硬约束</b> —— SigLIP@224 / Cosmos@384 / SmolVLA@512 / 原 ResNet@480 直接决定细节物体识别能力。换 vision encoder 比训更多 step 收益高</li>
+<li><b>偶尔抓到 1 只 ≠ 学会任务</b> —— Ep 8 的 placed=[F,T,F] 是 60 个 episode 里的 1/60 = 1.7%，等于 noise floor。不要从单一 lucky outcome 推断"模型在学习"</li>
+</ol>
+</div>
+
+<h2>7. 关联 · References</h2>
+<ul>
+<li>主 doc: <a href="pi05_finetune_pick_orange.html"><code>pi05_finetune_pick_orange.html</code></a> §2.5 bf16 重训资源估算</li>
+<li>strict leaderboard: <code>scripts/benchmark/STRICT_LEADERBOARD.md</code></li>
+<li>distribution: <code>results/benchmark/pi05-expert-2k.distribution.md</code> + <code>.svg</code></li>
+<li>raw metrics: <code>results/benchmark/pi05-expert-2k.metrics.json</code></li>
+<li>launcher: <code>LeIsaac/scripts/training/pi05_pt/train.sh</code></li>
+<li>ckpts: <code>LeIsaac/outputs/pi05-expert-leisaac-pick-orange/checkpoints/{500..10000}</code> (13 × 9.4 GB = 122 GB on disk)</li>
+<li>memory: <code>pi05-pytorch-expertonly-phase15-negative</code></li>
+<li>related: <code>leisaac-policy-comparison</code>, <code>feedback-20round-strict-benchmark</code>, <code>feedback-dreamzero-eval-stage-criteria</code></li>
+</ul>
+
+</body>
+</html>
