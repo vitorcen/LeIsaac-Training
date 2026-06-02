@@ -12,6 +12,19 @@
 
 **Reference**: X-VLA sweep `scripts/auto_sweep_xvla_ckpts.sh` is the canonical sweep pattern; `eval_watcher.sh` is its live-poll cousin tailored to lerobot async server.
 
+## Post-training cleanup (mandatory)
+
+**Rule**: once a training run is **evaluated and benchmarked** (logged on leaderboard / model card), prune its `outputs/<run>/` to the minimum needed for reproduction and archival:
+
+- **One dir per model family** (winner + same-family negative archive — keep one failed variant to prove the negative, delete duplicate failures of the same family).
+- **3-6 ckpts per kept dir** (the best ckpt by eval + 2-5 neighbors spanning the eval window; for LeRobot-style training keep `last`).
+- **Delete** any `*-baseline-v2`, `*-patched`, `*-cont`, `*-phased`, `*-smoke`, `*.<param>-sweep` directory that has a successor/winner; delete wire-debug / bug-residue dirs (ckpts that cannot inference).
+- **Never** prune a dir whose training process is still running (`pgrep` first), and never prune the strict-leaderboard winner's best ckpt.
+
+**Why**: 14 retired runs × ~40 GB/run = ~600 GB dead weight. ckpt sweeps inside one run (every 500 step × 40 = 40 ckpts × 2.8 GB) = another ~100 GB per run. Cleaning to family-winner + 3-6 ckpts gave us 1 TB → 196 GB (2026-05-29). Disk runs out → next train SIGSEGV on `torch.save` → looks like a flash-attn crash, actually ENOSPC.
+
+**Trigger**: after a model card / leaderboard row is published (the eval result is now external truth, the intermediate ckpts are no longer load-bearing). Confirm with the user before `rm -rf` — irreversible.
+
 ## AutoDL cloud training
 
 When fine-tuning on AutoDL (no-local-GPU mode for setup + GPU mode for training), see [docs/training/autodl_cloud_finetune_playbook.html](docs/training/autodl_cloud_finetune_playbook.html) for: HF gated vs public download paths, `/etc/network_turbo` quirks, single-stream curl recipe for big LFS files, git-lfs prep, `uv sync` + tensorrt-cu12 GPU-mode requirement, 140 GB disk budget with `LossDrivenPruneCallback(top_k=5)`, and a failure playbook.

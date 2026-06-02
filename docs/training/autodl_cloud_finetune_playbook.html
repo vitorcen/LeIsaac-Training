@@ -49,7 +49,7 @@
 <li><b>选机</b>：单 4090 24GB 是 N1.7 的 "刚好够" 配置；RTX PRO 6000 96GB 可放心开大 batch，训练快 3-4×</li>
 <li><b>磁盘</b>：默认 50GB 不够，<b>必须扩到 100-140GB</b>；旧机不可扩需"克隆系统盘 + 数据盘到新机"</li>
 <li><b>HF 加速三件套</b>：公开 repo → <code>hf-mirror.com</code>；gated repo → <code>/etc/network_turbo</code> + canonical HF；大文件 → <b>单流 curl</b>（多线程被代理掐死）</li>
-<li><b>PyTorch wheel</b>（本机 uv sync）：默认 <code>download.pytorch.org</code> 国内不通 TLS handshake EOF；<b>必须改 aliyun mirror</b> <code>https://mirrors.aliyun.com/pytorch-wheels/cu128</code>（14 MB/s 稳）</li>
+<li><b>PyTorch wheel</b>（本机 uv sync）：默认 <code>download.pytorch.org</code> 不通 TLS handshake EOF；<b>必须改 aliyun mirror</b> <code>https://mirrors.aliyun.com/pytorch-wheels/cu128</code>（14 MB/s 稳）</li>
 <li><b>模式切换</b>：clone repo / 下载基础模型用<b>无卡模式</b>（便宜）；<code>uv sync</code>（torch + tensorrt build）必须 <b>GPU 模式</b>（无卡 nvidia-smi 权限拒绝）</li>
 <li><b>ckpt 策略</b>：<code>save_only_model=True</code> 单 ckpt 12GB；<b>LossDrivenPrune</b> 留 top-K 自动删差的；100GB 可留 6 个 ckpt</li>
 </ul>
@@ -461,7 +461,7 @@ class LossDrivenPruneCallback(TrainerCallback):
 <tr><td><code>Access denied. This repository requires approval.</code></td><td>endpoint 上没有 token（hf-mirror 不转发 Authorization）</td><td><code>HF_ENDPOINT=https://huggingface.co hf auth login --token hf_xxx</code></td></tr>
 <tr><td><code>httpx.RemoteProtocolError: Server disconnected</code></td><td>hf 客户端多 worker 被代理掐</td><td>降到 <code>--max-workers 2</code>，大文件改 curl</td></tr>
 <tr><td><code>Invalid zip file structure</code> (uv sync flash-attn)</td><td>git-lfs 没装，wheel 是 134 字节 pointer</td><td><code>apt install git-lfs &amp;&amp; git lfs pull</code></td></tr>
-<tr><td><code>tls handshake eof</code> on <code>download-r2.pytorch.org</code></td><td>PyTorch CDN 从国内本机不通（无 VPN/proxy）；uv 默认走 download.pytorch.org 拿 torch wheel</td><td><b>本机 sed pyproject 替 URL 到 aliyun mirror：<br/><code>sed -i 's|https://download.pytorch.org/whl/cu128|https://mirrors.aliyun.com/pytorch-wheels/cu128|g' pyproject.toml</code><br/>aliyun 实测 14 MB/s 稳定</b></td></tr>
+<tr><td><code>tls handshake eof</code> on <code>download-r2.pytorch.org</code></td><td>PyTorch CDN 从本机不通（无 VPN/proxy）；uv 默认走 download.pytorch.org 拿 torch wheel</td><td><b>本机 sed pyproject 替 URL 到 aliyun mirror：<br/><code>sed -i 's|https://download.pytorch.org/whl/cu128|https://mirrors.aliyun.com/pytorch-wheels/cu128|g' pyproject.toml</code><br/>aliyun 实测 14 MB/s 稳定</b></td></tr>
 <tr><td><code>PermissionError: 'nvidia-smi'</code> (tensorrt-cu12)</td><td>无卡模式</td><td>关机切 GPU 模式装一次</td></tr>
 <tr><td>文件 4.6 GB 但 du 显示 128 MB</td><td>curl <code>-C -</code> resume 跨 session 写出 sparse 空洞</td><td>删除重下，curl 不要用 <code>-C -</code></td></tr>
 <tr><td>aria2c <code>CN:1 DL:0B</code> 卡死</td><td>多连接被代理速率限制</td><td>改 curl 单流</td></tr>
@@ -485,7 +485,7 @@ class LossDrivenPruneCallback(TrainerCallback):
 <tr><td>github LFS pull</td><td><code>git lfs pull</code> via proxy</td><td>~50s for 470 MB</td><td>OK</td></tr>
 <tr><td>uv sync (torch 2.7.1 cu128) — v1 在线</td><td><code>uv sync</code> via AutoDL proxy（GPU 模式）</td><td><b>~30-60 min</b> for ~10 GB（实测被代理限速到 1 MB/s）</td><td>GPU 模式必须，含 tensorrt build</td></tr>
 <tr><td><b>uv sync — v2 离线 bundle</b></td><td><b><code>uv_sync_offline.sh</code> + 本机预下 bundle</b></td><td><b>~2-5 min</b> install only</td><td><b>无卡模式可用；本机预下 10-30 min 一次性</b></td></tr>
-<tr><td><b>本机 download.pytorch.org → aliyun mirror</b></td><td>sed pyproject.toml URL → <code>https://mirrors.aliyun.com/pytorch-wheels/cu128</code></td><td><b>~14 MB/s</b>（100 MB 实测 7.4s）</td><td><b>国内本机 uv sync 必备；PyTorch CDN 不通时唯一路径</b></td></tr>
+<tr><td><b>本机 download.pytorch.org → aliyun mirror</b></td><td>sed pyproject.toml URL → <code>https://mirrors.aliyun.com/pytorch-wheels/cu128</code></td><td><b>~14 MB/s</b>（100 MB 实测 7.4s）</td><td><b>本机 uv sync 必备；PyTorch CDN 不通时唯一路径</b></td></tr>
 <tr><td><b>本机已有 cache → AutoDL</b></td><td><b><code>scp</code> 直传</b></td><td><b>~4.7 MB/s</b>（受限于本地上传带宽）</td><td><b>代理 degrade 时救命方案；4.6 GB 约 15 min vs 代理 60h</b></td></tr>
 </table>
 
