@@ -1,5 +1,8 @@
 # LeIsaac — vitorcen fork
 
+> 📦 本仓库是母项目 **[vitorcen/isaaclab-experience](https://github.com/vitorcen/isaaclab-experience)** 的一个子模块（manipulation / VLA 微调线）。
+> _Part of the parent project **[vitorcen/isaaclab-experience](https://github.com/vitorcen/isaaclab-experience)** — the manipulation / VLA fine-tuning track._
+
 [LightwheelAI/leisaac](https://github.com/LightwheelAI/leisaac) (Apache-2.0) 的 fork。在 upstream 提供的 SO-101 遥操 + GR00T N1.5/N1.6 微调配方之上，扩展了**通用 LeRobot 微调脚手架**、**PickOrange 多策略横评**、以及一组让非平凡 VLA 能在 Isaac Sim 上跑通的 client 端补丁。
 _A fork of [LightwheelAI/leisaac](https://github.com/LightwheelAI/leisaac) (Apache-2.0). Extends the upstream SO-101 teleop + GR00T fine-tune recipes with a generic LeRobot fine-tune scaffold, a PickOrange multi-policy benchmark, and client-side fixes that make non-trivial VLAs evaluable in Isaac Sim._
 
@@ -104,8 +107,8 @@ _Design docs and postmortems_
   _Three sim-side root causes diagnosed for ACT eval._
 - [`docs/training/dp_inference_speedup_and_dynamic_timeout.html`](docs/training/dp_inference_speedup_and_dynamic_timeout.html) — Diffusion Policy DDPM→DDIM hot-swap（393→147 ms/chunk）+ user-patience-cap eval timeout 完整 postmortem，含 SVG 拟合曲线
   _DP inference speedup via DDPM→DDIM hot-swap + dynamic timeout postmortem, with inline SVG fit curves._
-- [`docs/finetune/smolvla2_finetune_pick_orange.html`](docs/finetune/smolvla2_finetune_pick_orange.html) — SmolVLA 微调 v1 失败 / v2 部分成功 + schema-free base recipe
-- [`docs/finetune/policy_comparison_priorities.html`](docs/finetune/policy_comparison_priorities.html) — 横评 + DiT / SmolVLA2 / Octo / RDT-1B 后续优先级
+- [`docs/training/smolvla2_finetune_pick_orange.html`](docs/training/smolvla2_finetune_pick_orange.html) — SmolVLA 微调 v1 失败 / v2 部分成功 + schema-free base recipe
+- [`docs/training/policy_comparison_priorities.html`](docs/training/policy_comparison_priorities.html) — 横评 + DiT / SmolVLA2 / Octo / RDT-1B 后续优先级
 
 ### 4. LeIsaac client 端补丁
 _LeIsaac client-side fixes for non-trivial VLAs_
