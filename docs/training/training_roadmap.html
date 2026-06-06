@@ -197,6 +197,42 @@
 本质差异：DreamZero <b>imagine-then-execute</b>（推理时多步去噪生成视频）= 慢；Fast-WAM <b>训练时 co-train video，推理时 SKIP imagination</b> = 快。
 </div>
 
+<h2>3.5 成功率预估总表 · Success-rate forecast（2026-06-03 调研更新）</h2>
+
+<p class="en">Unified forecast across measured baselines (anchors) + researched candidates, ranked by the one factor that actually decides this task: <b>vision input resolution</b>.</p>
+
+<p>把所有<b>已实测 baseline（锚点）</b>和<b>新调研候选（估算）</b>放进一张表，按真正决定本任务成败的维度——<b>vision 输入分辨率</b>（橙子在画面里仅 10–40px，需 ≥1.5 个 patch 才"看得见"）——排序：</p>
+
+<table>
+<tr><th>模型</th><th>vision 输入</th><th>action head</th><th>单臂/SO-101</th><th>PickOrange 成功率</th><th>性质</th></tr>
+<tr><td>GR00T-N1.7</td><td>Eagle ViT <b>@448</b></td><td>DiT flow</td><td>✅</td><td><b>68%</b></td><td>🟢 锚点（已训）</td></tr>
+<tr><td>ACT</td><td>ResNet 原生</td><td>chunk</td><td>✅</td><td><b>43%</b></td><td>🟢 锚点</td></tr>
+<tr style="background:#eafff0"><td><b><a href="wallx_finetune_plan.html">Wall-X / WALL-OSS</a></b></td><td>Qwen2.5-VL <b>动态</b>（默认256→需调高）</td><td>flow / FAST</td><td><span class="tag-good">🟢 官方 SO-101 示例</span></td><td><b>估 40–65%</b></td><td>⭐ 最推荐</td></tr>
+<tr style="background:#eef4ff"><td><b><a href="starvla_qwen3vl_finetune_plan.html">StarVLA + Qwen3-VL-4B</a></b></td><td>Qwen3-VL <b>动态+DeepStack</b></td><td>OFT/PI/GR00T 四选</td><td><span class="tag-warn">⚠️ LeRobot v3✅ / SO101=TODO</span></td><td><b>估 30–60%</b></td><td>🔵 第二步</td></tr>
+<tr><td>SmolVLA</td><td>SigLIP <b>@512</b></td><td>flow</td><td>✅</td><td><b>25%</b></td><td>🟢 锚点</td></tr>
+<tr><td>OpenVLA-OFT</td><td>SigLIP+DINO <b>@224</b> ❌</td><td>continuous+L1+并行解码</td><td>未见 SO-101 先例</td><td><b>估 15–40%</b></td><td>🟡 仅验证价值</td></tr>
+<tr><td>multi_task_dit (DiT)</td><td>CLIP@224 <b>+只取 CLS</b> ❌❌</td><td>DiT diffusion</td><td>✅（纯视觉）</td><td><b>估 5–30%</b></td><td>🔴 比 DP 还弱</td></tr>
+<tr><td>Diffusion Policy</td><td>ResNet 原生</td><td>UNet1D</td><td>✅</td><td>概率 0/3~3/3</td><td>🟢 锚点</td></tr>
+<tr><td>LingBot-VLA</td><td>Qwen2.5-VL 动态</td><td>flow</td><td><span class="tag-bad">🔴 仅双臂无 ckpt</span></td><td>高成本/低把握</td><td>🔴 等官方</td></tr>
+<tr><td>π0.5</td><td>SigLIP <b>@224</b> ❌</td><td>flow</td><td>✅</td><td><b>1.7%</b></td><td>🔴 已失败</td></tr>
+<tr><td>OpenVLA（原版）</td><td>224 ❌</td><td>离散 token</td><td>✅</td><td><b>0%</b></td><td>🔴 已失败</td></tr>
+</table>
+
+<div class="callout bad">
+<b>🔑 一句话总规律 · The one rule（8 锚点验证）：</b>本任务的胜负手是 <b>vision 输入分辨率</b>，不是 action head 多先进。<b>≥448 才进 work 区，固定 224 基本判死。</b>
+<br/><span class="en">The decider is vision input resolution, not how fancy the action head is. ≥448 enters the work zone; fixed 224 is near-fatal.</span>
+</div>
+
+<div class="callout">
+<b>⚠️ 2026-06-03 调研修正 · Corrections：</b>
+<ul>
+<li><b>multi_task_dit 定位下调</b>：原 2.1 表标"⭐ 低风险 DiT"误导。实测源码 = <b>CLIP ViT-B/16 @224 + 只取 CLS token</b>（整图压成单个 768 维全局向量，无 spatial map），视觉比 DP 的 ResNet <b>更弱</b>。DiT head ≠ GR00T 的成功来源（GR00T 靠 Eagle@448 强视觉）。60 demo 还落在其文档点名的 collapse 高风险区。</li>
+<li><b>OpenVLA-OFT</b>（arXiv 2502.19645）：修好了原版 action head 死因（离散 token→continuous+L1+并行解码，480ms→73ms 解 timeout），但 <b>vision 仍 224 未动</b> → 逃得出 0% 但天花板被 224 压死，打不过 GR00T。仅"隔离验证 action head 增量"有科研价值。</li>
+<li><b>Wall-X 升级为首选新候选</b>：Qwen2.5-VL 动态分辨率根治 224 死穴 + <b>官方自带 SO-101 单臂示例</b> + LeRobot 原生 + zero-shot Fruit Sorting 96。详见 <a href="wallx_finetune_plan.html">wallx_finetune_plan.html</a>。</li>
+<li><b>Qwen3-VL 代已不空白</b>：StarVLA（MIT 真 ckpt）/ ABot-M0 / Qwen-VLA。最可操作的是 StarVLA+Qwen3-VL-4B，详见 <a href="starvla_qwen3vl_finetune_plan.html">starvla_qwen3vl_finetune_plan.html</a>。</li>
+</ul>
+</div>
+
 <h2>4. 执行顺序建议 · Recommended order</h2>
 
 <svg width="980" height="160" viewBox="0 0 980 160" xmlns="http://www.w3.org/2000/svg">

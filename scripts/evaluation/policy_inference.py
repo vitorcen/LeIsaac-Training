@@ -197,7 +197,7 @@ class Controller:
 
 def preprocess_obs_dict(obs_dict: dict, model_type: str, language_instruction: str):
     """Preprocess the observation dictionary to the format expected by the policy."""
-    if model_type in ["gr00t", "gr00tn1.5", "gr00tn1.6", "lerobot", "openpi", "pi05", "dreamzero"]:
+    if model_type in ["gr00t", "gr00tn1.5", "gr00tn1.6", "lerobot", "openpi", "pi05", "dreamzero", "wallx", "starvla"]:
         obs_dict["task_description"] = language_instruction
         return obs_dict
     else:
@@ -382,6 +382,34 @@ def main():
             raise ValueError(f"DreamZero only supports so101leader task currently (got {task_type}).")
 
         policy = DreamZeroServicePolicyClient(
+            host=args_cli.policy_host,
+            port=args_cli.policy_port,
+            timeout_ms=args_cli.policy_timeout_ms,
+            camera_keys=[key for key, sensor in env.scene.sensors.items() if isinstance(sensor, Camera)],
+        )
+
+    elif args_cli.policy_type == "wallx":
+        from isaaclab.sensors import Camera
+        from leisaac.policy import WallXServicePolicyClient
+
+        if task_type != "so101leader":
+            raise ValueError(f"Wall-X only supports so101leader task currently (got {task_type}).")
+
+        policy = WallXServicePolicyClient(
+            host=args_cli.policy_host,
+            port=args_cli.policy_port,
+            timeout_ms=args_cli.policy_timeout_ms,
+            camera_keys=[key for key, sensor in env.scene.sensors.items() if isinstance(sensor, Camera)],
+        )
+
+    elif args_cli.policy_type == "starvla":
+        from isaaclab.sensors import Camera
+        from leisaac.policy import StarVLAServicePolicyClient
+
+        if task_type != "so101leader":
+            raise ValueError(f"StarVLA only supports so101leader task currently (got {task_type}).")
+
+        policy = StarVLAServicePolicyClient(
             host=args_cli.policy_host,
             port=args_cli.policy_port,
             timeout_ms=args_cli.policy_timeout_ms,

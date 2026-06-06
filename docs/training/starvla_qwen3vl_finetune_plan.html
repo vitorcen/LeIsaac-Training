@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>StarVLA + Qwen3-VL-4B 微调可行性 — LeIsaac SO-101 PickOrange</title>
+<style>
+  :root {
+    color-scheme: light;
+    --bg: #ffffff; --fg: #1a1a1a; --muted: #555;
+    --accent: #1f6feb; --warn: #d29922; --bad: #cf222e; --good: #1a7f37;
+    --code-bg: #f3f3f3; --border: #d0d7de;
+  }
+  html { background: #fff; }
+  body { font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+         background: #ffffff; color: #1a1a1a;
+         max-width: 980px; margin: 28px auto; padding: 0 22px; line-height: 1.6; }
+  h1 { border-bottom: 2px solid #1a1a1a; padding-bottom: 6px; color: #1a1a1a; }
+  h2 { margin-top: 36px; border-left: 4px solid var(--accent); padding-left: 10px; color: #1a1a1a; }
+  h3 { margin-top: 24px; color: var(--accent); }
+  .en { color: #555; font-style: italic; font-size: 0.92em; }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0; background: #ffffff; color: #1a1a1a; }
+  th, td { border: 1px solid var(--border); padding: 6px 10px; text-align: left; vertical-align: top;
+           background: #ffffff; color: #1a1a1a; }
+  th { background: #f0f3f6; color: #1a1a1a; }
+  code, pre { font-family: "JetBrains Mono", Menlo, Consolas, monospace; }
+  pre { background: #f3f3f3; color: #1a1a1a; padding: 12px; border-radius: 4px; overflow-x: auto; font-size: 0.88em; }
+  code { background: #f3f3f3; color: #1a1a1a; padding: 1px 5px; border-radius: 3px; }
+  .tag-good { color: var(--good); font-weight: 600; }
+  .tag-warn { color: var(--warn); font-weight: 600; }
+  .tag-bad  { color: var(--bad); font-weight: 600; }
+  .callout { border-left: 4px solid var(--warn); background: #fff8e6; color: #1a1a1a; padding: 10px 14px; margin: 14px 0; }
+  .callout.bad { border-color: var(--bad); background: #ffeef0; }
+  .callout.good { border-color: var(--good); background: #e6f4ea; }
+  svg { display: block; margin: 14px auto; background: #ffffff; }
+  ul { padding-left: 22px; }
+  li { margin: 4px 0; }
+  .meta { color: #555; font-size: 0.9em; }
+  a { color: #1f6feb; }
+</style>
+</head>
+<body>
+
+<h1>StarVLA + Qwen3-VL-4B 微调可行性</h1>
+<p class="meta">StarVLA 框架（MIT）× Qwen3-VL-4B backbone · SO-101 PickOrange 适配评估 · 2026-06-03</p>
+<p class="en">Feasibility study for the StarVLA framework with a Qwen3-VL-4B backbone on the LeIsaac SO-101 single-arm PickOrange task. Verdict: the "vision-dividend" second step after WALL-OSS.</p>
+
+<div class="callout good">
+<b>TL;DR：</b>StarVLA 是<b>唯一有真实代码路径的 Qwen3-VL 机器人 VLA</b>（MIT，可下载 ckpt，LeRobot v3，四种 action head 可选）。Qwen3-VL 的 <b>DeepStack + 3D-grounding</b> 升级理论上对小物体最有利。估 <b>30–60%</b>，定位为 <b>WALL-OSS 之后吃 vision 红利的第二步</b>。<br/>
+<span class="en">StarVLA is the only Qwen3-VL robot VLA with a real code path (MIT, downloadable ckpt, LeRobot v3, four action heads). DeepStack/3D-grounding theoretically help small objects most. Est. 30–60%, positioned as the "vision-dividend" second step after WALL-OSS.</span><br/>
+<b>主要代价 / Main cost：</b>SO-101 在 StarVLA README 里还是个 <b>未勾选的 TODO</b>，单臂适配链路要自己补；且 Qwen3-VL 对 10–40px 小物体的提升<b>只有定性陈述、无量化证据</b>。
+</div>
+
+<h2>1. 两层结构：框架 + backbone · Framework + backbone</h2>
+<p>这个候选是两件东西的组合，分开理解：</p>
+<table>
+<tr><th>层 / Layer</th><th>是什么 / What</th></tr>
+<tr><td><b>StarVLA</b>（框架）</td><td>开源 VLA 训练框架，<a href="https://github.com/starVLA/starVLA"><code>github.com/starVLA/starVLA</code></a>，<b>MIT license</b>。支持多种 VL backbone × 四种 action head，原生吃 <b>LeRobot v3.0</b>。</td></tr>
+<tr><td><b>Qwen3-VL-4B</b>（backbone）</td><td>阿里 Qwen 2025-10 放出的 dense 档 VLM；相对 Qwen2.5-VL 关键升级 = <b>DeepStack</b>（多层 ViT 特征注入 LLM 多层，"capture fine-grained details"）+ <b>2D/3D grounding</b>（官方点名 "spatial reasoning and embodied AI"）。</td></tr>
+</table>
+
+<h3>1.1 关键事实 · Key facts</h3>
+<table>
+<tr><th>项 / Item</th><th>值 / Value</th></tr>
+<tr><td>框架 repo</td><td><a href="https://github.com/starVLA/starVLA"><code>starVLA/starVLA</code></a>（MIT）</td></tr>
+<tr><td>backbone 支持</td><td>Qwen2.5-VL 7B、<b>Qwen3-VL 4B</b>、Qwen3.5-VL 0.8B/2B/4B/9B</td></tr>
+<tr><td>已发布 Qwen3-VL ckpt</td><td><code>StarVLA/Qwen3-VL-4B-Instruct-Action</code>（基座，+2048 action token）<br/><code>Qwen3VL-OFT-Bridge-RT-1</code>(42.7) · <code>Qwen3VL-GR00T-Bridge-RT-1</code>(65.3) · <code>Qwen3VL-PI_v3-Bridge-RT-1</code>(69.8)</td></tr>
+<tr><td>action head（四选一）</td><td><b>FAST</b>（离散 AR token）· <b>OFT</b>（MLP 连续）· <b>PI</b>（flow-matching diffusion）· <b>GR00T</b>（双系统 flow-matching）</td></tr>
+<tr><td>vision 分辨率</td><td>Qwen3-VL native dynamic + <b>DeepStack 细粒度特征</b></td></tr>
+<tr><td>数据格式</td><td><b>LeRobot v3.0 原生</b>；预训练 Bridge/Fractal 本身是<b>单臂</b>（WidowX / Google robot）</td></tr>
+<tr><td>SO-101 支持</td><td><span class="tag-warn">⚠️ README 里是未勾选的 <code>- [ ] SO101</code>（规划中，未发布）</span></td></tr>
+<tr><td>License</td><td><b>MIT</b>（商用友好）</td></tr>
+</table>
+
+<div class="callout">
+<b>Qwen3-VL / Qwen3.5-VL 的其它 VLA（对照）：</b>
+<ul>
+<li><b>ABot-M0</b>（高德，<a href="https://arxiv.org/html/2602.11236v1">arXiv 2602.11236</a>）：Qwen3-VL-4B + DiT(0.16B)，<b>单臂原生支持</b>（pad-to-dual-arm），有权重；偏 3D 空间推理，小物体非卖点。</li>
+<li><b>Qwen-VLA</b>（官方，<a href="https://arxiv.org/abs/2605.30280">arXiv 2605.30280</a>）：Qwen3.5-4B + 1.15B DiT flow，LIBERO 97.9%；<b>但可下载权重未证实</b>，无 LeRobot 路径。</li>
+</ul>
+选 StarVLA 是因为它<b>同时</b>满足：真实 ckpt + LeRobot v3 + 单臂预训练数据 + 4090 可行 —— 这是 Qwen3-VL 代里唯一齐全的。
+</div>
+
+<h2>2. 系统架构 · Architecture</h2>
+<svg width="900" height="300" viewBox="0 0 900 300" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="arr2" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#1f6feb" />
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="900" height="300" fill="#ffffff"/>
+
+  <rect x="30" y="30" width="210" height="60" rx="8" fill="#eef4ff" stroke="#1f6feb" stroke-width="2"/>
+  <text x="135" y="55" text-anchor="middle" font-weight="bold" fill="#1a1a1a">观测 · 多视角图像</text>
+  <text x="135" y="75" text-anchor="middle" font-size="12" fill="#1a1a1a">cam_front + cam_wrist</text>
+
+  <rect x="30" y="120" width="210" height="60" rx="8" fill="#eef4ff" stroke="#1f6feb" stroke-width="2"/>
+  <text x="135" y="145" text-anchor="middle" font-weight="bold" fill="#1a1a1a">语言指令 · Language</text>
+  <text x="135" y="165" text-anchor="middle" font-size="12" fill="#1a1a1a">"Pick up the orange..."</text>
+
+  <rect x="300" y="55" width="250" height="100" rx="8" fill="#fff8e6" stroke="#d29922" stroke-width="2"/>
+  <text x="425" y="82" text-anchor="middle" font-weight="bold" fill="#1a1a1a">Qwen3-VL-4B</text>
+  <text x="425" y="102" text-anchor="middle" font-size="12" fill="#1a1a1a">native dynamic resolution</text>
+  <text x="425" y="120" text-anchor="middle" font-size="12" fill="#1a1a1a">+ DeepStack（细粒度）</text>
+  <text x="425" y="138" text-anchor="middle" font-size="12" fill="#1a1a1a">+ 2D/3D grounding</text>
+
+  <rect x="610" y="55" width="260" height="100" rx="8" fill="#e6f4ea" stroke="#1a7f37" stroke-width="2"/>
+  <text x="740" y="80" text-anchor="middle" font-weight="bold" fill="#1a1a1a">Action Head（四选一）</text>
+  <text x="740" y="100" text-anchor="middle" font-size="12" fill="#1a1a1a">FAST / OFT / PI(flow) / GR00T</text>
+  <text x="740" y="118" text-anchor="middle" font-size="12" fill="#1a1a1a">→ action chunk (6-DOF)</text>
+  <text x="740" y="138" text-anchor="middle" font-size="11" fill="#555">建议选 GR00T/PI flow-matching</text>
+
+  <line x1="240" y1="60" x2="298" y2="95" stroke="#1f6feb" stroke-width="2" marker-end="url(#arr2)"/>
+  <line x1="240" y1="150" x2="298" y2="120" stroke="#1f6feb" stroke-width="2" marker-end="url(#arr2)"/>
+  <line x1="550" y1="105" x2="608" y2="105" stroke="#1f6feb" stroke-width="2" marker-end="url(#arr2)"/>
+
+  <rect x="360" y="220" width="290" height="55" rx="8" fill="#fff8e6" stroke="#d29922" stroke-width="2"/>
+  <text x="505" y="243" text-anchor="middle" font-weight="bold" fill="#1a1a1a">⚠️ SO-101 = README TODO</text>
+  <text x="505" y="262" text-anchor="middle" font-size="12" fill="#1a1a1a">单臂数据有（Bridge），但 SO101 适配需自补</text>
+  <line x1="740" y1="155" x2="600" y2="220" stroke="#d29922" stroke-width="2" stroke-dasharray="5,4" marker-end="url(#arr2)"/>
+</svg>
+
+<h2>3. 核心：Qwen3-VL 的 vision 升级对 PickOrange · The vision dividend</h2>
+<p>相对 WALL-OSS 的 Qwen2.5-VL，Qwen3-VL 的卖点正好压在本任务的命门上——<b>小物体细粒度感知</b>：</p>
+<ul>
+<li><b>DeepStack</b>：把 ViT 多层特征注入 LLM 多层，官方原话 "capture fine-grained details"。对 10–40px 的小橙子，这是结构上最有利的改动。</li>
+<li><b>2D/3D grounding 增强</b>：官方点名 "spatial reasoning and embodied AI"，对"在画面里精确定位橙子"直接相关。</li>
+<li><b>native dynamic resolution</b>：与 Qwen2.5-VL 同样可吃满 640×480，不存在固定 224 瓶颈。</li>
+</ul>
+<div class="callout">
+<b>⚠️ 诚实边界 / Honest scope：</b>以上 vision 升级是官方<b>定性陈述</b>，<b>没有"对 10–40px 小物体提升 X%"的量化 benchmark</b>。DeepStack/grounding 在通用 VQA 上变强，不能直接外推到"橙子抓取成功率 +N%"。<b>真实增益要靠我们自己跑出来。</b>另外部署像素/token 预算同样需在 config 里确认（同 WALL-OSS 的 256 陷阱风险）。
+</div>
+
+<h2>4. action head 选择 · Head choice</h2>
+<p>StarVLA 一个框架支持四种 head，可直接做<b>同 backbone × 不同 head</b> 的受控对照（横评价值高）：</p>
+<table>
+<tr><th>Head</th><th>机制</th><th>Bridge-RT-1 分</th><th>PickOrange 建议</th></tr>
+<tr><td><b>PI</b></td><td>flow-matching diffusion（同 π0.5/WALL-OSS 制式）</td><td><b>69.8</b></td><td><span class="tag-good">✅ 首选</span></td></tr>
+<tr><td><b>GR00T</b></td><td>双系统 flow-matching（同 GR00T-N1.7）</td><td><b>65.3</b></td><td><span class="tag-good">✅ 次选</span></td></tr>
+<tr><td>OFT</td><td>MLP 连续 + L1（同 OpenVLA-OFT）</td><td>42.7</td><td>对照用</td></tr>
+<tr><td>FAST</td><td>离散 AR token（同原版 OpenVLA）</td><td>—</td><td>不推荐（小数据欠拟合）</td></tr>
+</table>
+<p>已发布 ckpt 自带这三组分数，<b>flow-matching 系（PI/GR00T）显著优于离散</b>——与我们 PickOrange 的经验一致（continuous flow > discrete token）。</p>
+
+<h2>5. SO-101 单臂适配（要自己补）· Single-arm adaptation</h2>
+<div class="callout bad">
+<b>主要工作量在这里。</b>StarVLA 预训练数据（Bridge/Fractal）<b>本身是单臂</b>，所以不像 LingBot 那样有"双臂→单臂"的架构鸿沟；但 README 里 <code>SO101</code> 是<b>未勾选 TODO</b>，没有现成 config。需要：
+<ul>
+<li>写 SO-101 6-DOF 的 robot/dof config（可参考 WALL-OSS 的 S101 示例 + StarVLA 既有单臂 config）。</li>
+<li>确认 observation 命名映射（我们的 <code>cam_front</code>/<code>cam_wrist</code> → StarVLA 期望的多视角键）。</li>
+<li>action 归一化统计接 LeRobot dataset。</li>
+</ul>
+相比 WALL-OSS（官方现成 S101 示例），这是 StarVLA 排第二的核心原因——<b>它把 vision 红利和适配成本一起给了你。</b>
+</div>
+
+<h2>6. 4090 24GB 可行性 · Feasibility</h2>
+<table>
+<tr><th>项</th><th>评估</th></tr>
+<tr><td>backbone 大小</td><td>Qwen3-VL-4B，bf16 ~8GB <span class="tag-good">轻松</span></td></tr>
+<tr><td>LoRA 微调</td><td>4B 量级 + 冻结 backbone + LoRA + grad-ckpt，<b>24GB 可行但偏紧</b>（同 WALL-OSS/GR00T-3B 经验）；需 bf16 + 小 batch</td></tr>
+<tr><td>推理</td><td>4B flow-matching VLA，4090 实时可行；延迟由 denoise step × chunk 决定，<b>需实测</b></td></tr>
+<tr><td>StarVLA LoRA 支持</td><td>框架支持参数高效微调（OFT head 本就是轻量），<b>比 WALL-OSS 的 LoRA 路径更明确</b></td></tr>
+</table>
+
+<h2>7. 实施路径 · Implementation</h2>
+<h3>Phase 0 — 框架落地（~0.5 天）</h3>
+<ul>
+<li>clone <code>starVLA/starVLA</code>，跑通官方 <code>Qwen3-VL-4B-Instruct-Action</code> + LeRobot demo。</li>
+<li>确认分辨率 / token 预算配置项（避免 256 陷阱）。</li>
+</ul>
+<h3>Phase 1 — SO-101 config 适配（~1 天）⭐ 主要工作量</h3>
+<ul>
+<li>写 SO-101 6-DOF dof_config + observation 映射（参考 wallx_finetune_plan.html 的 S101 示例）。</li>
+<li>接 PickOrange LeRobot dataset（v3.0 原生）。</li>
+</ul>
+<h3>Phase 2 — 微调（~1 天）</h3>
+<pre>backbone: Qwen3-VL-4B-Instruct-Action
+action_head: PI            # flow-matching，首选
+resolution: 480            # ⚠️ 吃满原生帧，避免 256 陷阱
+robot: so101_single_arm    # 6-DOF
+lora: true  bf16: true  grad_ckpt: true  batch: 1</pre>
+<h3>Phase 3 — Server + client（~1h）</h3>
+<ul>
+<li><code>server/starvla_leisaac/server.py</code> 类比 pi05/gr00t ZMQ server。</li>
+<li><code>policy_inference.py</code> 加 <code>--policy_type=starvla</code>。</li>
+</ul>
+<h3>Phase 4 — Eval + 同-head 对照（~0.5 天）</h3>
+<ul>
+<li>主跑 PI head；时间允许加跑 GR00T/OFT head 做<b>同 backbone × 不同 head</b> 受控对照（独特横评价值）。</li>
+</ul>
+
+<h2>8. 成功率预估 · Forecast</h2>
+<div class="callout good">
+<b>估 30–60%（中高把握 / moderate-high）。</b><br/>
+落点逻辑：Qwen3-VL 动态分辨率 + DeepStack 理论上 ≥ WALL-OSS 的 vision，进入 work 区；flow-matching head（PI/GR00T，Bridge 65–70 分）sample-efficient。<b>下界 30%</b> 反映 SO-101 适配从零、Qwen3-VL 小物体增益无量化证据、4090 降配三重不确定；<b>上界 60%</b> 若 DeepStack 真对小橙子有效 + 适配顺利，可与 WALL-OSS 并肩。<b>比 WALL-OSS 略保守，纯因工程成本（SO-101=TODO）更高，不是模型更弱。</b>
+<br/><span class="en">Est. 30–60%. Vision ≥ WALL-OSS in theory (Qwen3-VL + DeepStack); flow-matching head is sample-efficient. Lower bound reflects from-scratch SO-101 adaptation + unquantified small-object gain + 4090 downscaling. More conservative than WALL-OSS purely on engineering cost, not model capability.</span>
+</div>
+
+<h2>9. 与 WALL-OSS 的取舍 · vs WALL-OSS</h2>
+<table>
+<tr><th>维度</th><th>WALL-OSS（第一步）</th><th>StarVLA + Qwen3-VL-4B（第二步）</th></tr>
+<tr><td>backbone 代次</td><td>Qwen2.5-VL</td><td><span class="tag-good">Qwen3-VL（更新，DeepStack）</span></td></tr>
+<tr><td>vision 小物体</td><td>动态分辨率</td><td><span class="tag-good">动态 + DeepStack（理论更优，无量化证据）</span></td></tr>
+<tr><td>SO-101 适配</td><td><span class="tag-good">✅ 官方现成示例</span></td><td><span class="tag-warn">⚠️ TODO，需自补</span></td></tr>
+<tr><td>action head</td><td>flow / FAST（2 选）</td><td><span class="tag-good">FAST/OFT/PI/GR00T（4 选，可对照）</span></td></tr>
+<tr><td>LoRA 路径</td><td>待实测</td><td><span class="tag-good">框架更明确</span></td></tr>
+<tr><td>预估成功率</td><td>40–65%</td><td>30–60%</td></tr>
+<tr><td>定位</td><td><b>⭐ 先做（成本低）</b></td><td><b>🔵 第二步（吃 vision 红利 + 同-head 对照）</b></td></tr>
+</table>
+
+<h2>10. 来源 · Sources</h2>
+<ul>
+<li><a href="https://github.com/starVLA/starVLA">github.com/starVLA/starVLA</a>（框架，MIT）</li>
+<li><a href="https://huggingface.co/StarVLA">HF StarVLA model zoo</a>（Qwen3-VL-4B-Instruct-Action 等真实 ckpt）</li>
+<li><a href="https://arxiv.org/abs/2511.21631">arXiv 2511.21631 — Qwen3-VL 技术报告</a>（DeepStack / grounding 升级）</li>
+<li><a href="https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct">HF Qwen3-VL（dense 档）</a></li>
+<li><a href="https://arxiv.org/html/2602.11236v1">arXiv 2602.11236 — ABot-M0（Qwen3-VL-4B + DiT，单臂）</a></li>
+<li><a href="https://arxiv.org/abs/2605.30280">arXiv 2605.30280 — Qwen-VLA（Qwen3.5-4B，权重待证实）</a></li>
+</ul>
+
+<h2>11. 关联文档 · Related</h2>
+<ul>
+<li><a href="training_roadmap.html">training_roadmap.html</a> — 多策略路线图（成功率预估总表）</li>
+<li><a href="wallx_finetune_plan.html">wallx_finetune_plan.html</a> — 第一步候选（成本更低）</li>
+<li><a href="lingbot_vla_finetune_plan.html">lingbot_vla_finetune_plan.html</a> — Qwen2.5-VL 代双臂对照</li>
+</ul>
+
+</body>
+</html>

@@ -6,8 +6,6 @@
 [LightwheelAI/leisaac](https://github.com/LightwheelAI/leisaac) (Apache-2.0) 的 fork。在 upstream 提供的 SO-101 遥操 + GR00T N1.5/N1.6 微调配方之上，扩展了**通用 LeRobot 微调脚手架**、**PickOrange 多策略横评**、以及一组让非平凡 VLA 能在 Isaac Sim 上跑通的 client 端补丁。
 _A fork of [LightwheelAI/leisaac](https://github.com/LightwheelAI/leisaac) (Apache-2.0). Extends the upstream SO-101 teleop + GR00T fine-tune recipes with a generic LeRobot fine-tune scaffold, a PickOrange multi-policy benchmark, and client-side fixes that make non-trivial VLAs evaluable in Isaac Sim._
 
-![ACT eval — SO-101 PickOrange](docs/assets/pick-orange.jpg)
-
 ![Self-trained GR00T-N1.7 ckpt-6000 — 3/3 perfect pick-and-place](docs/assets/gr00t-n1.7-ckpt-6000.jpg)
 _自训 GR00T-N1.7 ckpt-6000：3/3 oranges placed @ 87s, BENCH 5-round = 14/15 (4/5 envs) — 平 hi-space N1.7 SOTA。HF: [`wsagi/GR00T-N1.7-PickOrange`](https://huggingface.co/wsagi/GR00T-N1.7-PickOrange)_
 
@@ -49,7 +47,7 @@ _Directory layout follows semantic split:_
 ### 2. PickOrange 多策略横评 — Strict 20-round Benchmark
 _PickOrange multi-policy benchmark — strict 20-round_
 
-把 `LeIsaac-SO101-PickOrange-v0` 当 benchmark，统一 eval harness 跑 13 个 baseline，**20 round × 每 round 3 颗橙子 = 60 oranges total per policy**。
+把 `LeIsaac-SO101-PickOrange-v0` 当 benchmark，统一 eval harness 跑 14 个 baseline，**20 round × 每 round 3 颗橙子 = 60 oranges total per policy**。
 _13 baselines × 20 rounds × 3 oranges = 60 oranges total per policy._
 
 **Eval config** (单一权威 = `scripts/benchmark/run_one_strict.sh`)：
@@ -75,17 +73,19 @@ policy_action_horizon = 每 model 不同（见 baselines.tsv）
 | 4 | [`hi-space/GR00T-N1.6-3B-Pick-Orange`](https://huggingface.co/hi-space/GR00T-N1.6-3B-Pick-Orange) | ~3B | `gr00t` | 40 | 48.3% | 25% | 40% | 87s  | 14.9 GB | `[3,3,1,2,2,1,2,0,1,3,3,1,1,1,0,0,1,0,1,3]` |
 | 5 | [`wsagi/GR00T-N1.6-PickOrange`](https://huggingface.co/wsagi/GR00T-N1.6-PickOrange) **自训 / ours** (ckpt-6500) | ~3B | `gr00t` | 40 | 46.7% | 20% | 45% | 66s  | 14.9 GB | `[3,1,0,3,0,3,2,0,2,2,0,3,1,2,1,1,2,1,0,1]` |
 | 6 | [`wsagi/ACT-PickOrange`](https://huggingface.co/wsagi/ACT-PickOrange) **自训 / ours** (lerobot v0.4.0 ckpt-18k) | ~52M | `lerobot-act` | 70 | 43.3% | 30% | 40% | 151s | 9.5 GB  | `[1,3,3,0,2,0,0,3,3,0,3,1,1,0,2,0,0,3,1,0]` |
-| 7 | [`shadowHokage/act_policy`](https://huggingface.co/shadowHokage/act_policy) | ~52M | `lerobot-act` | 70 | 28.3% | 10% | 20% | 169s | 8.6 GB  | `[0,1,0,3,1,2,2,3,0,0,1,1,1,0,0,1,0,1,0,0]` |
-| 8 | [`edge-inference/smolvla-so101-pick-orange`](https://huggingface.co/edge-inference/smolvla-so101-pick-orange) | ~450M | `lerobot-smolvla` | 50 | 25.0% | 0% | 20% | 179s | ~23 GB | `[2,0,2,0,1,1,1,2,0,0,1,1,0,0,2,1,0,1,0,0]` |
-| 9 | [`wsagi/SmolVLA-PickOrange`](https://huggingface.co/wsagi/SmolVLA-PickOrange) **自训 / ours** (main=15k) | ~450M | `lerobot-smolvla` | 50 | 25.0% | 0% | 15% | 176s | ~24 GB | `[0,1,0,2,1,1,0,0,0,1,1,0,1,2,0,1,1,0,2,1]` |
-| 10 | [`wsagi/X-VLA-PickOrange`](https://huggingface.co/wsagi/X-VLA-PickOrange) **自训 / ours** (weakaug 17k) | 0.9B | `pi05` (xvla server) | 32 | 6.7% | 0% | 0% | 118s | 11.8 GB | `[0,0,0,1,0,0,0,1,0,0,1,0,0,0,0,0,0,0,0,1]` |
-| 11 | [`wsagi/DiffusionPolicy-PickOrange`](https://huggingface.co/wsagi/DiffusionPolicy-PickOrange) **自训 / ours** (v0.4 fullres patched, ckpt-70k) | ~267M | `lerobot-diffusion` | 16 | 0.0% | 0% | 0% | 191s | 9.5 GB | `[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]` |
-| 12 | OpenVLA-7B **自训 / ours** (ckpt-5700, vanilla 8bit r64) | 7B + LoRA | `pi05` (openvla server) | 1 | 0.0% | 0% | 0% | 88s  | 18.0 GB | `[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]` |
-| 13 | π0.5 **自训 / ours** (pt-v3 final_lora.npz) | 3.36B + 5M LoRA | `pi05` | 35 | 0.0% | 0% | 0% | 180s | 18.0 GB | `[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]` |
+| 7 | [`wsagi/StarVLA-PickOrange`](https://huggingface.co/wsagi/StarVLA-PickOrange) **自训 / ours** (QwenGR00T freeze-VLM, step-18k) | ~4B | `starvla` | 16 | 35.0% | 10% | 35% | 170s | 16.7 GB | `[1,3,0,1,0,0,2,3,2,1,0,2,1,1,2,0,2,0,0,0]` |
+| 8 | [`shadowHokage/act_policy`](https://huggingface.co/shadowHokage/act_policy) | ~52M | `lerobot-act` | 70 | 28.3% | 10% | 20% | 169s | 8.6 GB  | `[0,1,0,3,1,2,2,3,0,0,1,1,1,0,0,1,0,1,0,0]` |
+| 9 | [`edge-inference/smolvla-so101-pick-orange`](https://huggingface.co/edge-inference/smolvla-so101-pick-orange) | ~450M | `lerobot-smolvla` | 50 | 25.0% | 0% | 20% | 179s | ~23 GB | `[2,0,2,0,1,1,1,2,0,0,1,1,0,0,2,1,0,1,0,0]` |
+| 10 | [`wsagi/SmolVLA-PickOrange`](https://huggingface.co/wsagi/SmolVLA-PickOrange) **自训 / ours** (main=15k) | ~450M | `lerobot-smolvla` | 50 | 25.0% | 0% | 15% | 176s | ~24 GB | `[0,1,0,2,1,1,0,0,0,1,1,0,1,2,0,1,1,0,2,1]` |
+| 11 | [`wsagi/X-VLA-PickOrange`](https://huggingface.co/wsagi/X-VLA-PickOrange) **自训 / ours** (weakaug 17k) | 0.9B | `pi05` (xvla server) | 32 | 6.7% | 0% | 0% | 118s | 11.8 GB | `[0,0,0,1,0,0,0,1,0,0,1,0,0,0,0,0,0,0,0,1]` |
+| 12 | [`wsagi/DiffusionPolicy-PickOrange`](https://huggingface.co/wsagi/DiffusionPolicy-PickOrange) **自训 / ours** (v0.4 fullres patched, ckpt-70k) | ~267M | `lerobot-diffusion` | 16 | 0.0% | 0% | 0% | 191s | 9.5 GB | `[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]` |
+| 13 | OpenVLA-7B **自训 / ours** (ckpt-5700, vanilla 8bit r64) | 7B + LoRA | `pi05` (openvla server) | 1 | 0.0% | 0% | 0% | 88s  | 18.0 GB | `[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]` |
+| 14 | π0.5 **自训 / ours** (pt-v3 final_lora.npz) | 3.36B + 5M LoRA | `pi05` | 35 | 0.0% | 0% | 0% | 180s | 18.0 GB | `[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]` |
 
 > **`policy_type` 备注**：
 > - `gr00t` = ZMQ flat-wire client，统一适配 N1.5 / N1.6 / N1.7 三 release（release-specific 通过 server_kind + GR00T_DIR 路由 + GR00T_WRAP_OBSERVATION envelope 切换；见 [`doc/gr00t_multi_release_env_split.html`](../doc/gr00t_multi_release_env_split.html)）。
 > - `pi05` = msgpack-ndarray wire 协议，X-VLA / OpenVLA / π0.5 三个 server 共用此 client（端口不同：5556 / 5557 / 5558）。
+> - `starvla` = StarVLA (Qwen3-VL-4B + GR00T flow-matching head) 的 websocket client（openpi msgpack-numpy 协议，stateless 双相机 @ 448）；近乎 Wall-X client 的复刻，见 `serve_starvla.py` + `StarVLAServicePolicyClient`。
 >
 > **Peak VRAM** = `nvidia-smi` 总 GPU 内存峰值（含 Isaac Sim ~5-6 GB baseline + policy server）。SmolVLA 23-24GB 是因 backbone 全权重 +Sim 共占；ACT 9.5GB 是 policy ~3GB + Sim 6GB。
 
@@ -95,6 +95,7 @@ policy_action_horizon = 每 model 不同（见 baselines.tsv）
 - 🥉 **N1.5 LightwheelAI (58.3%) 仍能打** — 老 backbone + 上游公开 ckpt 在 strict 20-round 反超自训 N1.6 (46.7%)，说明 baseline 上限随 dataset coverage 而非 backbone 容量提升。
 - ⚙️ **ACT 自训 (43.3%) > shadowHokage (28.3%) 53%** — 锁版本 lerobot **v0.4.0** + ckpt-18k h=70 重训。原因 = lerobot v0.4→v0.5 dataloader 行为漂移（PR #3406 uint8/persistent_workers + PR #3442 ACT padding loss fix），详见 [`docs/training/act_framework_drift.html`](docs/training/act_framework_drift.html)。
 - 🟡 **SmolVLA self (25.0%) ≈ edge-inference (25.0%)** — 同架构 strict 20-round 几乎打平；P(≥2) 差 5% 不显著。SmolVLM2 backbone 在 60 demo 数据集上学到的上限大致一致。
+- 🆕 **StarVLA 自训 (35.0%, step-18k) 偏弱档** — QwenGR00T **冻 VLM 只训 flow-matching head**（云端 4080-32G 训），448 分辨率喂橙子。云端 sweep 出倒 U 过拟合曲线，峰值 ~15k 步、>21k 塌陷（手臂晃动悬停）。主死因是**慢**：17/20 轮撞 180s 墙钟没放完 3 颗，但 35% 橙子率说明在认真抓放、非乱动。根因 60 demo + 冻 VLM 容量数据双不足；提分杠杆 = 解冻 VLM 顶层 / 加 demo。**3-round 当时虚高到 33%，strict 20-round 才显真值 10% P(3)** — 又一次 20-round 必要性铁证。
 - 🚨 **自训 DP / OpenVLA / π0.5 全 0/60** — 50-60 demo 不足以喂这些 model class（OpenVLA 7B / π0.5 3.36B base）。DP 另有 lerobot async server bug — `predict_action_chunk` 不 `populate_queues` → n_obs_steps=2 stack 空 deque → server stream crash → "policy dead"，已在 `lerobot-v040` editable 一行 patch 修复。
 - 🍊 **GR00T 多 release env 隔离** — N1.5 / N1.6 / N1.7 各独立 submodule + venv，transformers 4.51.3 (N1.5/N1.6) vs 4.57.3 (N1.7) ABI 冲突；2026-05-24 完成隔离后 N1.6 自训才解锁可推理。详见 [`doc/gr00t_multi_release_env_split.html`](../doc/gr00t_multi_release_env_split.html)。
 

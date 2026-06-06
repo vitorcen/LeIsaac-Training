@@ -793,3 +793,154 @@ class Pi05ServicePolicyClient(Policy):
         chunk = np.concatenate([arm, grip], axis=1)               # (50, 6)
         chunk = convert_lerobot_action_to_leisaac(chunk)
         return torch.from_numpy(chunk[:, None, :])
+
+
+class WallXServicePolicyClient(WebsocketServicePolicy):
+    """Client for a Wall-X (wall-oss) flow-matching VLA.
+
+    Server side is ``wall_x.serving.websocket_policy_server.WebsocketPolicyServer``
+    wrapping ``WallXPolicy`` (see ``LeIsaac/scripts/evaluation/serve_wallx.py``).
+    The wire protocol is the same openpi-derived msgpack-numpy websocket the
+    OpenPI client uses, so we inherit :class:`WebsocketServicePolicy` verbatim.
+
+    The server's ``WallXPolicy.infer`` expects observations keyed by the *training*
+    image-feature names and a flat 6-DOF proprio vector in lerobot motor degrees:
+
+        {
+            "face_view":       (H, W, 3) uint8,   # <- sim "front" camera
+            "left_wrist_view": (H, W, 3) uint8,   # <- sim "wrist" camera
+            "state":           (1, 6) float32,    # arm5 + gripper1, motor degrees
+            "prompt":          str,
+            "dataset_names":   str,               # must match norm_stats.json key
+        }
+
+    and returns ``{"predict_action": (1, pred_horizon, 6)}`` in motor degrees.
+    We convert sim radians -> motor degrees on the way in (same path the GR00T /
+    LeRobot clients use) and motor degrees -> radians on the way out.
+    """
+
+    # LeIsaac sim camera key -> Wall-X training image-feature key.
+    SIM_TO_WALLX_CAM = {"front": "face_view", "wrist": "left_wrist_view"}
+
+    def __init__(
+        self,
+        host: str = "localhost",
+        port: int = 8000,
+        timeout_ms: int = 60000,
+        camera_keys: list[str] = ["front", "wrist"],
+        dataset_name: str = "leisaac/pick-orange",
+    ):
+        super().__init__(host=host, port=port, timeout_ms=timeout_ms)
+        self.camera_keys = camera_keys
+        self.dataset_name = dataset_name
+
+    def infer(self, obs: dict) -> dict:
+        """Override the OpenPI packer with *standard* msgpack-numpy.
+
+        The wall-x WebsocketPolicyServer encodes/decodes ndarrays with the
+        upstream ``msgpack_numpy`` (``{b"nd": True, ...}``), whereas the OpenPI
+        base packer uses a different schema (``{b"__ndarray__": True, ...}``).
+        Mixing them leaves arrays as raw dicts on the far side (server saw images
+        as ``dict`` and crashed in ``process_images``). Pack/unpack here with the
+        same standard codec the server uses, both directions.
+        """
+        import msgpack
+        import msgpack_numpy as _mnp
+
+        self._ws.send(msgpack.packb(obs, default=_mnp.encode))
+        response = self._ws.recv()
+        if isinstance(response, str):
+            raise RuntimeError(f"Error in inference server:\n{response}")
+        return msgpack.unpackb(response, object_hook=_mnp.decode)
+
+    def get_action(self, observation_dict: dict) -> torch.Tensor:
+        obs: dict = {}
+        for key in self.camera_keys:
+            wallx_key = self.SIM_TO_WALLX_CAM.get(key, key)
+            img = observation_dict[key]
+            if isinstance(img, torch.Tensor):
+                img = img.cpu().numpy()
+            img = np.asarray(img)
+            if img.ndim == 4 and img.shape[0] == 1:  # (1, H, W, 3) -> (H, W, 3)
+                img = img[0]
+            obs[wallx_key] = img.astype(np.uint8)
+
+        # proprio: LeIsaac radians -> lerobot motor degrees (matches training data)
+        state = convert_leisaac_action_to_lerobot(observation_dict["joint_pos"])  # (1, 6) deg
+        obs["state"] = np.asarray(state, dtype=np.float32)
+        obs["prompt"] = observation_dict["task_description"]
+        obs["dataset_names"] = self.dataset_name
+
+        result = self.infer(obs)
+        action = np.asarray(result["predict_action"])  # (1, T, 6) motor degrees
+        if action.ndim == 3 and action.shape[0] == 1:
+            action = action[0]  # (T, 6)
+        # motor degrees -> LeIsaac radians
+        action = convert_lerobot_action_to_leisaac(action)  # (T, 6)
+        return torch.from_numpy(action[:, None, :]).float()  # (T, 1, 6)
+
+
+class StarVLAServicePolicyClient(WebsocketServicePolicy):
+    """Client for a StarVLA (Qwen3-VL-4B + GR00T flow-matching head) VLA.
+
+    Server side is the inline simple websocket server in
+    ``LeIsaac/scripts/evaluation/serve_starvla.py`` wrapping StarVLA's
+    ``PolicyServerWrapper``. Same openpi-derived msgpack-numpy websocket protocol
+    as the Wall-X / OpenPI adapters, so we inherit :class:`WebsocketServicePolicy`
+    and override ``infer`` with the standard msgpack-numpy codec.
+
+    The server's ``StarVLAPolicy.infer`` is *stateless* (training samples carried
+    no proprio) and expects two camera frames at training resolution (448), keyed
+    by the sim camera names, plus the language prompt:
+
+        { "front": (H,W,3) uint8, "wrist": (H,W,3) uint8, "prompt": str }
+
+    and returns ``{"predict_action": (1, T, 6)}`` in lerobot motor degrees.
+    Output degrees -> sim radians on the way out (same path as the Wall-X client).
+    """
+
+    def __init__(
+        self,
+        host: str = "localhost",
+        port: int = 8000,
+        timeout_ms: int = 60000,
+        camera_keys: list[str] = ["front", "wrist"],
+        dataset_name: str = "leisaac/pick-orange",
+    ):
+        super().__init__(host=host, port=port, timeout_ms=timeout_ms)
+        self.camera_keys = camera_keys
+        self.dataset_name = dataset_name
+
+    def infer(self, obs: dict) -> dict:
+        """Standard msgpack-numpy codec, matching serve_starvla's inline server."""
+        import msgpack
+        import msgpack_numpy as _mnp
+
+        self._ws.send(msgpack.packb(obs, default=_mnp.encode))
+        response = self._ws.recv()
+        if isinstance(response, str):
+            raise RuntimeError(f"Error in inference server:\n{response}")
+        return msgpack.unpackb(response, object_hook=_mnp.decode)
+
+    def get_action(self, observation_dict: dict) -> torch.Tensor:
+        obs: dict = {}
+        for key in self.camera_keys:
+            img = observation_dict[key]
+            if isinstance(img, torch.Tensor):
+                img = img.cpu().numpy()
+            img = np.asarray(img)
+            if img.ndim == 4 and img.shape[0] == 1:  # (1, H, W, 3) -> (H, W, 3)
+                img = img[0]
+            obs[key] = img.astype(np.uint8)
+
+        # stateless model -> no proprio sent; prompt drives the policy
+        obs["prompt"] = observation_dict["task_description"]
+        obs["dataset_names"] = self.dataset_name
+
+        result = self.infer(obs)
+        action = np.asarray(result["predict_action"])  # (1, T, 6) motor degrees
+        if action.ndim == 3 and action.shape[0] == 1:
+            action = action[0]  # (T, 6)
+        # motor degrees -> LeIsaac radians
+        action = convert_lerobot_action_to_leisaac(action)  # (T, 6)
+        return torch.from_numpy(action[:, None, :]).float()  # (T, 1, 6)
