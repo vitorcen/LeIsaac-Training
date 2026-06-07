@@ -1,0 +1,273 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>Wall-X / WALL-OSS 微调可行性 — LeIsaac SO-101 PickOrange</title>
+<style>
+  :root {
+    color-scheme: light;
+    --bg: #ffffff; --fg: #1a1a1a; --muted: #555;
+    --accent: #1a7f37; --warn: #d29922; --bad: #cf222e; --good: #1a7f37;
+    --code-bg: #f3f3f3; --border: #d0d7de;
+  }
+  html { background: #fff; }
+  body { font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+         background: #ffffff; color: #1a1a1a;
+         max-width: 980px; margin: 28px auto; padding: 0 22px; line-height: 1.6; }
+  h1 { border-bottom: 2px solid #1a1a1a; padding-bottom: 6px; color: #1a1a1a; }
+  h2 { margin-top: 36px; border-left: 4px solid var(--accent); padding-left: 10px; color: #1a1a1a; }
+  h3 { margin-top: 24px; color: var(--accent); }
+  .en { color: #555; font-style: italic; font-size: 0.92em; }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0; background: #ffffff; color: #1a1a1a; }
+  th, td { border: 1px solid var(--border); padding: 6px 10px; text-align: left; vertical-align: top;
+           background: #ffffff; color: #1a1a1a; }
+  th { background: #f0f3f6; color: #1a1a1a; }
+  code, pre { font-family: "JetBrains Mono", Menlo, Consolas, monospace; }
+  pre { background: #f3f3f3; color: #1a1a1a; padding: 12px; border-radius: 4px; overflow-x: auto; font-size: 0.88em; }
+  code { background: #f3f3f3; color: #1a1a1a; padding: 1px 5px; border-radius: 3px; }
+  .tag-good { color: var(--good); font-weight: 600; }
+  .tag-warn { color: var(--warn); font-weight: 600; }
+  .tag-bad  { color: var(--bad); font-weight: 600; }
+  .callout { border-left: 4px solid var(--warn); background: #fff8e6; color: #1a1a1a; padding: 10px 14px; margin: 14px 0; }
+  .callout.bad { border-color: var(--bad); background: #ffeef0; }
+  .callout.good { border-color: var(--good); background: #e6f4ea; }
+  svg { display: block; margin: 14px auto; background: #ffffff; }
+  ul { padding-left: 22px; }
+  li { margin: 4px 0; }
+  .meta { color: #555; font-size: 0.9em; }
+  a { color: #1f6feb; }
+</style>
+</head>
+<body>
+
+<h1>Wall-X / WALL-OSS 微调可行性</h1>
+<p class="meta">X Square Robot（跨维智能）2025 开源 · SO-101 PickOrange 适配评估 · 2026-06-03</p>
+<p class="en">Feasibility study for fine-tuning X Square Robot's WALL-OSS embodied foundation model to the LeIsaac SO-101 single-arm PickOrange task. Verdict: highest-confidence new candidate.</p>
+
+<div class="callout good">
+<b>TL;DR：</b>WALL-OSS 是当前<b>性价比最高的新候选</b>，把握偏高（估 <b>40–65%</b>）。三个理由：(1) Qwen2.5-VL <b>native dynamic resolution</b> 根治了 π0.5/OpenVLA 那个"橙子被压成 ≤1 个 patch"的死穴；(2) LeRobot 原生 + 6-DOF 单臂走 <code>customized_robot_config</code> 直接配（仓库自带 dual-arm 例，单臂自写一段）；(3) zero-shot <b>Fruit Sorting 得分 96</b>，与 PickOrange 高度同构。<br/>
+<span class="en">WALL-OSS is the most pragmatic new candidate (est. 40–65%). Native dynamic resolution cures the small-object vision bottleneck; LeRobot-native, single-arm via customized_robot_config; near-identical Fruit Sorting task scores 96 zero-shot.</span><br/>
+<b>必做前置 1 / Must-do #1：</b>默认配置把图像降到 256，<b>务必先把训练/推理分辨率调到 480+</b> 吃满 640×480 原生帧，否则会步 π0.5 后尘。<br/>
+<b>必做前置 2 / Must-do #2：</b>4090 全量 FT 塞不下（官方表 40G / 需 ≥48G），但 trainer 自带 <code>freeze_vlm</code> —— <b>冻结 3.75B VLM、只训 ~0.47B action expert ≈ 19G 显存进得去</b>（GR00T 同款省显存套路）。<b>用 freeze_vlm，不用全量。</b>
+</div>
+
+<div class="callout good">
+<b>✅ 实战跑通记录（2026-06-05）· Shipped &amp; training.</b> 已在单 4090 跑通，底座 <b>wall-oss-0.5</b>，freeze_vlm 只训 0.47B action expert + action_preprocessor，<b>loss 1.1–2.4 健康，0.357s/step，VRAM 实测仅 14.3G/24G</b>（比预估 19G 还省）。4 epoch ≈ 13h，ckpt → <code>outputs/wallx-oss05-leisaac-pick-orange/</code>。脚手架 <code>workspace/leisaac_pick_orange/{config_qact_leisaac.yml, compute_norm_stats_leisaac.py, run_leisaac.sh, run_leisaac_retry.sh}</code>。
+<br/><b>踩平的 7 个坑（修复已落地）/ 7 gotchas fixed：</b>
+<ol>
+<li><b>🔴 env 必须 python 3.11</b>：本机 python 3.10.20 让 <code>import torch</code> ~40% 间歇 segfault（C 栈溢出，纯 Python 稳）；换 3.11 → 0/15 稳。<b>与 torch/CUDA 版本无关</b>。那些 posixpath/sre/pyc 诡异错全是同一堆腐蚀的表象。</li>
+<li><b>ulimit -s 131072</b>：py3.11 后更重的启动（ast 解析/深模型构建）+ 默认 8M 栈仍偶发 → 加大栈 + 重试器 <code>run_leisaac_retry.sh</code> 兜（反复启动到 "iter 1/" 进训练循环=稳态）。</li>
+<li>transformers <b>4.51.3</b>（requirements 的 4.49 是 stale，代码要 <code>AttentionInterface</code>）；flash-attn 用 <b>cp311</b> 预编译 wheel；csrc 编译要 <code>TORCH_CUDA_ARCH_LIST=8.9</code>。</li>
+<li><b>加载跳过 shape 不符 key</b>（<code>modeling…from_pretrained</code>）：0.5 预训练 action_dim=26，SO-101 是 6 → action_preprocessor.{w1,action_proj_back} 保持 6-DOF 新初始化。</li>
+<li><b>freeze_vlm 额外放行 action_preprocessor 可训</b>（trainer）：它在 moe.experts.1 之外，不放行会随机初始化被冻死。</li>
+<li><b>数据集用 v2.1 格式</b>：lerobot 0.3.4 是 <code>CODEBASE_VERSION=v2.1</code>，读不了 v3.0 的 tasks.parquet → 用 <code>leisaac-pick-orange_old</code>（同 60 ep）；KEY_MAPPINGS/ACTION_DATASET_NAMES 注册 repo_id。</li>
+<li><b>调度 num_epoch 100→4 / 每 epoch 存</b>：<code>num_training_steps</code> 只管 LR cosine 长度、<b>不是停止条件</b>，原配置会跑 100 epoch ≈ 320h、每 5 epoch 才存（首 ckpt 16h）。</li>
+</ol>
+</div>
+
+<h2>1. 什么是 Wall-X / WALL-OSS · What it is</h2>
+<p><b>WALL-OSS</b>（仓库名 <code>wall-x</code>）是 <b>X Square Robot（x-square-robot / X²，跨维智能）</b> 开源的具身基础模型。LeRobot v0.5.0 已把它列为官方 policy（<code>--policy.type=wall_x</code>），<b>是同一个模型的官方协作移植</b>，不是第三方山寨。</p>
+<table>
+<tr><th>项 / Item</th><th>值 / Value</th></tr>
+<tr><td>组织 / Org</td><td>X Square Robot（跨维智能）</td></tr>
+<tr><td>GitHub</td><td><a href="https://github.com/X-Square-Robot/wall-x"><code>X-Square-Robot/wall-x</code></a></td></tr>
+<tr><td>论文 / Paper</td><td><a href="https://arxiv.org/abs/2509.11766">arXiv 2509.11766</a> 《Igniting VLMs toward the Embodied Space》（WALL-OSS）</td></tr>
+<tr><td>HF 权重</td><td><code>x-square-robot/wall-oss-flow</code>、<code>wall-oss-flow-v0.1</code>（另有 WALL-OSS-0.5 / -FAST 变体）</td></tr>
+<tr><td>LeRobot 集成</td><td><a href="https://huggingface.co/docs/lerobot/walloss">官方文档</a>："adapted from their open-source WallX repository"，<code>--policy.type=wall_x</code></td></tr>
+<tr><td>License</td><td><b>Apache-2.0</b>（商用友好）</td></tr>
+</table>
+
+<h3>1.1 关键事实 · Key facts</h3>
+<table>
+<tr><th>项 / Item</th><th>值 / Value</th></tr>
+<tr><td>VL backbone</td><td><b>Qwen2.5-VL（3B VLM）</b>，代码类名 <code>Qwen2_5_VLMoEForAction</code></td></tr>
+<tr><td>总参数 / Total params</td><td><b>4.22B</b>（8.45 GB bf16，单 safetensors，HF 实测）= base Qwen2.5-VL-3B <b>3.75B</b>（vision 0.66B + LLM 3.1B）+ <b>action expert `moe.experts.1` ≈ 0.47B</b></td></tr>
+<tr><td>vision 分辨率</td><td><b>native dynamic resolution</b>（按 min/max_pixels 保留原始宽高比，<b>非固定 224/448</b>）⚠️ 默认部署配置降到 256</td></tr>
+<tr><td>action head</td><td>双分支：<code>diffusion</code>（flow matching 连续）/ <code>fast</code>（FAST 离散 token）</td></tr>
+<tr><td>action_horizon（chunk）</td><td><b>32</b></td></tr>
+<tr><td>action_dim</td><td>灵活：flow 模式 pad 到 20 维再截回，<b>单臂 6-DOF 原生支持</b></td></tr>
+<tr><td>预训练数据</td><td><b>20+ embodiments，每 epoch 100 万+ 轨迹，含单臂 + 双臂</b>（model card 提到 <code>x2_normal</code> 单臂集）</td></tr>
+<tr><td>数据格式</td><td>LeRobot dataset 原生</td></tr>
+<tr><td>同构任务证据</td><td>zero-shot 17-task suite <b>Fruit Sorting = 96</b></td></tr>
+</table>
+
+<h2>2. 系统架构 · Architecture</h2>
+<svg width="900" height="300" viewBox="0 0 900 300" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#1a7f37" />
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="900" height="300" fill="#ffffff"/>
+
+  <rect x="30" y="30" width="210" height="60" rx="8" fill="#eafff0" stroke="#1a7f37" stroke-width="2"/>
+  <text x="135" y="55" text-anchor="middle" font-weight="bold" fill="#1a1a1a">观测 · 多视角图像</text>
+  <text x="135" y="75" text-anchor="middle" font-size="12" fill="#1a1a1a">cam_front + cam_wrist</text>
+
+  <rect x="30" y="120" width="210" height="60" rx="8" fill="#eafff0" stroke="#1a7f37" stroke-width="2"/>
+  <text x="135" y="145" text-anchor="middle" font-weight="bold" fill="#1a1a1a">语言指令 · Language</text>
+  <text x="135" y="165" text-anchor="middle" font-size="12" fill="#1a1a1a">"Pick up the orange..."</text>
+
+  <rect x="300" y="65" width="240" height="80" rx="8" fill="#fff8e6" stroke="#d29922" stroke-width="2"/>
+  <text x="420" y="92" text-anchor="middle" font-weight="bold" fill="#1a1a1a">Qwen2.5-VL 3B</text>
+  <text x="420" y="112" text-anchor="middle" font-size="12" fill="#1a1a1a">native dynamic resolution</text>
+  <text x="420" y="130" text-anchor="middle" font-size="12" fill="#1a1a1a">→ multimodal embeddings</text>
+
+  <rect x="600" y="65" width="270" height="80" rx="8" fill="#e6f4ea" stroke="#1a7f37" stroke-width="2"/>
+  <text x="735" y="92" text-anchor="middle" font-weight="bold" fill="#1a1a1a">MoE Action Head</text>
+  <text x="735" y="112" text-anchor="middle" font-size="12" fill="#1a1a1a">flow-matching / FAST token</text>
+  <text x="735" y="130" text-anchor="middle" font-size="12" fill="#1a1a1a">→ action chunk T=32 (6-DOF)</text>
+
+  <line x1="240" y1="60" x2="298" y2="100" stroke="#1a7f37" stroke-width="2" marker-end="url(#arr)"/>
+  <line x1="240" y1="150" x2="298" y2="115" stroke="#1a7f37" stroke-width="2" marker-end="url(#arr)"/>
+  <line x1="540" y1="105" x2="598" y2="105" stroke="#1a7f37" stroke-width="2" marker-end="url(#arr)"/>
+
+  <rect x="360" y="215" width="280" height="55" rx="8" fill="#eafff0" stroke="#1a7f37" stroke-width="2"/>
+  <text x="500" y="238" text-anchor="middle" font-weight="bold" fill="#1a1a1a">✅ 单臂 6-DOF 原生支持</text>
+  <text x="500" y="257" text-anchor="middle" font-size="12" fill="#1a1a1a">SO-101: shoulder/elbow/wrist + gripper</text>
+  <line x1="735" y1="145" x2="600" y2="215" stroke="#1a7f37" stroke-width="2" stroke-dasharray="5,4" marker-end="url(#arr)"/>
+</svg>
+
+<h2>3. 核心：vision 分辨率为什么是把握的关键 · Why resolution is the crux</h2>
+<p>本任务已被 8 个数据点反复验证：<b>成败的胜负手是 vision 输入分辨率</b>，橙子在 640×480 帧里仅 10–40px。固定 224 的模型把橙子压到 ≤1 个 patch → 几乎不可见 → 失败。</p>
+<table>
+<tr><th>Model</th><th>Vision encoder</th><th>输入分辨率</th><th>橙子缩放后</th><th>结果</th></tr>
+<tr><td>GR00T-N1.7</td><td>Eagle-2 ViT</td><td>448</td><td>22–34 px（1.5–2.4 patch）</td><td><span class="tag-good">68% ✅</span></td></tr>
+<tr><td>SmolVLA</td><td>SigLIP</td><td>512</td><td>24–40 px（1.7–2.9 patch）</td><td><span class="tag-good">25% ✅</span></td></tr>
+<tr><td><b>WALL-OSS</b></td><td><b>Qwen2.5-VL（动态）</b></td><td><b>可吃满 640×480</b></td><td><b>原生不缩，token 充足</b></td><td><span class="tag-good"><b>估 40–65% ✅</b></span></td></tr>
+<tr><td>π0.5</td><td>SigLIP</td><td>224</td><td>10–17 px（≤1 patch）</td><td><span class="tag-bad">1.7% ❌</span></td></tr>
+<tr><td>OpenVLA</td><td>SigLIP+DINOv2</td><td>224</td><td>10–17 px（≤1 patch）</td><td><span class="tag-bad">0% ❌</span></td></tr>
+</table>
+<div class="callout bad">
+<b>⚠️ 唯一的陷阱 / The one trap：</b>WALL-OSS 官方部署 guide 默认把各 view 降到 <code>resolution: 256</code>。如果照抄默认配置，小橙子又会被压回 ≤1 patch，<b>退化成 π0.5</b>。
+但因为底座是动态分辨率，<b>只需在 config 把分辨率调到 480+ 即可保住小橙子的 token，不用换 encoder</b>——这正是它相对固定-224 模型的根本优势。<b>这是第一个要验证的实验。</b>
+</div>
+
+<h2>4. SO-101 单臂适配（customized_robot_config 自写）· Single-arm path</h2>
+<div class="callout">
+<b>⚠️ 事实纠正（2026-06-05 clone 仓库核对）：</b>仓库 <code>workspace/lerobot_example/config_qact.yml</code> 自带的是 <b>aloha_mobile_cabinet（双臂 + 移动底盘）</b>示例，<b>不是</b>开箱即用的 SO-101 单臂。"官方 SO-101 示例"出处是第三方部署 blog，不在本仓库。<b>但</b> trainer 有 <code>enable_customized_robot_config</code> 机制，单臂自写一段 6-DOF 即可——比 LingBot（仅双臂、需 swap head）容易得多。
+</div>
+<p>SO-101 单臂走 <code>customized_robot_config</code>（仿 workspace/README 的 <code>action_eef:6 / action_gripper:1</code> 写法），我们的 6 维直接对上数据集 <code>action.names</code>：</p>
+<pre>enable_customized_robot_config: true
+customized_robot_config:
+  name: "leisaac/pick-orange-so101"
+  customized_dof_config:        # = predict_action_keys，sum=6，max≤20
+    action_arm: 5               # shoulder_pan/lift, elbow_flex, wrist_flex/roll
+    action_gripper: 1
+  customized_agent_pos_config:  # = obs state，sum=6
+    state_arm: 5
+    state_gripper: 1
+# 另需在 wall_x/data/utils.py 注册本数据集的 camera key 映射：
+#   observation.images.front -> face_view ; observation.images.wrist -> left_wrist_view</pre>
+<ul>
+<li>✅ 预训练已含单臂数据（<code>x2_normal</code>）—— 不是纯双臂迁移，先验对单臂友好。</li>
+<li>✅ action_dim 灵活（flow pad-to-20 再截回 6 / FAST 直接 6 维）。</li>
+<li>✅ LeRobot v3.0 dataset 原生 —— 我们的 60-demo PickOrange（so101_follower, 6-DOF, front+wrist@480×640）直接喂。</li>
+<li>⚠️ 需先跑 <code>scripts/compute_norm_stats.py</code> 生成 norm_stats.json（维度要与 customized_dof_config 之和 = 6 对齐）。</li>
+</ul>
+
+<h2>5. 4090 24GB 可行性 · Feasibility（2026-06-05 实测重写）</h2>
+<div class="callout good">
+<b>结论：全量 FT 塞不下，但 <code>freeze_vlm</code>（只训 0.47B action expert）≈ 19G 进得去——和 GR00T-N1.7 当年塞进 4090 拿 68% 是同一招。</b>之前"🔴 单 4090 放不下"只针对全量 FT，是误导，已修正。
+</div>
+<p>显存账（4.22B 总参，action expert ≈ 0.47B；权重 2B/参、AdamW 状态 fp32 m+v≈8B + master 4B/可训参、bf16 梯度 2B/可训参、bs=1 + grad-ckpt 激活 ~4–5G）：</p>
+<table>
+<tr><th>路线</th><th>可训参数</th><th>常驻权重</th><th>梯度+Adam</th><th>激活</th><th>合计</th><th>4090</th></tr>
+<tr><td><b>全量 FT</b></td><td>4.22B 全部</td><td>8.4 G</td><td>~33 G</td><td>~4 G</td><td><b>~46 G</b></td><td><span class="tag-bad">🔴 官方表 40G，需 ≥48G</span></td></tr>
+<tr><td><b>freeze_vlm</b> ⭐</td><td><b>~0.47B（moe.experts.1）</b></td><td>8.4 G</td><td>~6.6 G</td><td>~4 G</td><td><b>~19 G</b></td><td><span class="tag-good">🟢 进得去（首选）</span></td></tr>
+<tr><td><b>LoRA</b>（r=8）</td><td>~20 M adapter</td><td>8.4 G</td><td>~0.5 G</td><td>~5 G</td><td><b>~14 G</b></td><td><span class="tag-good">🟢 很宽裕（备选）</span></td></tr>
+<tr><td>推理 server</td><td>—</td><td>8.4 G</td><td>—</td><td>~2 G</td><td><b>~11 G</b></td><td><span class="tag-good">🟢 官方 30ms/chunk</span></td></tr>
+</table>
+<p><b>trainer 自带的省显存开关（<code>wall_x/trainer/qwen_vl_act_trainer.py:662</code>，无需改代码）：</b></p>
+<pre>freeze_vlm: true            # 冻结一切，只训 name 含 "moe.experts.1." 的 action expert
+# 或分离学习率（VLM 也微调一点）：
+# action_expert_learning_rate: 0.00005
+# train_action_expert_only: true   # 只优化 action expert，VLM 常驻不更新</pre>
+<div class="callout">
+<b>风险分层 · Risk tiers：</b>
+<ul>
+<li><b>低风险</b>：推理（官方背书单 4090 30ms）、数据接入（LeRobot v3 原生）、<b>显存（freeze_vlm 实测账 ~19G）</b>。</li>
+<li><b>中风险（需实测）</b>：① 默认 256 分辨率必须调到 480+（实验 1）；② 分辨率↑ → Qwen2.5-VL 动态视觉 token↑ → 激活涨，是要 grad-ckpt 的真正原因（不是参数量）；③ 0.47B expert 在 60 demo 上容量够不够（GR00T 冻 backbone 也只训 action head 拿到 68%，先验乐观）。</li>
+</ul>
+</div>
+
+<h2>6. 实施路径 · Implementation</h2>
+<h3>Phase 0 — 现实检查（~1h）</h3>
+<ul>
+<li>clone <code>X-Square-Robot/wall-x</code>，读 S101 single-arm finetuning 示例 config。</li>
+<li>确认 LeRobot <code>--policy.type=wall_x</code> 训练入口是否暴露 LoRA / 分辨率 knob。</li>
+<li><b>定位分辨率配置项</b>（<code>resolution: 256</code> → 改 480/512）。</li>
+</ul>
+<h3>Phase 1 — 分辨率验证实验（~0.5 天）⭐ 最高优先</h3>
+<ul>
+<li>用官方 ckpt 做 <b>zero-shot / 极短微调</b>，对比 <code>resolution=256</code> vs <code>480</code> 两组，看橙子可见性 + 抓取倾向。</li>
+<li>这一步直接决定后面值不值得投全量微调。</li>
+</ul>
+<h3>Phase 2 — 显存路径定型（已实测，~0.5 天）</h3>
+<ul>
+<li><b>定案：<code>freeze_vlm: true</code> + bs=1 + grad-ckpt ≈ 19G</b>，单 4090 直接训，不必云端 / 多卡。LoRA 作备选（更省但 expert 已够小）。</li>
+</ul>
+<h3>Phase 3 — 微调（~1 天）</h3>
+<p>训练入口 = <code>accelerate launch train_qact.py --config config_qact.yml</code>（<b>非</b> lerobot CLI；lerobot <code>--policy.type=wall_x</code> 是另一条推理移植线）。关键 config 字段：</p>
+<pre>model_type: wall-oss
+pretrained_wallx_path: <HF cache>/x-square-robot/wall-oss-flow
+use_fast_tokenizer: False          # 训 Flow（flow-matching 连续动作）
+freeze_vlm: true                   # ⭐ 只训 0.47B action expert → 19G
+FSDP2: false                       # 单卡不用 FSDP
+torch_compile: false
+batch_size_per_gpu: 1
+gradient_accumulation_steps: 32    # 等效 batch 32
+data:
+  action_horizon: 32
+  resolution:                      # ⚠️ 关键：默认 256 全改 480
+    face_view: 480
+    left_wrist_view: 480
+enable_customized_robot_config: true   # SO-101 6-DOF（见 §4）</pre>
+<p>run.sh 单卡：<code>CUDA_VISIBLE_DEVICES=0</code>，<code>accelerate launch --num_processes=1</code>。</p>
+<h3>Phase 4 — Server + client（~1h，复用 pi05/gr00t 套路）</h3>
+<ul>
+<li><code>server/wallx_leisaac/server.py</code> 类比现有 ZMQ server。</li>
+<li><code>policy_inference.py</code> 加 <code>--policy_type=wallx</code>（wire chunk=32）。</li>
+</ul>
+<h3>Phase 5 — Eval（~2h）</h3>
+<ul>
+<li>按 <code>scripts/benchmark/run_one.sh</code> 横评；horizon 从 chunk*0.5=16 起 sweep。</li>
+<li>5-round → 若 ≥SmolVLA(25%) 再跑 strict 20-round 上 leaderboard。</li>
+</ul>
+
+<h2>7. 成功率预估 · Forecast</h2>
+<div class="callout good">
+<b>估 40–65%（把握偏高 / high confidence）。</b><br/>
+落点逻辑：vision 用动态分辨率吃满 640×480 → 进入 GR00T(448,68%)/SmolVLA(512,25%) 的 work 区上沿；flow-matching action head 与 GR00T 同制式（sample-efficient）；官方单臂示例 + 同构 Fruit Sorting 96 压实工程可行性。<b>下界 40%</b> 反映 60 demo 小数据 + 4090 降配训练的不确定性；<b>上界 65%</b> 若分辨率与多视角配齐，有望逼近 GR00T。
+<br/><span class="en">Est. 40–65%. Dynamic-resolution vision puts it in the GR00T/SmolVLA work zone; flow-matching head is sample-efficient; official single-arm example + analogous Fruit-Sorting-96 de-risk the engineering.</span>
+</div>
+
+<h2>8. 与其它候选的取舍 · Trade-off</h2>
+<table>
+<tr><th>维度</th><th>WALL-OSS</th><th>LingBot-VLA</th><th>OpenVLA-OFT</th></tr>
+<tr><td>vision 分辨率</td><td><span class="tag-good">动态（可吃满 640×480）</span></td><td>动态（像素预算未公开）</td><td><span class="tag-bad">固定 224 死穴</span></td></tr>
+<tr><td>单臂 SO-101</td><td><span class="tag-good">✅ 官方示例</span></td><td><span class="tag-bad">❌ 仅双臂无 ckpt</span></td><td>未见先例</td></tr>
+<tr><td>LeRobot 集成</td><td><span class="tag-good">✅ 官方移植</span></td><td>v3 格式兼容</td><td>需自接</td></tr>
+<tr><td>预估成功率</td><td><b>40–65%</b></td><td>高成本/低把握</td><td>15–40%</td></tr>
+<tr><td>结论</td><td><b>⭐ 首选</b></td><td>等官方单臂 ckpt</td><td>仅验证 action head</td></tr>
+</table>
+
+<h2>9. 来源 · Sources</h2>
+<ul>
+<li><a href="https://github.com/X-Square-Robot/wall-x">github.com/X-Square-Robot/wall-x</a></li>
+<li><a href="https://huggingface.co/docs/lerobot/walloss">huggingface.co/docs/lerobot/walloss</a>（LeRobot 官方移植文档）</li>
+<li><a href="https://huggingface.co/blog/Geoffrey19/wall-oss-full-deployment-guide">WALL-OSS full deployment guide</a>（S101 单臂示例 + 256 分辨率 + 30ms 推理来源）</li>
+<li><a href="https://huggingface.co/x-square-robot/wall-oss-flow">HF x-square-robot/wall-oss-flow</a></li>
+<li><a href="https://arxiv.org/abs/2509.11766">arXiv 2509.11766《Igniting VLMs toward the Embodied Space》</a></li>
+<li><a href="https://qwenlm.github.io/blog/qwen2.5-vl/">Qwen2.5-VL（native dynamic resolution 来源）</a></li>
+</ul>
+
+<h2>10. 关联文档 · Related</h2>
+<ul>
+<li><a href="training_roadmap.html">training_roadmap.html</a> — 多策略路线图（成功率预估总表）</li>
+<li><a href="starvla_qwen3vl_finetune_plan.html">starvla_qwen3vl_finetune_plan.html</a> — Qwen3-VL 代第二步候选</li>
+<li><a href="lingbot_vla_finetune_plan.html">lingbot_vla_finetune_plan.html</a> — 双臂锁定的对照案例</li>
+</ul>
+
+</body>
+</html>
