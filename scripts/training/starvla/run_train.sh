@@ -36,6 +36,9 @@ OVERRIDES="--datasets.vla_data.data_root_dir $DATA_ROOT --run_root_dir $RUN_ROOT
 [ -n "$RUN_ID" ]    && OVERRIDES="$OVERRIDES --run_id $RUN_ID"
 [ -n "$MAX_STEPS" ] && OVERRIDES="$OVERRIDES --trainer.max_train_steps $MAX_STEPS"
 [ -n "$BATCH" ]     && OVERRIDES="$OVERRIDES --datasets.vla_data.per_device_batch_size $BATCH"
+# SAVE_INTERVAL: needed for the 500-step "does the arm move?" smoke ckpt, since the
+# real config saves every few thousand. e.g. MAX_STEPS=500 SAVE_INTERVAL=500.
+[ -n "$SAVE_INTERVAL" ] && OVERRIDES="$OVERRIDES --trainer.save_interval $SAVE_INTERVAL"
 if [ "${RESUME:-0}" = "1" ]; then
   OVERRIDES="$OVERRIDES --trainer.is_resume True"
   echo "### RESUME mode: will pick up latest checkpoint"

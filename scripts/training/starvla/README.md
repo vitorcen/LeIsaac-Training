@@ -14,8 +14,9 @@ _One kit, many variants. A new VLM×head = ONE config yaml, not a new dir._
 ```
 starvla/
   configs/
-    so101_qwen_gr00t.yaml      # Run-1: Qwen3-VL-4B (冻) + GR00T flow-matching head
-    # so101_gemma4_pi_v3.yaml  # ← 未来变体只加这一个文件（含自己的 framework 块 + base_vlm）
+    so101_qwen_gr00t.yaml         # Run-1: Qwen3-VL-4B (冻) + GR00T flow-matching head
+    so101_qwen3vl8b_gr00t.yaml    # 变体: 同框架同 head, 换 8B 冻结骨干 (bs=4 / 60k step)
+    # so101_gemma4_pi_v3.yaml     # ← 再加变体只加这一个文件（含自己的 framework 块 + base_vlm）
   common/
     modality.json              # SO-101 6-DOF modality（→ 拷进数据集 meta/）
     data_registry/data_config.py   # 自包含 registry（robot_type + mixture so101_pickorange）
@@ -68,6 +69,36 @@ loss(action_dit)~1.2 · ETA ~8.5–9h ≈ 6.6 epoch。
 2. 复制 `configs/so101_qwen_gr00t.yaml` → `configs/so101_<vlm>_<head>.yaml`，改 `framework.name`
    （= starVLA `model/framework/VLM4A/[VLM][Head].py` 的类名）+ `framework.<vlm>.base_vlm` + `run_id`。
 3. `CONFIG=…/configs/so101_<vlm>_<head>.yaml RUN_ID=so101_<vlm>_<head> bash run_train.sh`。
+
+### 实例：换更大的同族骨干 Qwen3-VL-8B（`so101_qwen3vl8b_gr00t.yaml`）
+
+同 `framework.name: QwenGR00T` + 同 head，仅换冻结骨干 4B→8B。**starVLA 源码零改动**：
+QwenGR00T 运行时把 `cross_attention_dim` 对齐到所加载 VLM 的真实 `model.config.hidden_size`
+（8B = 4096），`vl_hidden_dim` 对本框架是死字段（仅 QwenPI/Adapter/Layerwise 那些 head 才回读）。
+eval 的 `serve_starvla.py:repoint_base_vlm` 命中的 `framework.qwenvl.base_vlm` 对 8B 仍成立，**eval 也不改**。
+
+```bash
+REPO=Qwen/Qwen3-VL-8B-Instruct bash env/dl_base.sh        # 下 8B 骨干（~16G，冻结也要全下，见下）
+
+# ① 先 500 步冒烟：拉回 ckpt-500 eval 看机械臂会不会动，再决定跑全程（沿用 Run-1 方法论）
+CONFIG=$REPO/examples/SO101_PickOrange/train_files/configs/so101_qwen3vl8b_gr00t.yaml \
+MAX_STEPS=500 SAVE_INTERVAL=500 RUN_ID=so101_qwen3vl8b_gr00t_smoke500 BATCH=4 bash run_train.sh
+
+# ② 冒烟 OK 才跑全程 60k
+CONFIG=$REPO/examples/SO101_PickOrange/train_files/configs/so101_qwen3vl8b_gr00t.yaml \
+RUN_ID=so101_pickorange_qwen3vl8b_gr00t bash run_train.sh
+```
+
+config 相对 Run-1 只动 4 处：`base_vlm`、`vl_hidden_dim 2048→4096`（卫生）、`per_device_batch_size 8→4`、`run_id`。
+**显存（48G 4090）**：8B 冻结权重 ~16G bf16，bs=4 时峰值 ~33–40G 安全（bs=8 ~41–50G 踩边/OOM）。
+注意三处**别误算省显存**：Qwen3 路径 `attn` 被 `QWen3.py` 强制 `sdpa`（flash-attn 配了无效）、
+`trainer.gradient_checkpointing` 是死字段且冻结 VLM 无 backward 可省、单卡 ZeRO-2 不分片参数。
+真正峰值大头是 `output_hidden_states=True` + `repeated_diffusion_steps`（默认 8）把 4096 宽 hidden
+repeat 8 倍喂 DiT cross-attn——**OOM 时第一杠杆是 `repeated_diffusion_steps` 降到 4，再动 batch**。
+bs 砍半 → `max_train_steps` 翻到 60k 才覆盖 Run-1 同等 ~6.6 epoch，~1.5s/step ≈ 16–20h。
+
+> eval 侧脚：`serve_starvla.py` 的 `--base` 走 `os.path.abspath`，**必须传本地 8B 目录**（传 HF repo id
+> 会被拼成假本地路径）；既有行为，非 8B 新增。
 
 ⚠️ **eval 待修的特殊情况**：`serve_starvla.py:repoint_base_vlm` 现硬编码 `framework.qwenvl.base_vlm`
 key。加非 Qwen 变体时需改成从 config 读 framework 类型再定位 `base_vlm` 键，否则 repoint 失效。
