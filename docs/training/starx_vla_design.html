@@ -1,0 +1,478 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>StarX-VLA 设计文档 — StarVLA 搭积木 × X-VLA 跨具身</title>
+<style>
+  :root { color-scheme: light;
+    --bg:#ffffff; --fg:#1d1d1f; --muted:#555;
+    --accent:#0a84ff; --warn:#d29922; --bad:#cf222e; --good:#1a7f37;
+    --code-bg:#f5f5f7; --border:#d2d2d7; }
+  html, body { background:#ffffff; }
+  body { font-family:-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+         background:#ffffff; color:#1d1d1f;
+         max-width:1080px; margin:28px auto; padding:0 24px; line-height:1.7; }
+  h1 { border-bottom:3px solid var(--accent); padding-bottom:10px; color:#1d1d1f; }
+  h2 { margin-top:40px; color:var(--accent); border-left:4px solid var(--accent); padding-left:10px; }
+  h3 { margin-top:26px; color:#1d1d1f; }
+  h4 { margin-top:18px; color:var(--muted); }
+  .en { color:var(--muted); font-style:italic; font-size:0.92em; }
+  .meta { color:var(--muted); font-size:0.9em; }
+  table { border-collapse:collapse; width:100%; margin:14px 0; font-size:0.94em; background:#fff; color:#1d1d1f; }
+  th, td { border:1px solid var(--border); padding:8px 12px; text-align:left; vertical-align:top; background:#fff; color:#1d1d1f; }
+  th { background:#f0f3f6; color:#1d1d1f; font-weight:600; }
+  code { background:var(--code-bg); color:inherit; padding:1px 6px; border-radius:4px;
+         font-family:"JetBrains Mono",Menlo,Consolas,monospace; font-size:0.9em; }
+  pre { background:#1d1d1f; color:#f5f5f7; padding:14px 18px; border-radius:8px; overflow-x:auto;
+        font-size:13px; line-height:1.5; }
+  pre code { background:transparent; color:inherit; padding:0; }
+  .tag-good { color:var(--good); font-weight:600; }
+  .tag-warn { color:var(--warn); font-weight:600; }
+  .tag-bad  { color:var(--bad); font-weight:600; }
+  .tldr { background:#fff7e6; color:#1d1d1f; border-left:5px solid #ff9500; padding:14px 18px;
+          border-radius:0 6px 6px 0; margin:16px 0 24px; }
+  .callout { border-left:4px solid var(--warn); background:#fff8e6; color:#1d1d1f; padding:10px 14px; margin:14px 0; }
+  .callout.bad { border-color:var(--bad); background:#ffeef0; }
+  .callout.good { border-color:var(--good); background:#e6f4ea; }
+  svg { display:block; margin:16px auto; background:#fafafa; border-radius:8px; }
+  ul, ol { padding-left:24px; }
+  li { margin:5px 0; }
+  a { color:var(--accent); }
+</style>
+</head>
+<body>
+
+<h1>StarX-VLA 设计文档</h1>
+<p class="meta">StarVLA「搭积木」可插拔 × X-VLA「跨具身」soft-prompt 条件化 · 设计草案 v1 · 2026-06-08</p>
+<p class="en">Design for StarX-VLA: graft X-VLA's cross-embodiment conditioning (soft-prompt hub + domain-aware projections) onto StarVLA's lego-like swappable-backbone / swappable-head codebase. One checkpoint, many robots, riding the Qwen3-VL vision dividend.</p>
+
+<div class="tldr">
+<b>核心命题 / Thesis：</b>把 X-VLA 的<b>跨具身条件化机制</b>（<code>soft_prompt_hub</code> + <code>DomainAwareLinear</code>）从它自带的弱 backbone（Florence2 @224px）里<b>抽出来</b>，做成 StarVLA 的<b>第三根可插拔轴</b>，嫁接到冻结的 <b>Qwen3-VL</b> backbone + <b>PI_v3</b> action head 上。<br/>
+<b>一句话本质 / In one line：</b>StarVLA 给你「换骨干 × 换头」，X-VLA 给你「一个 ckpt 跨多机器人」——StarX-VLA = <b>三轴同时可插拔</b>（VLM backbone × <b>embodiment adapter</b> × action head），且让跨具身能力<b>吃上 Qwen3-VL 的高分辨率 vision 红利</b>（PickOrange 铁律：小橙子 10–40px 需 ≥448px，Florence2 的 224px 吃不下）。<br/>
+<span class="en">StarVLA = swap backbone × head. X-VLA = one checkpoint across robots. StarX-VLA = both, on a third pluggable axis, with X-VLA's embodiment conditioning finally riding a high-resolution Qwen3-VL backbone instead of Florence2@224.</span>
+</div>
+
+<div class="callout bad">
+<b>⚠️ 评审后定调（codex gpt-5.5 + mimo v2.5-pro 双独立审，均比对真源码，见 §13）：</b>这<b>不是「移植 X-VLA 条件化」，而是「受 X-VLA 启发、新建一个 domain-conditioned PI_v3 head」</b>——X-VLA 的 soft prompt 之所以有效，靠的是它那个<b>全可训练</b>的 24 层 transformer 协同适配；StarX 里 VLM 冻结、只有 PI_v3 head 可训，soft prompt 的语义已<b>改变</b>（变成 action DiT 的「逐机器人条件 token」，不再是通用 embodiment prompt）。<br/>
+<b>因此落地顺序倒过来（两审一致的头号建议）：先做不带 soft prompt 的最小版（V0），再按消融证据决定要不要加 soft prompt（V1）。</b>见 <b>§7.5 推荐落地顺序</b>。
+</div>
+
+<h2>1. 动机：两个框架各缺一半 · Why — each framework is half a solution</h2>
+
+<p>这个项目对 PickOrange 横评已经积累了两条硬结论，正好分别戳中两个框架的软肋：</p>
+<ul>
+<li><b>铁律 A（vision 分辨率）</b>：橙子在画面里只有 10–40px，<b>backbone 必须 ≥448px 动态分辨率</b>才看得清（见 <code>.memory/vla-pickorange-vision-resolution-selection</code>）。Qwen3-VL DeepStack + dynamic resolution 是已验证的赢家。</li>
+<li><b>铁律 B（head 选型）</b>：同 Qwen3-VL-8B 骨干下，<b>PI_v3 head（LayerwiseFM cross-DiT）= 63.3% &gt; GR00T head 53.3%</b>（已发布实锤），flow-matching 系显著优于离散 token。</li>
+</ul>
+
+<table>
+<tr><th>框架</th><th>强 / Strength</th><th>弱 / Weakness（对本任务）</th></tr>
+<tr><td><b>StarVLA</b></td><td>「搭积木」：VLM backbone（Qwen3-VL 2B/4B/8B）× action head（FAST/OFT/PI_v3/GR00T）自由组合；冻 VLM 只训 head；原生 LeRobot v3；<b>吃满 Qwen3-VL 高分辨率</b>（满足铁律 A+B）。</td><td><span class="tag-bad">锁单具身</span>。每个 ckpt 只服务一个机器人；PickOrange 60-demo 小数据 regime 峰值卡在 3–4 ep（18–63%）。换机器人 = 从头再训一个 head。</td></tr>
+<tr><td><b>X-VLA</b></td><td><span class="tag-good">跨具身是设计目标</span>：<code>soft_prompt_hub</code>（30 个 domain slot × 32 token）+ <code>DomainAwareLinear</code>（每具身独立投影）让一个主干服务 30 种 embodiment；新机器人只学一个 soft-prompt slot。</td><td><b>锁 Florence2 @224px</b>。backbone 写死、偏弱，<b>违反铁律 A</b>（224px 看不清 10–40px 小橙子）；想换强 backbone 要动主干。</td></tr>
+<tr><td><b>StarX-VLA</b></td><td colspan="2"><b>取两者交集</b>：StarVLA 的可插拔骨干/头（满足铁律 A+B）+ X-VLA 的跨具身条件化（一个 ckpt 跨机器人）。把「具身」升格为<b>第三根独立可插拔轴</b>。</td></tr>
+</table>
+
+<h2>2. 三问自检（Linus 模式）· Sanity check</h2>
+<table>
+<tr><th>问</th><th>答</th></tr>
+<tr><td><b>1. 真问题还是假想？</b></td><td><span class="tag-good">真问题</span>。当前 leaderboard 全是单具身 SO-101 ckpt，每个机器人从头训 head，且被 60-demo 小数据天花板压住。跨具身预训练（Bridge+RT-1+双臂+SO-101 共训）直接给 head 喂更多数据，攻击的正是这个天花板。X-VLA 已证明跨具身可行，但它的 224px backbone 看不清橙子——<b>缺的恰好是 StarVLA 的强 backbone</b>。</td></tr>
+<tr><td><b>2. 有更简单方案吗？</b></td><td>「直接用 X-VLA」最简单，但<b>过不了铁律 A</b>（Florence2 224px）。「直接用 StarVLA」过得了 vision 但<b>不跨具身</b>。两者都不可省——StarX-VLA 是<b>能同时满足铁律 A+B+跨具身的最小组合</b>，不是叠床架屋。</td></tr>
+<tr><td><b>3. 会破坏什么吗？</b></td><td><span class="tag-good">零破坏</span>。单具身退化 = 现有 QwenPI_v3 路径（见 §7 范式 3）。已发布的 <code>StarVLA-Qwen3-VL-8B-PI_v3</code> 就是 StarX-VLA 在「embodiment 数=1」下的特例。<b>Never break userspace</b>：旧 config 不改照跑。</td></tr>
+</table>
+
+<h2>3. 三轴可插拔架构 · Three pluggable axes</h2>
+
+<p>StarVLA 现在是<b>两轴</b>（backbone × head）。StarX-VLA 在两者之间插入<b>第三轴 = Embodiment Adapter</b>，三轴互相正交、各自可换。</p>
+
+<svg width="1000" height="430" viewBox="0 0 1000 430" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="ar" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#0a84ff"/>
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="1000" height="430" fill="#fafafa"/>
+  <text x="500" y="28" text-anchor="middle" font-size="15" font-weight="bold" fill="#1d1d1f">StarX-VLA — 三轴可插拔（VLM backbone × Embodiment Adapter × Action head）</text>
+
+  <!-- Inputs -->
+  <rect x="20" y="70" width="170" height="44" rx="8" fill="#eef4ff" stroke="#0a84ff" stroke-width="2"/>
+  <text x="105" y="88" text-anchor="middle" font-size="11" font-weight="bold" fill="#1d1d1f">多视角图像 + 语言</text>
+  <text x="105" y="104" text-anchor="middle" font-size="10" fill="#1d1d1f">front+wrist @≥448 · prompt</text>
+
+  <rect x="20" y="130" width="170" height="40" rx="8" fill="#eef4ff" stroke="#0a84ff" stroke-width="2"/>
+  <text x="105" y="148" text-anchor="middle" font-size="11" font-weight="bold" fill="#1d1d1f">proprio (state)</text>
+  <text x="105" y="163" text-anchor="middle" font-size="10" fill="#1d1d1f">6-DOF（按 spec 自动 pad）</text>
+
+  <rect x="20" y="186" width="170" height="44" rx="8" fill="#ffeef0" stroke="#cf222e" stroke-width="2"/>
+  <text x="105" y="204" text-anchor="middle" font-size="11" font-weight="bold" fill="#1d1d1f">embodiment_id</text>
+  <text x="105" y="220" text-anchor="middle" font-size="10" fill="#1d1d1f">选哪台机器人（slot 选择器）</text>
+
+  <!-- Axis 1: VLM -->
+  <rect x="225" y="70" width="200" height="170" rx="10" fill="#fff8e6" stroke="#d29922" stroke-width="2.5"/>
+  <text x="325" y="92" text-anchor="middle" font-size="13" font-weight="bold" fill="#1d1d1f">轴 1 · VLM backbone</text>
+  <text x="325" y="110" text-anchor="middle" font-size="10" fill="#555">frozen, output_hidden_states</text>
+  <rect x="240" y="122" width="170" height="22" rx="4" fill="#fffaf0" stroke="#d29922"/>
+  <text x="325" y="137" text-anchor="middle" font-size="10" fill="#1d1d1f">Qwen3-VL 2B/4B/8B ✅</text>
+  <rect x="240" y="150" width="170" height="22" rx="4" fill="#fffaf0" stroke="#d29922"/>
+  <text x="325" y="165" text-anchor="middle" font-size="10" fill="#1d1d1f">Qwen2.5-VL / Florence2</text>
+  <text x="325" y="192" text-anchor="middle" font-size="10" fill="#1d1d1f">逐层特征 (per-layer)</text>
+  <text x="325" y="210" text-anchor="middle" font-size="10" fill="#1d1d1f">供 PI_v3 LayerwiseFM 注入</text>
+  <text x="325" y="228" text-anchor="middle" font-size="9.5" fill="#1a7f37">铁律 A：≥448px 动态分辨率</text>
+
+  <!-- Axis 2: Embodiment adapter -->
+  <rect x="450" y="70" width="220" height="290" rx="10" fill="#f0e6ff" stroke="#7d3cff" stroke-width="3"/>
+  <text x="560" y="92" text-anchor="middle" font-size="13" font-weight="bold" fill="#1d1d1f">轴 2 · Embodiment Adapter</text>
+  <text x="560" y="108" text-anchor="middle" font-size="10" fill="#7d3cff">（NEW · 来自 X-VLA）</text>
+
+  <rect x="465" y="122" width="190" height="48" rx="4" fill="#faf5ff" stroke="#7d3cff"/>
+  <text x="560" y="140" text-anchor="middle" font-size="10.5" font-weight="bold" fill="#1d1d1f">soft_prompt_hub[emb_id]</text>
+  <text x="560" y="156" text-anchor="middle" font-size="9.5" fill="#1d1d1f">Embedding(N_emb, K×D) → K token</text>
+
+  <rect x="465" y="178" width="190" height="48" rx="4" fill="#faf5ff" stroke="#7d3cff"/>
+  <text x="560" y="196" text-anchor="middle" font-size="10.5" font-weight="bold" fill="#1d1d1f">DomainProj (proprio/action)</text>
+  <text x="560" y="212" text-anchor="middle" font-size="9.5" fill="#1d1d1f">每具身独立 in/out 投影</text>
+
+  <rect x="465" y="234" width="190" height="62" rx="4" fill="#fff" stroke="#7d3cff" stroke-dasharray="3,2"/>
+  <text x="560" y="252" text-anchor="middle" font-size="10.5" font-weight="bold" fill="#1d1d1f">EmbodimentSpec（数据结构）</text>
+  <text x="560" y="268" text-anchor="middle" font-size="9.5" fill="#1d1d1f">dof / gripper_idx / norm</text>
+  <text x="560" y="283" text-anchor="middle" font-size="9.5" fill="#cf222e">取代 X-VLA 6 个硬编码 action_mode</text>
+
+  <text x="560" y="318" text-anchor="middle" font-size="10" fill="#1d1d1f">通用 pad/unpad + gripper 路由</text>
+  <text x="560" y="336" text-anchor="middle" font-size="9.5" fill="#1d1d1f">加新机器人 = 加 1 条 spec</text>
+  <text x="560" y="352" text-anchor="middle" font-size="9.5" fill="#1d1d1f">+ reinit 1 个 slot（不写子类）</text>
+
+  <!-- Axis 3: Head -->
+  <rect x="695" y="70" width="200" height="170" rx="10" fill="#e6f4ea" stroke="#1a7f37" stroke-width="2.5"/>
+  <text x="795" y="92" text-anchor="middle" font-size="13" font-weight="bold" fill="#1d1d1f">轴 3 · Action head</text>
+  <rect x="710" y="104" width="170" height="22" rx="4" fill="#f0f7f3" stroke="#1a7f37"/>
+  <text x="795" y="119" text-anchor="middle" font-size="10" fill="#1d1d1f">PI_v3 (LayerwiseFM) ✅首选</text>
+  <rect x="710" y="132" width="170" height="22" rx="4" fill="#f0f7f3" stroke="#1a7f37"/>
+  <text x="795" y="147" text-anchor="middle" font-size="10" fill="#1d1d1f">GR00T (flow-matching)</text>
+  <rect x="710" y="160" width="170" height="22" rx="4" fill="#f0f7f3" stroke="#1a7f37"/>
+  <text x="795" y="175" text-anchor="middle" font-size="10" fill="#1d1d1f">OFT / FAST（对照）</text>
+  <text x="795" y="200" text-anchor="middle" font-size="10" fill="#1d1d1f">输出 padded action chunk</text>
+  <text x="795" y="218" text-anchor="middle" font-size="9.5" fill="#1a7f37">铁律 B：PI_v3 &gt; GR00T (+10pt)</text>
+
+  <!-- Output -->
+  <rect x="710" y="270" width="200" height="56" rx="8" fill="#eef4ff" stroke="#0a84ff" stroke-width="2"/>
+  <text x="810" y="292" text-anchor="middle" font-size="11" font-weight="bold" fill="#1d1d1f">EmbodimentSpec.unpad</text>
+  <text x="810" y="310" text-anchor="middle" font-size="10" fill="#1d1d1f">→ 真实 6-DOF action → sim</text>
+
+  <!-- Arrows -->
+  <line x1="190" y1="92" x2="223" y2="120" stroke="#0a84ff" stroke-width="2" marker-end="url(#ar)"/>
+  <line x1="190" y1="150" x2="448" y2="195" stroke="#0a84ff" stroke-width="1.6" stroke-dasharray="3,2" marker-end="url(#ar)"/>
+  <line x1="190" y1="208" x2="448" y2="150" stroke="#cf222e" stroke-width="1.6" stroke-dasharray="3,2" marker-end="url(#ar)"/>
+  <line x1="425" y1="155" x2="448" y2="155" stroke="#0a84ff" stroke-width="2.5" marker-end="url(#ar)"/>
+  <text x="437" y="148" font-size="8.5" fill="#555">feat</text>
+  <line x1="670" y1="155" x2="693" y2="155" stroke="#0a84ff" stroke-width="2.5" marker-end="url(#ar)"/>
+  <line x1="795" y1="240" x2="795" y2="268" stroke="#0a84ff" stroke-width="2" marker-end="url(#ar)"/>
+  <path d="M 670 240 Q 690 300 708 298" fill="none" stroke="#7d3cff" stroke-width="1.6" stroke-dasharray="3,2" marker-end="url(#ar)"/>
+  <text x="700" y="258" font-size="8.5" fill="#7d3cff">spec.unpad</text>
+</svg>
+
+<p><b>读图要点 / Reading the diagram：</b></p>
+<ul>
+<li><b>轴 1（backbone）</b>和 <b>轴 3（head）</b>是 StarVLA <b>已有</b>的两轴（冻 VLM、运行时按 VLM <code>hidden_size</code> 对齐）。</li>
+<li><b>轴 2（Embodiment Adapter）</b>是<b>新增</b>，从 X-VLA 抽取：<code>soft_prompt_hub</code> 提供每具身的 K 个 prompt token，<code>DomainProj</code> 提供每具身独立的 proprio/action 投影，<code>EmbodimentSpec</code> 驱动通用 pad/unpad。</li>
+<li>三轴正交：换 backbone 不动 adapter，换 head 不动 backbone，加机器人不动前两者。</li>
+</ul>
+
+<h2>4. 核心数据结构：EmbodimentSpec（消除 X-VLA 的特殊情况）· The good-taste move</h2>
+
+<div class="callout">
+<b>Linus 视角 · "好程序员关心数据结构"：</b>X-VLA 把每种机器人的通道语义<b>硬编码成一个子类</b>——<code>ee6d</code> / <code>joint</code> / <code>auto</code> / <code>so101_bimanual</code> / <code>agibot_ee6d</code> / <code>franka_joint7</code>，6+ 个类，每个 ~80 行、各自规定 gripper 放哪个 index、用 MSE 还是 BCE。<b>这就是「10 个 if/else」的味道</b>。加一台机器人就要写一个新子类（见 X-VLA 文档 P0d：写 <code>SingleArmSO101JointActionSpace</code> 子类 ~80 行 + 注册）。
+</div>
+
+<p><b>StarX-VLA 的做法：把 N 个特殊情况类压成 1 个数据结构 + 1 条通用路径。</b>机器人之间的差异本质只是<b>几个数字</b>（多少 DOF、gripper 在第几维、gripper 是连续还是二值、用什么归一化）——这些是<b>数据</b>，不该是<b>代码</b>。</p>
+
+<pre><code>@dataclass
+class EmbodimentSpec:
+    name: str            # "so101_single"
+    emb_id: int          # soft-prompt / domain slot 编号
+    state_dim: int       # 6   —— 真实 proprio 维度
+    action_dim: int      # 6   —— 真实 action 维度
+    gripper_idx: tuple   # (5,) —— 哪几维是夹爪
+    gripper_loss: str    # "mse" | "bce"
+    state_norm: str      # "mean_std"
+    action_norm: str     # "min_max"
+
+# 一个通用 adapter 读 spec —— 不再有 per-robot 子类
+class EmbodimentAdapter(nn.Module):
+    def __init__(self, specs: list[EmbodimentSpec], hidden, K, max_state, max_action):
+        self.soft_prompt = nn.Embedding(len(specs), K * hidden)   # 每具身 K 个 prompt token
+        self.proprio_proj = DomainProj(len(specs), max_state, hidden)
+        self.action_in    = DomainProj(len(specs), max_action, hidden)
+        self.action_out   = DomainProj(len(specs), hidden, max_action)
+        self.specs = {s.emb_id: s for s in specs}
+
+    def encode(self, proprio, emb_id):          # 入：spec 驱动 pad → 投影
+        spec = self.specs[emb_id]
+        x = pad_to(proprio, self.max_state)     # 通用 pad，无特殊情况
+        return self.proprio_proj(x, emb_id) + self.soft_prompt(emb_id)
+
+    def decode(self, h, emb_id):                # 出：投影 → spec 驱动 unpad + gripper 路由
+        spec = self.specs[emb_id]
+        a = self.action_out(h, emb_id)[..., :spec.action_dim]
+        return route_gripper(a, spec.gripper_idx, spec.gripper_loss)
+</code></pre>
+
+<table>
+<tr><th></th><th>X-VLA（现状）</th><th>StarX-VLA（本设计）</th></tr>
+<tr><td>加一台新机器人</td><td>写 ~80 行子类 + <code>@register_action</code> + 决定 channel layout</td><td><span class="tag-good">加 1 条 <code>EmbodimentSpec</code> 数据 + reinit 1 个 slot</span></td></tr>
+<tr><td>通道语义</td><td>散落在 6+ 个类里，易错配（gripper idx 5 vs 11 半对齐）</td><td><span class="tag-good">集中在 spec 一处声明，一眼可审</span></td></tr>
+<tr><td>gripper MSE/BCE</td><td>子类里硬编码</td><td><span class="tag-good">spec 字段，通用路由</span></td></tr>
+<tr><td>代码量</td><td>N 机器人 × 80 行</td><td><span class="tag-good">1 个 adapter + N 条数据</span></td></tr>
+</table>
+
+<p class="en">N special-case subclasses → 1 data structure + 1 generic path. This is the linked-list-deletion refactor applied to embodiment handling: the differences between robots are <b>data</b> (a few numbers), not <b>code</b>.</p>
+
+<div class="callout bad">
+<b>⚠️ 评审修正（两审一致，比对 <code>action_hub.py:55/530</code>）：纯数据不够，要「数据优先 + 命名 hook」。</b>X-VLA 的子类除了 channel layout，还编码了<b>真正需要代码</b>的行为：rotation 转换（ee6d 6D↔旋转）、delta vs absolute 控制、action clip/rate-limit、gripper sigmoid/hysteresis、双臂耦合、controller-specific 反归一化、preprocess 时把 dummy 维清零。这些<b>不能压成几个数字</b>。<br/>
+<b>修正后的 EmbodimentSpec = 数据字段 + 一组可选「命名 transform hook」</b>（按名字从注册表取函数，不是写子类）：
+<pre><code>@dataclass
+class GripperSpec:                 # gripper 升格为子结构（mimo 提）
+    idx: tuple                     # 可多维 / 双臂多组
+    loss: str                      # "mse" | "bce"
+    norm: tuple | None             # gripper 自己的反归一化（异构 gripper）
+
+@dataclass
+class EmbodimentSpec:
+    name: str; emb_id: int
+    state_dim: int; action_dim: int
+    grippers: list[GripperSpec]    # 支持双臂 / 多 DOF gripper
+    state_norm: str; action_norm: str
+    control_mode: str              # "absolute" | "delta"
+    pre_hooks:  list[str] = ()     # 命名 hook：rotation/zero-dummy/...
+    post_hooks: list[str] = ()     # 命名 hook：clip/rate-limit/unnorm/...
+</code></pre>
+数据先行、行为走注册表 hook——既消除了 N 个子类的重复，又不把<b>真需要代码</b>的逻辑硬塞进数据。<span class="tag-warn">「纯 data-only 是天真的」（codex 原话）。</span>
+</div>
+
+<div class="callout">
+<b>⚠️ DomainProj 参数爆炸（两审一致，比对 <code>soft_transformer.py:222</code>）：</b>X-VLA 的 <code>DomainAwareLinear</code> 把<b>每个 domain 的整张权重矩阵</b>存进 <code>nn.Embedding</code>。在 Qwen/PI 的 hidden（2560/4096）下，30 个 embodiment × 整张矩阵 = <b>参数暴涨 + 小 slot 过拟合</b>。<b>StarX 必须改用「共享 linear + per-domain 低秩/LoRA + 仿射」</b>，不要照搬 X-VLA 的整矩阵存法。且 DomainProj <b>只插在 head 的输入/输出端</b>（2 处），<b>不要每层 DiT 都插</b>。
+</div>
+
+<h2>5. 跨具身条件化注入点：head 侧、落在 PI_v3 · Where conditioning is injected</h2>
+
+<p>X-VLA 的 soft prompt / DomainAwareLinear 原本是给它<b>可训练的 24 层 SoftPromptedTransformer</b>（那个 transformer 本身就是 policy）设计的。但 StarX-VLA 里 <b>VLM 冻结、head 才是被训的小模块</b>——条件化该注到哪？</p>
+
+<table>
+<tr><th>方案</th><th>注入位置</th><th>评价</th></tr>
+<tr><td>(a) prompt 侧</td><td>soft-prompt token 拼到<b>冻结 VLM 的输入序列</b>（P-tuning 风格 prefix）</td><td>🟡 干净，但 VLM 冻结时 prefix 离 action 输出太远，条件化信号衰减；且每加一具身要重跑 VLM 前向。</td></tr>
+<tr><td>(b) head 侧 ✅</td><td>soft-prompt token 注入 <b>PI_v3 head 的逐层 cross-attention</b>；<code>DomainProj</code> 替换 head 的 proprio/action in/out 投影</td><td><span class="tag-good">最佳契合</span>。PI_v3 LayerwiseFM <b>本就逐 VLM 层做 cross-attention 注入</b>——这正是 soft prompt 最想待的地方。条件化紧贴 action，且 emb_id 只是选 slot，<b>不增加 VLM 前向成本</b>。</td></tr>
+</table>
+
+<div class="callout good">
+<b>设计决策：走 (b)，宿主选 PI_v3。</b>理由有二：(1) 铁律 B —— PI_v3 已实测 63.3% &gt; GR00T 53.3%，是当前最强 head；(2) PI_v3 的 LayerwiseFM cross-DiT <b>结构上就是逐层注入</b>，把 X-VLA 的 soft prompt 接进它的 cross-attention KV，是<b>顺势而为</b>而非硬塞。GR00T head 作对照（末层注入，预期条件化偏弱）。
+</div>
+
+<div class="callout bad">
+<b>⚠️ 评审修正 1 —— 不是「每层」，是「每偶数层」（mimo，比对 PI_v3 <code>interleave_self_attention=True</code>）：</b>PI_v3 默认<b>奇数层是纯 self-attention、忽略 <code>encoder_hidden_states</code></b>；Qwen3-VL-8B 36 层里只有 <b>18 层（偶数层）</b>做 cross-attention。所以 soft prompt 实际注入点是 18 个，不是 36。上方 SVG 的「逐层」应读作「逐 cross-attn 层」。<br/>
+<b>⚠️ 评审修正 2 —— KV 直接 concat 会让 DiT 忽略 VLM 特征 / 过拟合 emb_id（codex，比对 <code>LayerwiseFM_ActionHeader.py:335</code>）：</b>PI_v3 每个 block cross-attend 到 <code>vl_embs_list[layer_idx]</code>；在 KV 里硬塞 K 个学习 token，可能<b>盖过真正的 VLM 视觉/语言特征</b>。<b>必带门控</b>：
+<pre><code># 逐 cross-attn 层 gated 注入，alpha_l 初始化为 0
+KV_l = vl_embs_list[l]  ⊕  alpha_l * prompt_proj(soft_prompt[emb_id])
+# alpha_l = nn.Parameter(0.0)  → 训练初期 KV ≡ 原 PI_v3</code></pre>
+<b>alpha_l 初始化 0</b> 的关键收益：<b>N_emb=1 时模型逐位等于原 PI_v3</b> → §8 的 E0 复现 63.3% 才真有意义（否则 adapter 一接上就改了数值，E0 不再是干净基线）。这也直接兑现 §2 的「零破坏」承诺。
+</div>
+
+<svg width="900" height="280" viewBox="0 0 900 280" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="ar2" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#1a7f37"/>
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="900" height="280" fill="#fafafa"/>
+  <text x="450" y="26" text-anchor="middle" font-size="13" font-weight="bold" fill="#1d1d1f">soft prompt 注入 PI_v3 LayerwiseFM 的逐层 cross-attention</text>
+
+  <!-- VLM layers -->
+  <rect x="30" y="60" width="150" height="180" rx="8" fill="#fff8e6" stroke="#d29922" stroke-width="2"/>
+  <text x="105" y="80" text-anchor="middle" font-size="11" font-weight="bold" fill="#1d1d1f">Qwen3-VL（冻结）</text>
+  <text x="105" y="100" text-anchor="middle" font-size="9" fill="#555">逐层 hidden states</text>
+  <rect x="45" y="112" width="120" height="24" rx="3" fill="#fffaf0" stroke="#d29922"/><text x="105" y="128" text-anchor="middle" font-size="9" fill="#1d1d1f">layer L₁ feat</text>
+  <rect x="45" y="146" width="120" height="24" rx="3" fill="#fffaf0" stroke="#d29922"/><text x="105" y="162" text-anchor="middle" font-size="9" fill="#1d1d1f">layer Lᵢ feat</text>
+  <rect x="45" y="180" width="120" height="24" rx="3" fill="#fffaf0" stroke="#d29922"/><text x="105" y="196" text-anchor="middle" font-size="9" fill="#1d1d1f">layer Lₙ feat</text>
+
+  <!-- soft prompt -->
+  <rect x="30" y="20" width="150" height="30" rx="6" fill="#f0e6ff" stroke="#7d3cff" stroke-width="2"/>
+  <text x="105" y="40" text-anchor="middle" font-size="10" font-weight="bold" fill="#1d1d1f">soft_prompt[emb_id] (K×D)</text>
+
+  <!-- PI_v3 cross-DiT stack -->
+  <rect x="320" y="50" width="260" height="200" rx="8" fill="#e6f4ea" stroke="#1a7f37" stroke-width="2.5"/>
+  <text x="450" y="72" text-anchor="middle" font-size="12" font-weight="bold" fill="#1d1d1f">PI_v3 LayerwiseFM cross-DiT</text>
+  <rect x="338" y="86" width="224" height="44" rx="4" fill="#f0f7f3" stroke="#1a7f37"/>
+  <text x="450" y="104" text-anchor="middle" font-size="10" fill="#1d1d1f">DiT block ← cross-attn(VLM Lᵢ ⊕ soft_prompt)</text>
+  <text x="450" y="120" text-anchor="middle" font-size="9" fill="#555">KV = concat(layer feat, soft prompt token)</text>
+  <rect x="338" y="138" width="224" height="44" rx="4" fill="#f0f7f3" stroke="#1a7f37"/>
+  <text x="450" y="156" text-anchor="middle" font-size="10" fill="#1d1d1f">DiT block ← cross-attn(VLM Lⱼ ⊕ soft_prompt)</text>
+  <text x="450" y="172" text-anchor="middle" font-size="9" fill="#555">flow-matching denoise（共享 expert）</text>
+  <rect x="338" y="190" width="224" height="44" rx="4" fill="#f0f7f3" stroke="#1a7f37"/>
+  <text x="450" y="208" text-anchor="middle" font-size="10" fill="#1d1d1f">DomainProj 出投影（per emb_id）</text>
+  <text x="450" y="224" text-anchor="middle" font-size="9" fill="#555">→ padded action chunk</text>
+
+  <!-- output -->
+  <rect x="700" y="120" width="160" height="60" rx="8" fill="#eef4ff" stroke="#0a84ff" stroke-width="2"/>
+  <text x="780" y="144" text-anchor="middle" font-size="10.5" font-weight="bold" fill="#1d1d1f">spec.unpad</text>
+  <text x="780" y="162" text-anchor="middle" font-size="9.5" fill="#1d1d1f">→ 真实 DOF action</text>
+
+  <!-- arrows -->
+  <line x1="180" y1="124" x2="336" y2="108" stroke="#1a7f37" stroke-width="1.6" marker-end="url(#ar2)"/>
+  <line x1="180" y1="158" x2="336" y2="160" stroke="#1a7f37" stroke-width="1.6" marker-end="url(#ar2)"/>
+  <line x1="180" y1="35" x2="336" y2="95" stroke="#7d3cff" stroke-width="1.6" stroke-dasharray="3,2" marker-end="url(#ar2)"/>
+  <line x1="580" y1="150" x2="698" y2="150" stroke="#1a7f37" stroke-width="2" marker-end="url(#ar2)"/>
+</svg>
+
+<h2>6. 维度对齐：两套机制正交、不冲突 · Dimension alignment — two orthogonal axes</h2>
+
+<div class="callout">
+<b>易混点（必须钉死）：</b>StarVLA 和 X-VLA 各有一套「维度对齐」，<b>层级完全不同，不要混为一谈</b>：
+</div>
+<table>
+<tr><th>机制</th><th>对齐什么</th><th>谁负责</th><th>StarX-VLA 处理</th></tr>
+<tr><td><b>hidden_size 对齐</b>（StarVLA）</td><td><b>特征维</b>：head 的 cross-attention dim 运行时对齐到所加载 VLM 的 <code>hidden_size</code>（2B=2048 / 4B=2560 / 8B=4096）</td><td>head（QwenGR00T.py:155 / PI_v3）</td><td><span class="tag-good">原样保留</span>。换 backbone 自动对齐，adapter 不掺和。</td></tr>
+<tr><td><b>action/state padding</b>（X-VLA）</td><td><b>动作空间维</b>：不同机器人 DOF 不同，统一 pad 到 <code>max_state</code>/<code>max_action</code>，且 gripper 必须落在约定 index</td><td>Embodiment Adapter（EmbodimentSpec）</td><td><span class="tag-good">由 spec 驱动</span>，集中声明、通用 pad/unpad。</td></tr>
+</table>
+<p>一个管<b>特征宽度</b>（跟 backbone 走），一个管<b>动作语义布局</b>（跟机器人走）——正交，互不干扰。这正是三轴可插拔成立的前提。</p>
+
+<h2>7. 三种训练范式 · Three training regimes</h2>
+
+<table>
+<tr><th>范式</th><th>冻 / 训</th><th>数据</th><th>用途</th></tr>
+<tr><td><b>1. 跨具身共训<br/>Co-train</b></td><td>冻 VLM；训 PI_v3 head + <b>全部 soft-prompt slot</b> + DomainProj</td><td>{Bridge, RT-1, 双臂, SO-101} 混合，<b>温度采样平衡</b>（见风险 R3）</td><td>预训练一个跨具身 ckpt，攻击 60-demo 小数据天花板。</td></tr>
+<tr><td><b>2. 新具身适配<br/>Adapt</b><br/><span class="tag-bad">⚠️未验证</span></td><td>冻 VLM + <b>冻共享 head</b>；只训<b>新 emb_id 的 1 个 slot + 它的 DomainProj</b></td><td>新机器人少量 demo（如 SO-101 60 demo）</td><td><b>存在性存疑（两审头号风险）</b>：一个冻住的 head 凭什么被「它从没针对训练过的新 slot」引导？X-VLA 没这问题因为它的 transformer 是活的、会适应新 slot。<b>前提条件</b>：范式 1 共训时必须用 <b>prompt-dropout / 多 slot 泛化训练</b>让 head 学会「读任意 slot」，且新机器人若 <b>控制模式/运动学</b>与预训练集差异大，单 slot+投影<b>救不了</b>共享去噪向量场（codex）。见 §10 R7。</td></tr>
+<tr><td><b>3. 单具身<br/>Single（= 现状）</b></td><td>冻 VLM；训 PI_v3 head（embodiment 数=1，slot 退化）</td><td>单机器人 SO-101</td><td><span class="tag-good">向后兼容</span>：完全等价现有 QwenPI_v3。已发布的 8B-PI_v3 ckpt 就是这个特例。</td></tr>
+</table>
+
+<div class="callout good">
+<b>不破坏保证：</b>范式 3 让 StarX-VLA 在 N_emb=1 时<b>逐位退化</b>为现有 StarVLA QwenPI_v3（配合 §5 的 alpha_l=0 门控初始化，是<b>数值逐位</b>等价，不只是「概念等价」）。新框架是<b>超集</b>，不是替代——旧 config、旧 ckpt 照常工作。
+</div>
+
+<h2>7.5 推荐落地顺序：先 V0（无 soft prompt），再按证据上 V1 · Build order</h2>
+
+<div class="callout good">
+<b>两审独立给出几乎相同的头号建议：soft prompt 不是起点，是「证明 I/O 投影不够」之后才加的可选项。</b>「最小有用轴 = EmbodimentSpec + DomainProj；soft prompt 在被证明必要前都是可选的」（codex）。「先试无 soft prompt 的跨具身共训——最小改动、零风险、实现量是 StarX 的 1/3、风险是它的 0」（mimo）。
+</div>
+
+<table>
+<tr><th>阶段</th><th>做什么</th><th>验证 / 决策门</th></tr>
+<tr><td><b>V0（先做）</b><br/>无 soft prompt 的跨具身共训</td><td>多数据集混训 PI_v3 head：统一 <code>EmbodimentSpec</code> 做 pad/unpad + <b>DomainProj 只在 I/O 端</b> + domain-balanced 采样。<b>不要 soft prompt、不要每层 DomainAwareLinear。</b>把跨具身当「更多 head 数据 + 正则」而非条件化机制——flow-matching 去噪器本就学「VLM feature → action」的通用映射。</td><td>跑 E1：V0 在 SO-101 strict 20-round 是否 &gt; 单具身 63.3%？<b>若 V0 就赢 → soft prompt 整个故事不必要，到此为止</b>（codex/mimo 都明确这条退出）。</td></tr>
+<tr><td><b>V1（仅当 V0 不够）</b><br/>加 gated soft prompt</td><td>仅当消融证明「I/O 投影 + domain-balanced 共训」不足以区分 embodiment 时，才按 §5 加<b>带门控（alpha_l=0 初始化）</b>的逐 cross-attn 层 soft prompt + 范式 1 的 prompt-dropout 训练（为范式 2 适配铺路）。</td><td>V1 相对 V0 的<b>净增益</b>必须 &gt; 它带来的复杂度/参数成本，否则回退 V0。</td></tr>
+</table>
+
+<p><b>这把原设计从「一步到位三轴」改为「证据驱动渐进」</b>：V0 本身已是完整可发布的跨具身 PI_v3；soft prompt（轴 2 的「条件 token」部分）降级为<b>待证伪的增强</b>，而 <code>EmbodimentSpec + DomainProj</code>（轴 2 的「动作空间统一」部分）是无论如何都要的地基。</p>
+
+<h2>8. 在 SO-101 PickOrange 上的验证计划 · Validation</h2>
+
+<p>不搞空想，用项目已有的 strict 20-round leaderboard 当标尺，做一个能<b>证伪</b>的实验阶梯：</p>
+<ol>
+<li><b>E0 基线对齐</b>：StarX-VLA 范式 3（N_emb=1, SO-101 only）应<b>复现</b>现有 PI_v3-8B 的 63.3%。复现不出来 = adapter 接错，先修。</li>
+<li><b>E1 跨具身预训练增益（用 V0 跑）</b>：<b>V0 = 无 soft prompt</b> 的多数据集共训 {Bridge + RT-1 + SO-101}（统一 spec + I/O DomainProj + domain-balanced 采样），再在 SO-101 上 strict 20-round。<b>假设：V0 &gt; 纯 SO-101 63.3%</b>（更多 head 数据 + 正则）。<span class="tag-warn">这是整个设计的决策门：V0 不赢，soft prompt 也大概率救不回来；V0 赢，则 soft prompt 是否还需要由 E1b 定。</span></li>
+<li><b>E1b 关键消融（决定 soft prompt 存废）</b>：V0（无 soft prompt，仅 domain-balanced + I/O 投影 + robot-ID one-hot）vs V1（加 gated soft prompt）。<b>若 V0 ≈ V1 → soft prompt 故事被证伪，砍掉</b>（两审都要求这个消融）。</li>
+<li><b>E2 适配效率（仅当 V1 立住）</b>：范式 2，冻共享 head 只学 SO-101 slot。<b>假设：用 &lt;5% 参数、&lt;10% 训练步达到 E1 的大部分性能</b>——但前提是范式 1 用 prompt-dropout 训过（见 §10 R7）；这是跨具身的省钱卖点，也是<b>最可能失败</b>的一环。</li>
+<li><b>E3 head 消融</b>：同上但换 GR00T head，验证「PI_v3 的逐 cross-attn 层注入比 GR00T 末层注入更吃 soft prompt」。</li>
+</ol>
+
+<div class="callout">
+<b>诚实边界 / Honest scope：</b>
+<ul>
+<li>所有「&gt;63.3%」是<b>假设</b>，不是承诺。跨具身预训练能否突破小数据天花板，<b>要 E1 真跑出来</b>。两审都指出：<b>X-VLA 自己在 SO-101 从 1/9 慢慢爬，这是「冷启动没那么惨」的证据，不是「跨具身给了大 boost」的证据</b>——「突破 63.3% 天花板」可能过于乐观，真增益更可能来自「更多 head 数据」而非 soft prompt 本身。</li>
+<li>多数据集共训的<b>采样平衡 + 数据清洗</b>是成败关键：Bridge 巨大且含大量<b>失败轨迹 / 人类抖动 / 静止帧</b>，SO-101 仅 60 条干净 demo——光温度采样不够，<b>需去失败轨迹、去静止帧</b>，否则干净小数据被噪声淹没（mimo）。</li>
+<li><b>数据语义错配 &gt; 架构风险（两审一致，列为头号风险 R0）</b>：Bridge/RT-1/SO-101 在 <b>相机位姿、action frame、控制频率、gripper 编码、horizon、归一化</b>上各不相同，盲混会教给共享 head <b>互相矛盾的动力学</b>。这是比「soft prompt 怎么接」更先要解决的问题。</li>
+<li>本设计是<b>架构方案</b>；真正 ROI 排序仍按 <code>.memory/vla-distill-data-diversity-roi</code>：prompt 多样性 &gt; DR &gt; multi-clip &gt; 训更长。跨具身属于「multi-embodiment」一类，ROI 待标定。</li>
+</ul>
+</div>
+
+<h2>9. 实现 Phases · Implementation</h2>
+<table>
+<tr><th>Phase</th><th>内容</th><th>预算</th></tr>
+<tr><td><b>P0</b></td><td>读 X-VLA <code>soft_transformer.py</code>（<code>DomainAwareLinear</code> 215 / <code>soft_prompt_hub</code> 340）+ StarVLA PI_v3 head 源码，确认 cross-attention KV 接口能塞 soft prompt token。</td><td>~半天</td></tr>
+<tr><td><b>P1</b></td><td>实现 <code>EmbodimentSpec</code> + <code>EmbodimentAdapter</code>（§4 代码骨架），单元测试 pad/unpad/gripper 路由 round-trip。</td><td>~1 天</td></tr>
+<tr><td><b>P2</b></td><td>把 adapter 接进 PI_v3 head 的逐层 cross-attention（§5 方案 b）；N_emb=1 smoke 500 step（铁律：先验"臂会动"，见 <code>.memory/feedback-smoke-500step-quick-gate</code>）。</td><td>~1 天</td></tr>
+<tr><td><b>P3 / E0</b></td><td>范式 3 全量训 SO-101，strict 20-round 复现 63.3%（max ~6 ep，best 3–4 ep，见 <code>.memory/feedback-vla-epoch-budget-6ep</code>）。</td><td>~1 天训 + eval</td></tr>
+<tr><td><b>P4 / E1–E3</b></td><td>引入 Bridge/RT-1，范式 1 共训 + 范式 2 适配 + head 消融。</td><td>多天（云端）</td></tr>
+</table>
+
+<h2>10. 风险清单 · Risks</h2>
+<table>
+<tr><th>风险</th><th>概率</th><th>影响</th><th>缓解</th></tr>
+<tr><td><b>R0 数据语义错配（两审列为头号）</b>：相机位姿/action frame/控制频率/gripper 编码/归一化跨数据集不一致 → 教给共享 head 矛盾动力学</td><td>高</td><td>致命</td><td>先做数据审计 + 统一帧/频率/归一化 + 去失败轨迹去静止帧；这比 soft prompt 怎么接更优先。属于 V0 的前置工作。</td></tr>
+<tr><td><b>R1 soft prompt 接 PI_v3 cross-attn KV 盖过 VLM 特征 / 过拟合 emb_id</b></td><td>中</td><td>高</td><td>门控注入 alpha_l=0 初始化（§5）；消融注入深度；N_emb=1 必须数值复现原 PI_v3。</td></tr>
+<tr><td><b>R2 冻结 VLM 下条件化信号太弱</b>（X-VLA 原本主干可训，这里主干冻）</td><td>中</td><td>中</td><td>走 head 侧注入（§5 方案 b）让条件化紧贴 action；必要时给 soft prompt 更大 K 或解冻 head 顶层。</td></tr>
+<tr><td><b>R3 多数据集采样不平衡饿死 SO-101</b>（Bridge 巨 vs 60 demo）</td><td>高</td><td>高</td><td>温度采样 / 每 embodiment 配额；E1 监控 SO-101 子集 loss 单独下降。</td></tr>
+<tr><td><b>R4 通道语义对齐错</b>（gripper idx 跨具身放错维）</td><td>中</td><td>高</td><td>EmbodimentSpec 集中声明 + round-trip 单测（P1）；这正是 spec 取代散落子类要解决的问题。</td></tr>
+<tr><td><b>R5 跨具身预训练无增益</b>（小数据天花板是 vision/data 本质限制，不是 head 容量）</td><td>中</td><td>中</td><td>E1 可证伪；若无增益则结论本身有价值（负面归档，见项目惯例），退回范式 3 等价现状、零损失。</td></tr>
+<tr><td><b>R7 范式 2（冻 head + 新 slot）根本不工作</b>：冻住的 head 无法被「从未训练过的新 slot」引导（soft prompt 的有效性本依赖可训练 backbone）</td><td>高</td><td>高</td><td>范式 1 共训必须 <b>prompt-dropout / 多 slot 泛化</b>训练让 head 学会「读任意 slot」；控制模式/运动学差异大的新机器人单 slot 救不了 → 退回少量解冻 head 顶层或小规模微调。E2 先证伪再依赖。</td></tr>
+<tr><td><b>R8 DomainProj/DomainAwareLinear 参数爆炸 + 小 slot 过拟合</b>（X-VLA 存整张 per-domain 矩阵）</td><td>中</td><td>中</td><td>改用共享 linear + per-domain 低秩/LoRA + 仿射；DomainProj 只插 I/O 端、不每层插（§4）。</td></tr>
+<tr><td>R6 显存：跨具身共训 batch 内多 embodiment</td><td>低</td><td>中</td><td>8B PI_v3 冻 VLM 在 4090-48G 占 43.7G；共训不增 VLM 成本，主要是 dataloader。OOM 第一杠杆仍是 <code>repeated_diffusion_steps</code>（见 <code>.memory/starvla-vlm-variant-2b-4b-8b</code>）。</td></tr>
+</table>
+
+<h2>11. 取舍对照 · Trade-off table</h2>
+<table>
+<tr><th>维度</th><th>StarVLA</th><th>X-VLA</th><th>StarX-VLA（本设计）</th></tr>
+<tr><td>backbone 可换</td><td><span class="tag-good">✅ 2B/4B/8B</span></td><td><span class="tag-bad">✗ 锁 Florence2</span></td><td><span class="tag-good">✅ 继承 StarVLA</span></td></tr>
+<tr><td>vision 分辨率（铁律 A）</td><td><span class="tag-good">✅ ≥448 动态</span></td><td><span class="tag-bad">✗ 224px</span></td><td><span class="tag-good">✅</span></td></tr>
+<tr><td>head 可换（铁律 B）</td><td><span class="tag-good">✅ 4 选</span></td><td>🟡 action_mode 多但绑主干</td><td><span class="tag-good">✅ PI_v3 首选</span></td></tr>
+<tr><td>跨具身（一 ckpt 多机器人）</td><td><span class="tag-bad">✗ 单具身</span></td><td><span class="tag-good">✅ 30 slot</span></td><td><span class="tag-good">✅ 继承 X-VLA</span></td></tr>
+<tr><td>加新机器人成本</td><td>从头训 head</td><td>写 ~80 行子类</td><td><span class="tag-good">+1 条 spec + 1 slot</span></td></tr>
+<tr><td>新具身适配参数量</td><td>整个 head</td><td>1 soft-prompt slot</td><td><span class="tag-good">1 slot + DomainProj</span></td></tr>
+<tr><td>向后兼容</td><td>—</td><td>—</td><td><span class="tag-good">✅ N_emb=1 退化为 StarVLA</span></td></tr>
+<tr><td>工程成熟度</td><td><span class="tag-good">已发布多 ckpt</span></td><td><span class="tag-good">lerobot 原生</span></td><td><span class="tag-warn">⚠️ 待实现（本文）</span></td></tr>
+</table>
+
+<h2>12. 开放问题 · Open questions</h2>
+<ul>
+<li><b>Q1</b>：soft prompt 注入 PI_v3 应该<b>每层都注</b>（同 LayerwiseFM 逐层）还是<b>只注前几层</b>？逐层更强但参数/算力更多。</li>
+<li><b>Q2</b>：<code>DomainProj</code> 用 X-VLA 的「每 domain 独立全套权重」（参数随 N_emb 线性涨）还是「低秩 per-domain LoRA」（更省，但容量上限低）？小数据下后者可能更稳。</li>
+<li><b>Q3</b>：跨具身预训练用<b>现成 X-VLA base 的 soft prompt 权重</b>初始化（但它配 Florence2，特征空间不同，未必可迁），还是<b>全新随机初始化</b>？倾向后者 + 借 StarVLA 已发布的 Bridge-RT-1 PI_v3 ckpt 暖启 head。</li>
+<li><b>Q4</b>：gripper 跨具身语义不一致（SO-101 连续度数 vs Bridge 二值）——EmbodimentSpec 的 <code>gripper_loss</code> 字段够不够？是否需要每具身独立 gripper 反归一化表？</li>
+</ul>
+
+<h2>13. 评审记录 · Review log</h2>
+<p class="meta">2026-06-08 两个独立模型评审，<b>均自行读取并比对了 X-VLA / PI_v3 真源码</b>（非泛泛而谈）。结论高度一致，已据此把设计从「一步到位三轴」改为「证据驱动渐进（V0→V1）」。见 <code>.memory/feedback-mimo-independent-review</code> 习惯。</p>
+
+<div class="callout good">
+<b>两审一致的核心结论（已全部纳入修订）：</b>
+<ol>
+<li><b>重新定性</b>：这不是「移植 X-VLA 条件化」，而是「受启发新建 domain-conditioned PI_v3 head」——X-VLA soft prompt 的有效性依赖<b>全可训练</b>的 transformer，StarX 里 VLM 冻结后语义已变。→ 改 TL;DR + §7.5。</li>
+<li><b>先做 V0（无 soft prompt）</b>：最小有用轴 = <code>EmbodimentSpec + DomainProj</code>；soft prompt 在消融证明必要前都是可选项。「实现量 1/3、风险 0」。→ 新增 §7.5 + 改 §8 E1/E1b 决策门。</li>
+<li><b>范式 2（冻 head + 新 slot）存在性存疑</b>：冻住的 head 无法被没训练过的新 slot 引导。→ §7 标「未验证」+ §10 R7。</li>
+<li><b>EmbodimentSpec 纯数据不够</b>：rotation/delta/clip/gripper hysteresis/双臂耦合需代码 → 「数据优先 + 命名 hook」+ GripperSpec 子结构。→ 改 §4。</li>
+<li><b>DomainAwareLinear 参数爆炸</b>：X-VLA 存整张 per-domain 矩阵，StarX 须改低秩/LoRA + 只插 I/O 端。→ §4 + §10 R8。</li>
+<li><b>数据语义错配 &gt; 架构风险</b>：列为头号 R0。→ §8 honest scope + §10 R0。</li>
+</ol>
+</div>
+
+<div class="callout" id="review-codex"><b>codex gpt-5.5（要点）：</b>
+<ul>
+<li>「不是 grafting，是 build a new domain-conditioned PI_v3 head inspired by X-VLA」；soft prompt 变成 action DiT 的逐机器人条件 token。</li>
+<li>head-side 注入方向对，但 KV 直接 concat 会让 DiT 忽略 <code>vl_embs_list[layer_idx]</code>（<code>LayerwiseFM_ActionHeader.py:335</code>）→ <b>必带 gated adapter，alpha_l=0 初始化</b>，使 N_emb=1 数值近似原 PI_v3、E0 才有意义。</li>
+<li>EmbodimentSpec 要 data-first + named transform hooks；「pure data-only is naive」（引 <code>action_hub.py:55/530</code>）。</li>
+<li>E1 plausible not strong；真增益多半来自「更多 head 数据」，<b>需做 no-soft-prompt + robot-ID one-hot 的消融</b>，赢了则 soft prompt 故事不必要。</li>
+<li>最小有用轴 = <code>EmbodimentSpec + DomainProj</code>，soft prompt optional until proven。</li>
+</ul>
+</div>
+
+<div class="callout" id="review-mimo"><b>opencode mimo-v2.5-pro（要点）：</b>
+<ul>
+<li><b>致命问题 = 范式 2 的存在性</b>：随机初始化的新 slot 想影响冻住的 head，信号传不出去；X-VLA 无此问题因 transformer 是活的。</li>
+<li>PI_v3 <code>interleave_self_attention=True</code> → <b>只有偶数层（18/36）做 cross-attention</b>，「每层注入」实为「每偶数层」，设计图需声明。</li>
+<li>gripper 需子结构（双臂多 idx / 多 DOF / 各自 norm）。</li>
+<li>Bridge/RT-1 含失败轨迹+抖动，PI_v3 head 容量小于 X-VLA 24 层 transformer，<b>需数据清洗</b>，否则 60 条干净 demo 被淹没；X-VLA 自身增益更像「冷启动没那么惨」而非大 boost。</li>
+<li><b>更简单替代</b>：无 soft prompt 的跨具身共训（统一 spec pad/unpad + I/O DomainProj + domain-balanced），把跨具身当数据增强；「先试这个，失败再加 soft prompt」。</li>
+<li>评分：🟡 凑合 —— 方向对但过度设计。</li>
+</ul>
+</div>
+
+<p class="meta">原始评审全文存于 <code>/tmp/starx_codex_review.txt</code> 与 <code>/tmp/starx_mimo_review.txt</code>（会话内）。</p>
+
+<h2>14. 来源 · Sources</h2>
+<ul>
+<li><a href="xvla_finetune_plan.html">xvla_finetune_plan.html</a> — X-VLA 架构逐行确认（Florence2 + SoftPromptedTransformer + DomainAwareLinear + soft_prompt_hub + rectified-flow）</li>
+<li><a href="starvla_qwen3vl_finetune_plan.html">starvla_qwen3vl_finetune_plan.html</a> — StarVLA 框架 + Qwen3-VL backbone + 4 种 head</li>
+<li><a href="training_roadmap.html">training_roadmap.html</a> — 多策略路线图</li>
+<li><code>.memory/vla-pickorange-vision-resolution-selection</code> — 铁律 A（vision 分辨率）</li>
+<li><code>.memory/starvla-vlm-variant-2b-4b-8b</code> — backbone 可换零源码改动 + 显存</li>
+<li><code>.memory/three-box-sweep-live-state</code> — PI_v3 head &gt; GR00T head 实锤（铁律 B）</li>
+<li>StarVLA: <a href="https://github.com/starVLA/starVLA">github.com/starVLA/starVLA</a>（MIT）· X-VLA: <code>lerobot.policies.xvla</code></li>
+</ul>
+
+</body>
+</html>

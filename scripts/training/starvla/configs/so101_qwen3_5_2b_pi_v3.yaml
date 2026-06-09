@@ -1,0 +1,72 @@
+# SO-101 PickOrange — StarVLA QwenPI_v3 (Qwen3.5-2B vision + PI_v3 LayerwiseFM head)
+# Pivot from the abandoned Qwen3-VL-2B + GR00T run (0-1/9 sweep). Qwen3.5-2B is natively
+# multimodal (vision_config: ViT depth24/patch16/out_hidden 2048, text hidden 2048, 24 layers).
+# StarVLA selects _QWen3_5_VL_Interface automatically because base_vlm path contains "Qwen3.5".
+#
+# Zero-source-change backbone swap: QwenPI_v3 auto-overrides vl_hidden_dim (->2048) and
+# num_vl_layers (->24) at runtime from the loaded VLM, and sets the LayerwiseFM DiT depth =
+# num_vl_layers (24) + builds project_layers (VL hidden 2048 -> action_dit_hidden_dim 1024)
+# at that dim. So the only required change vs the 8B PI_v3 config is base_vlm.
+#
+# ⚠️ REQUIRES transformers >= 5.2.0 (Qwen3_5ForConditionalGeneration); the box env was
+# upgraded 4.57.0 -> 5.2.0 for this. Qwen3-VL/Cosmos runs stay on their own 4.57 envs.
+run_id: so101_qwen3_5_2b_pi_v3
+run_root_dir: /root/autodl-tmp/starvla-outputs
+seed: 42
+wandb_entity: ""
+wandb_project: starVLA_SO101
+is_debug: false
+version_id: "0.21"
+
+framework:
+  name: QwenPI_v3
+  qwenvl:
+    base_vlm: /root/autodl-tmp/models/Qwen3.5-2B
+    attn_implementation: flash_attention_2
+    vl_hidden_dim: 2048            # Qwen3.5-2B text hidden; auto-overridden at runtime, kept
+                                   # correct for hygiene (PI_v3 project_layers read it).
+  action_model:
+    action_model_type: LayerwiseFM   # PI_v3 head; action_dit_hidden_dim=1024, repeated_diffusion_steps=2,
+                                     # num_inference_timesteps=4, ... come from QwenPI_v3DefaultConfig.
+    action_dim: 6                    # SO-101 6-DOF
+    state_dim: 6
+    action_horizon: 16
+
+datasets:
+  vla_data:
+    dataset_py: lerobot_datasets
+    data_root_dir: /root/autodl-tmp/datasets
+    data_mix: so101_pickorange
+    lerobot_version: v2.0
+    sequential_step_sampling: false
+    per_device_batch_size: 4       # 2B backbone + PI_v3 head on 32G 4080S; smoke confirms VRAM, raise if headroom
+    load_all_data_for_training: true
+    video_backend: torchvision_av
+
+trainer:
+  max_train_steps: 30000           # 2B converges faster than 8B; eval continuously from 5k
+  num_warmup_steps: 1500
+  save_interval: 1000              # user: save every 1k, eval from 5k every 1k
+  eval_interval: 100000            # no in-train sim eval
+  learning_rate:
+    base: 2.5e-05
+    qwen_vl_interface: 1.0e-05
+    action_model: 1.0e-04
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-06
+  freeze_modules: 'qwen_vl_interface'   # freeze 2B VLM, train PI_v3 head only
+  loss_scale:
+    vla: 1.0
+    vlm: 0.1
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  logging_frequency: 10
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 1
+  gradient_checkpointing: true
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-08

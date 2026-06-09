@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# Unified single-GPU eval QUEUE for all frozen-VLM StarVLA families (PI_v3 / Cosmos / Qwen3.5).
+# Each family is pulled as HEADS only; a sweep point = merge {vlm_base + head} -> full ckpt ->
+# serve (family's env + base + quant) -> strict_eval (GUI, 3-round) -> record -> rm merged.
+# Serial by design (one local GPU): one job at a time, newest-step-first across families.
+# Waits if an EXTERNAL serve/eval is using the GPU (e.g. a standalone 20-round strict), so it
+# never double-books. All results land in ONE CSV the user can `cat` anytime.
+#
+# Check results:  column -t -s, $OUT/eval_queue.csv      |  live log: tail -f /tmp/eval_queue.log
+set -uo pipefail
+ROOT=/home/david/work/isaaclab-experience
+OUT=$ROOT/LeIsaac/outputs
+TOOLS=$OUT/_head_sweep_tools
+MERGE=$TOOLS/merge_head.py
+STRICT=$ROOT/LeIsaac/scripts/evaluation/starvla_strict_eval.sh
+EVAL_ENV=/home/david/miniconda3/envs/starvla_eval/bin/python
+QWEN35_ENV=/home/david/miniconda3/envs/starvla_eval_qwen35/bin/python
+ROUNDS="${ROUNDS:-3}"; GUI="${GUI:-1}"; POLL_S="${POLL_S:-45}"
+CSV=$OUT/eval_queue.csv
+LOG=/tmp/eval_queue.log
+PIDF=/tmp/eval_queue.pid
+# single-instance pidfile guard (rsync-style flock inheritance not an issue here, but keep it simple)
+if [ -f "$PIDF" ] && kill -0 "$(cat "$PIDF" 2>/dev/null)" 2>/dev/null; then echo "queue already running $(cat "$PIDF")"; exit 0; fi
+echo $$ >"$PIDF"
+[ -f "$CSV" ] || echo "family,step,placed_per_ep,E_oranges_pct,timestamp" > "$CSV"
+log(){ echo "[$(date +%T)] $*" | tee -a "$LOG"; }
+
+g8b=$(ls -d /home/david/.cache/huggingface/hub/models--Qwen--Qwen3-VL-8B-Instruct/snapshots/*/ 2>/dev/null|head -1); g8b=${g8b%/}
+cosmos=$(ls -d /home/david/.cache/huggingface/hub/models--nvidia--Cosmos-Reason2-8B/snapshots/*/ 2>/dev/null|head -1); cosmos=${cosmos%/}
+q35=$(ls -d /home/david/.cache/huggingface/hub/models--Qwen--Qwen3.5-2B/snapshots/*/ 2>/dev/null|head -1); q35=${q35%/}
+q35_4b=$(ls -d /home/david/.cache/huggingface/hub/models--Qwen--Qwen3.5-4B/snapshots/*/ 2>/dev/null|head -1); q35_4b=${q35_4b%/}
+q35_9b=$(ls -d /home/david/.cache/huggingface/hub/models--Qwen--Qwen3.5-9B/snapshots/*/ 2>/dev/null|head -1); q35_9b=${q35_9b%/}
+
+# name|heads_dir|vlm_base|base_vlm|env_py|quant|min_step|min_mb|ckdir
+FAM=(
+  "piv3|$OUT/starvla-pi_v3-run/heads|$TOOLS/vlm_base_8b.pt|$g8b|$EVAL_ENV|8|0|1200|$OUT/starvla-pi_v3-run/checkpoints"
+  "cosmos|$OUT/starvla-cosmos-run/heads|$TOOLS/vlm_base_cosmos.pt|$cosmos|$EVAL_ENV|8|0|300|$OUT/starvla-cosmos-run/checkpoints"
+  "qwen35|$OUT/starvla-qwen35-2b-run/heads|$TOOLS/vlm_base_qwen35_2b.pt|$q35|$QWEN35_ENV|0|5000|700|$OUT/starvla-qwen35-2b-run/checkpoints"
+  "qwen35_4b|$OUT/starvla-qwen35-4b-run/heads|$TOOLS/vlm_base_qwen35_4b.pt|$q35_4b|$QWEN35_ENV|0|5000|1000|$OUT/starvla-qwen35-4b-run/checkpoints"
+  "qwen35_9b|$OUT/starvla-qwen35-9b-run/heads|$TOOLS/vlm_base_qwen35_9b.pt|$q35_9b|$QWEN35_ENV|8|4000|1000|$OUT/starvla-qwen35-9b-run/checkpoints"
+)
+
+gpu_busy(){ pgrep -f "serve_starvla.py" >/dev/null 2>&1 || pgrep -f "policy_inference.py" >/dev/null 2>&1; }
+
+while true; do
+  # collect candidates: "step|name|head|vlm_base|base|env|quant|ckdir"
+  cands=()
+  for spec in "${FAM[@]}"; do
+    IFS='|' read -r name hd vlmb base env quant minstep minmb ckdir <<<"$spec"
+    [ -d "$hd" ] || continue
+    for h in "$hd"/steps_*_head.pt; do
+      [ -f "$h" ] || continue
+      step=$(echo "$h" | sed -n 's/.*steps_\([0-9]*\)_.*/\1/p')
+      [ "${step:-0}" -lt "$minstep" ] && continue
+      sz=$(stat -c %s "$h" 2>/dev/null || echo 0); [ "$sz" -gt $((minmb*1000000)) ] || continue
+      # skip heads the puller is still writing (mtime within 90s): a half-pulled file can pass
+      # the size gate but fail torch.load -> permanent MERGE_FAIL. wait until size is stable.
+      [ $(( $(date +%s) - $(stat -c %Y "$h" 2>/dev/null || echo 0) )) -lt 90 ] && continue
+      grep -q "^$name,$step," "$CSV" && continue
+      cands+=("$step|$name|$h|$vlmb|$base|$env|$quant|$ckdir")
+    done
+  done
+  if [ ${#cands[@]} -eq 0 ]; then sleep "$POLL_S"; continue; fi
+  # Priority: qwen35 family first (the active sweep we watch — its steps are tiny vs
+  # piv3/cosmos high steps, so a plain global newest-first sort would starve it forever
+  # while the others keep training). Within each group, newest-step-first.
+  q35=$(printf '%s\n' "${cands[@]}" | awk -F'|' '$2 ~ /^qwen35/' | sort -t'|' -k1 -n -r)
+  rest=$(printf '%s\n' "${cands[@]}" | awk -F'|' '$2 !~ /^qwen35/' | sort -t'|' -k1 -n -r)
+  IFS=$'\n' cands=($(printf '%s\n%s\n' "$q35" "$rest" | grep -v '^$')); unset IFS
+  # wait if GPU busy with an external eval (e.g. standalone 20-round strict)
+  while gpu_busy; do log "GPU busy (external eval), wait"; sleep 30; done
+
+  IFS='|' read -r step name h vlmb base env quant ckdir <<<"${cands[0]}"
+  mkdir -p "$ckdir"
+  full=$ckdir/steps_${step}_pytorch_model.pt
+  log "=== [$name] step $step: merge+eval (q=$quant) ==="
+  if [ ! -f "$vlmb" ]; then log "[$name] vlm_base missing ($vlmb) — skip family this round"; echo "$name,$step,\"NO_VLM_BASE\",NA,$(date +%FT%T)" >>"$CSV"; continue; fi
+  "$env" "$MERGE" "$vlmb" "$h" "$full" >>"$LOG" 2>&1 || { log "[$name] merge fail $step"; echo "$name,$step,\"MERGE_FAIL\",NA,$(date +%FT%T)" >>"$CSV"; rm -f "$full"; continue; }
+  STARVLA_PY="$env" BASE="$base" VLM_QUANT="$quant" ROUNDS="$ROUNDS" GUI="$GUI" \
+    EPISODE_LENGTH_S=60 MAX_ROUND_WALL_S=90 DISPLAY="${DISPLAY:-:0}" \
+    bash "$STRICT" "$full" >>"$LOG" 2>&1 || true
+  md=$ckdir/strict_eval_q${quant}_r${ROUNDS}demo.distribution.md
+  raw=$(grep -oE 'placed_per_ep = \[[^]]*\]' "$md" 2>/dev/null | tail -1)
+  pct=$(grep -oE 'E\(oranges/ep\) = [0-9.]+ / [0-9]+ = [0-9.]+%' "$md" 2>/dev/null | grep -oE '[0-9.]+%' | tail -1)
+  echo "$name,$step,\"${raw:-NA}\",${pct:-NA},$(date +%FT%T)" >> "$CSV"
+  log "[$name] step $step -> ${raw:-NA} ${pct:-NA}"
+  rm -f "$full"   # keep head, drop merged full ckpt (re-mergeable anytime)
+done

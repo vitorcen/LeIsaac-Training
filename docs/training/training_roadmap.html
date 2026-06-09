@@ -233,6 +233,30 @@
 </ul>
 </div>
 
+<h2>3.6 训练资源实测 · Measured training cost（2026-06-07，三台 AutoDL 并行）</h2>
+
+<p class="en">Live VRAM + throughput + wall-clock for the three StarVLA cloud runs (frozen VLM, head-only training). Numbers measured mid-run, not theoretical.</p>
+
+<p>三台云端 StarVLA 同时训(都<b>冻结 VLM、只训 action head</b>)的实测显存 / 吞吐 / 总耗时。运行中采的真实值,非估算。</p>
+
+<table>
+<tr><th>训练</th><th>骨干 VLM</th><th>action head</th><th>GPU</th><th>batch</th><th>显存占用</th><th>GPU util</th><th>速度</th><th>总步数</th><th>预计总耗时</th></tr>
+<tr><td><b>PI_v3-8B</b></td><td>Qwen3-VL-8B</td><td>QwenPI_v3 LayerwiseFM (cross-DiT 36层)</td><td>RTX 4090 48G</td><td>2</td><td><b>43.7 / 48.0 GB</b>（91%）</td><td>99%</td><td>1.86 it/s（3.7 样本/s）</td><td>90 000</td><td><b>≈13.4 h</b></td></tr>
+<tr><td><b>Cosmos-8B</b></td><td>Cosmos-Reason2-8B</td><td>QwenGR00T DiT flow</td><td>RTX 4090 48G</td><td>4</td><td>28.5 / 48.0 GB（59%）</td><td>75%</td><td>2.02 it/s（8.1 样本/s）</td><td>60 000</td><td><b>≈8.3 h</b></td></tr>
+<tr><td><b>2B</b></td><td>Qwen3-VL-2B</td><td>QwenGR00T DiT flow</td><td>RTX 4080S 32G</td><td>8</td><td>18.8 / 32.0 GB（59%）</td><td>63%</td><td>1.18 it/s（9.4 样本/s）</td><td>30 000</td><td><b>≈7.1 h</b></td></tr>
+</table>
+
+<div class="callout">
+<b>🔍 反直觉点 · Counter-intuitive：</b>
+<ul>
+<li><b>同是 8B,PI_v3 比 Cosmos 吃显存得多</b>:PI_v3-8B 在 <b>batch 只有 2</b> 时就占 <b>43.7 GB</b>,而 Cosmos-8B 在 batch=4 才占 28.5 GB。差别全在 action head —— <b>QwenPI_v3 的 LayerwiseFM 是 36 层 cross-DiT + repeated diffusion steps</b>,显存大头是这个头不是冻结的 VLM。所以 PI_v3-8B 被迫 bs=2(再大就 OOM),也因此 it/s 最低、单卡总耗时最长。</li>
+<li><b>2B 反而 it/s 最低(1.18)但吞吐最高</b>:小骨干能上 bs=8,样本/秒(9.4)反超两个 8B;显存只用 18.8 GB,32G 卡都富余。</li>
+<li><b>冻结 VLM 的代价转移</b>:三者 VLM 都冻结,真正决定显存/速度的是 <b>action head 复杂度 × batch</b>,不是 VLM 参数量。选 head 时这是隐藏成本。</li>
+</ul>
+</div>
+
+<p class="meta">注:8B ckpt 落盘 ≈18.9 GB/个(含可训 head),冻结 VLM 占 92.7%；sweep 保全走 head-extraction(每个只拉 ~1.4 GB head 回本机合并)。AutoDL 容器 RAM 上限 62 GB cgroup —— resume 时 <code>torch.load</code> 大 ckpt 须 <code>mmap=True</code> 否则 OOM。</p>
+
 <h2>4. 执行顺序建议 · Recommended order</h2>
 
 <svg width="980" height="160" viewBox="0 0 980 160" xmlns="http://www.w3.org/2000/svg">

@@ -1,0 +1,75 @@
+# SO-101 PickOrange — StarVLA QwenPI_v3 (Qwen3-VL-8B vision + PI_v3 LayerwiseFM head)
+# Sibling of so101_qwen3vl8b_gr00t.yaml: SAME 8B frozen VLM + SAME recipe, only the action
+# head architecture differs (GR00T flow-matching DiT -> PI_v3 LayerwiseFM cross-DiT).
+# Goal: controlled A/B — does PI_v3's head (model_zoo Bridge-RT-1 69.8 vs GR00T 65.3) beat
+# our 8B GR00T (53.3% strict) on this task, with everything else held fixed.
+#
+# 4B->8B is zero-source-change here too (same as QwenGR00T): QwenPI_v3 auto-overrides
+# vl_hidden_dim to the loaded VLM's real hidden (4096) at runtime, and project_layers
+# (VL hidden 4096 -> action_dit_hidden_dim 1024) are built at that dim at init. The 4B->8B
+# weight-transfer caveat ONLY applies to loading the 4B Bridge-RT_1 pretrained head into 8B
+# (cross-backbone projection mismatch) — NOT to from-scratch training, which this is.
+run_id: so101_pickorange_qwen3vl8b_pi_v3
+run_root_dir: /root/autodl-tmp/starvla-outputs
+seed: 42
+wandb_entity: ""
+wandb_project: starVLA_SO101
+is_debug: false
+version_id: "0.21"
+
+framework:
+  name: QwenPI_v3
+  qwenvl:
+    base_vlm: /root/autodl-tmp/models/Qwen3-VL-8B-Instruct
+    attn_implementation: flash_attention_2   # NOTE: dead on Qwen3 path — QWen3.py forces
+                                   # attn="sdpa" unconditionally. Peak is sdpa-attention sized.
+    vl_hidden_dim: 4096            # Qwen3-VL-8B text hidden; auto-overridden at runtime, kept
+                                   # correct for hygiene (PI_v3 project_layers read it).
+  action_model:
+    action_model_type: LayerwiseFM   # PI_v3 head (vs QwenGR00T's GR00T DiT). Rest of the head
+                                     # cfg (action_dit_hidden_dim=1024, repeated_diffusion_steps=2,
+                                     # num_inference_timesteps=4, ...) comes from QwenPI_v3DefaultConfig.
+    action_dim: 6                    # SO-101 6-DOF (default is 7)
+    state_dim: 6
+    action_horizon: 16               # same chunk length as the 8B GR00T run -> clean A/B
+
+datasets:
+  vla_data:
+    dataset_py: lerobot_datasets
+    data_root_dir: /root/autodl-tmp/datasets
+    data_mix: so101_pickorange
+    lerobot_version: v2.0          # our dataset is v2.1 -> read via v2.0 file layout
+    sequential_step_sampling: false
+    per_device_batch_size: 4       # match 8B GR00T; PI_v3 head ~0.54B (vs GR00T ~0.47B) +
+                                   # LayerwiseFM injects into VLM layers -> watch VRAM, drop to 2
+                                   # if it OOMs on the 48G 4090 (smoke-test first).
+    load_all_data_for_training: true
+    video_backend: torchvision_av
+
+trainer:
+  max_train_steps: 60000           # same as 8B GR00T (bs=4 -> ~120k-sample peak near 30k step)
+  num_warmup_steps: 1500
+  save_interval: 6000              # 10 slices for incremental sanity eval (LeIsaac rule)
+  eval_interval: 100000            # no in-train sim eval -> effectively off
+  learning_rate:
+    base: 2.5e-05
+    qwen_vl_interface: 1.0e-05
+    action_model: 1.0e-04
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-06
+  freeze_modules: 'qwen_vl_interface'   # freeze 8B VLM, train PI_v3 head only
+  loss_scale:
+    vla: 1.0
+    vlm: 0.1
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  logging_frequency: 10
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 1   # must match ds_config.yaml (deepspeed hardcodes 1)
+  gradient_checkpointing: true
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-08
