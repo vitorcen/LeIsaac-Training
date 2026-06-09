@@ -4,7 +4,7 @@
 # it whenever it exits, UNLESS the sweep is complete (epoch-3 ckpt already in the
 # CSV) — so it survives the full ~17h unattended training without babysitting.
 set -uo pipefail
-ROOT=/home/david/work/isaaclab-experience
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 WATCHER=$ROOT/LeIsaac/scripts/evaluation/wallx_sweep_watcher.sh
 CSV=$ROOT/LeIsaac/outputs/wallx-sweep/sweep.csv
 SUP_LOG=$ROOT/LeIsaac/outputs/wallx-sweep/supervisor.log

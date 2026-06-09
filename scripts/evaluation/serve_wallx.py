@@ -19,8 +19,8 @@ NO ``config.json`` (HF model config) and no processor/tokenizer files. So we:
 
 Example:
     python serve_wallx.py \
-        --ckpt   /home/david/work/isaaclab-experience/LeIsaac/outputs/wallx-smoke/0_2 \
-        --base   /home/david/.cache/huggingface/hub/models--x-square-robot--wall-oss-0.5/snapshots/f2119fd2bc888c249ed42a4004f42dc09ed1fa84 \
+        --ckpt   outputs/wallx-smoke/0_2 \
+        --base   $HF_HOME/hub/models--x-square-robot--wall-oss-0.5/snapshots/<rev> \
         --port   8000 \
         --prompt "Pick three oranges and put them into the plate, then reset the arm to rest state."
 """

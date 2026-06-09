@@ -351,7 +351,7 @@ lerobot-train \
 
 <h3>6.1 启动 LeRobot policy_server</h3>
 <p>Server 是通用的，<b>启动时不绑定 ckpt</b>；客户端在请求里通过 <code>policy_path</code> 指定具体模型。</p>
-<pre><code>bash ~/work/isaaclab-experience/scripts/policy_server.sh start lerobot
+<pre><code>bash ~/work/isaaclab-experience/LeIsaac/scripts/policy_server.sh start lerobot
 # 或直接：
 conda activate lerobot && \
   python -m lerobot.async_inference.policy_server --host 0.0.0.0 --port 8080</code></pre>
@@ -369,7 +369,7 @@ conda activate lerobot && \
     --policy_host=127.0.0.1 --policy_port=8080 \
     --policy_timeout_ms=15000 \
     --policy_language_instruction='Pick the orange to the plate' \
-    --policy_checkpoint_path=/home/david/work/LeIsaac/outputs/smolvla2-leisaac-pick-orange/checkpoints/last/pretrained_model \
+    --policy_checkpoint_path=~/work/LeIsaac/outputs/smolvla2-leisaac-pick-orange/checkpoints/last/pretrained_model \
     --policy_action_horizon=16 --device=cuda --enable_cameras</code></pre>
 
 <div class="info">

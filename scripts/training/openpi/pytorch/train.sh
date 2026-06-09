@@ -2,7 +2,7 @@
 # π0.5 PyTorch LoRA fine-tune on a LeRobot v3.0 dataset.
 #
 # Thin wrapper around the pi05_leisaac.train entry point installed by
-# pip install -e ~/work/isaaclab-experience/server.
+# pip install -e ~/work/isaaclab-experience/LeIsaac/server.
 #
 # Usage:
 #   bash scripts/training/openpi/pytorch/train.sh                 # 3000-step smoke

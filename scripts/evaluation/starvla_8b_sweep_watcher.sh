@@ -12,15 +12,15 @@
 # Env overrides: POLL_S EVAL_ROUNDS EPISODE_LENGTH_S STEP_HZ ACTION_HORIZON PORT IMG_SIZE GUI
 set -uo pipefail
 
-ROOT=/home/david/work/isaaclab-experience
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 SWEEP=$ROOT/LeIsaac/outputs/starvla-8b-run    # separate from the 4B starvla-sweep
 RUNDIR=$SWEEP/run
 CKDIR=$RUNDIR/checkpoints
 CSV=$SWEEP/sweep.csv
 LOG=$SWEEP/watcher.log
 # local 8B snapshot dir (abspath-safe; serve does os.path.abspath on --base)
-BASE="${BASE:-/home/david/.cache/huggingface/hub/models--Qwen--Qwen3-VL-8B-Instruct/snapshots/0c351dd01ed87e9c1b53cbc748cba10e6187ff3b}"
-STARVLA_PY=/home/david/miniconda3/envs/starvla_eval/bin/python
+BASE="${BASE:-${HF_HOME:-$HOME/.cache/huggingface}/hub/models--Qwen--Qwen3-VL-8B-Instruct/snapshots/0c351dd01ed87e9c1b53cbc748cba10e6187ff3b}"
+STARVLA_PY=$(conda info --base)/envs/starvla_eval/bin/python
 SERVE=$ROOT/LeIsaac/scripts/evaluation/serve_starvla.py
 PROMPT="Grab orange and place into plate"
 

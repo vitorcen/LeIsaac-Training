@@ -8,14 +8,14 @@
 #
 # Env: MIN_STEP(5000) ROUNDS(3) GUI(1) VLM_QUANT(0) POLL_S(60)
 set -uo pipefail
-ROOT=/home/david/work/isaaclab-experience
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 LRD=$ROOT/LeIsaac/outputs/starvla-qwen35-2b-run
 HEADS=$LRD/heads
 CKDIR=$LRD/checkpoints
 VLMBASE=$ROOT/LeIsaac/outputs/_head_sweep_tools/vlm_base_qwen35_2b.pt
 MERGE=$ROOT/LeIsaac/outputs/_head_sweep_tools/merge_head.py
-QENV=/home/david/miniconda3/envs/starvla_eval_qwen35/bin/python
-BASE35=$(ls -d /home/david/.cache/huggingface/hub/models--Qwen--Qwen3.5-2B/snapshots/*/ | head -1); BASE35=${BASE35%/}
+QENV=$(conda info --base)/envs/starvla_eval_qwen35/bin/python
+BASE35=$(ls -d ${HF_HOME:-$HOME/.cache/huggingface}/hub/models--Qwen--Qwen3.5-2B/snapshots/*/ | head -1); BASE35=${BASE35%/}
 MIN_STEP="${MIN_STEP:-5000}"
 ROUNDS="${ROUNDS:-3}"; GUI="${GUI:-1}"; VLM_QUANT="${VLM_QUANT:-0}"
 EPISODE_LENGTH_S="${EPISODE_LENGTH_S:-60}"; MAX_ROUND_WALL_S="${MAX_ROUND_WALL_S:-90}"

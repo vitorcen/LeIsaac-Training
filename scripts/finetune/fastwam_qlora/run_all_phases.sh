@@ -10,7 +10,7 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 W="${SCRIPT_DIR}/watchdog.sh"
-BASE="/home/david/work/fastwam-repo/runs/train/fastwam_qlora_pickorange_5phase"
+BASE="${FASTWAM_REPO:-$HOME/work/fastwam-repo}/runs/train/fastwam_qlora_pickorange_5phase"
 
 # After each phase completes, collapse its ckpt dir to ONLY the target step
 # (the resume target for the next phase).  Watchdog keeps last-3 within an

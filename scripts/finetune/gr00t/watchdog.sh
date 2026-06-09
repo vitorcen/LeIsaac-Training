@@ -211,9 +211,8 @@ eval_unevaluated_ckpts() {
         local eval_log="$REPO_ROOT/logs/gr00t_ckpt_eval_${step}.log"
         local tmo=$(( rounds * EVAL_MAX_ROUND_WALL_S + 300 ))
 
-        GR00T_MODEL_PATH="$ckpt_dir" GR00T_EMBODIMENT_TAG="NEW_EMBODIMENT" \
-            GR00T_PORT="$EVAL_POLICY_PORT" \
-            bash "$REPO_ROOT/server/start_server.sh" --gr00t-only 2>&1 | tail -5 | tee -a "$WATCHDOG_LOG"
+        GR00T_PORT="$EVAL_POLICY_PORT" \
+            bash "$LEISAAC_ROOT/scripts/policy_server.sh" start gr00t-n17 "$ckpt_dir" 2>&1 | tail -5 | tee -a "$WATCHDOG_LOG"
 
         if ! ss -tlnp 2>/dev/null | grep -q ":$EVAL_POLICY_PORT "; then
             echo "  [watchdog] WARN: server not up after launch — extra 15s wait" | tee -a "$WATCHDOG_LOG"

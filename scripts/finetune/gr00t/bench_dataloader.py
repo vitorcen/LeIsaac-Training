@@ -9,10 +9,12 @@ Outputs frames/sec + per-call latency. No model load.
 
 Usage:
     cd dependencies/Isaac-GR00T && uv run --no-sync python \
-        /home/david/work/isaaclab-experience/LeIsaac/scripts/finetune/gr00t/bench_dataloader.py \
+        LeIsaac/scripts/finetune/gr00t/bench_dataloader.py \
         --mode {baseline|memmap|workers} --num_samples 500
 """
 from __future__ import annotations
+
+import os
 
 import argparse
 import time
@@ -22,8 +24,8 @@ import numpy as np
 import torchcodec
 from torch.utils.data import DataLoader, Dataset
 
-DATASET = Path("/home/david/work/isaaclab-experience/LeIsaac/datasets/v2-gr00t/leisaac-pick-orange")
-CACHE = Path("/home/david/cache/leisaac_pick_orange_frames")  # NVMe; /dev/shm only 32G
+DATASET = Path(os.environ.get("LEISAAC_DATASET", os.path.join(os.path.dirname(__file__), "../../../datasets/v2-gr00t/leisaac-pick-orange")))
+CACHE = Path(os.environ.get("FRAME_CACHE", "/tmp/leisaac_pick_orange_frames"))  # NVMe; /dev/shm only 32G
 VIDEO_TMPL = "videos/chunk-000/observation.images.{cam}/episode_{ep:06d}.mp4"
 CAMS = ["front", "wrist"]
 N_EP = 60

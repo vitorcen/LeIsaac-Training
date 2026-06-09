@@ -16,7 +16,7 @@ set -uo pipefail
 CKPT="${1:?usage: starvla_strict_eval.sh <ckpt.pt>}"
 CKPT="$(readlink -f "$CKPT")"
 [ -f "$CKPT" ] || { echo "no such ckpt: $CKPT"; exit 1; }
-ROOT=/home/david/work/isaaclab-experience
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 # Fool-proof backbone resolution: infer 2B/4B/8B from the ckpt path and pick the matching
 # local Qwen3-VL snapshot. A hardcoded BASE silently mis-pairs (e.g. 4B base + 8B ckpt) and
 # the load fails with a size mismatch the serve-retry loop misreads as "corruption" (4 wasted
@@ -28,14 +28,14 @@ if [ -z "${BASE:-}" ]; then
     *8b*|*8B*) VLM_TAG=8B ;;
     *) echo "[strict] cannot infer VLM backbone (2b/4b/8b) from ckpt path; set BASE=<snapshot dir>"; exit 1 ;;
   esac
-  BASE="$(ls -d /home/david/.cache/huggingface/hub/models--Qwen--Qwen3-VL-${VLM_TAG}-Instruct/snapshots/*/ 2>/dev/null | head -1)"
+  BASE="$(ls -d ${HF_HOME:-$HOME/.cache/huggingface}/hub/models--Qwen--Qwen3-VL-${VLM_TAG}-Instruct/snapshots/*/ 2>/dev/null | head -1)"
   BASE="${BASE%/}"
   [ -n "$BASE" ] && [ -d "$BASE" ] || { echo "[strict] no local Qwen3-VL-${VLM_TAG}-Instruct snapshot — hf download it first, or set BASE=<dir>"; exit 1; }
   echo "[strict] inferred backbone=$VLM_TAG -> BASE=$BASE"
 fi
 # env-overridable: Qwen3.5 backbone needs the transformers-5.2 env (starvla_eval_qwen35),
 # Qwen3-VL/Cosmos use the default tf-4.57 env (starvla_eval).
-STARVLA_PY="${STARVLA_PY:-/home/david/miniconda3/envs/starvla_eval/bin/python}"
+STARVLA_PY="${STARVLA_PY:-$(conda info --base)/envs/starvla_eval/bin/python}"
 SERVE=$ROOT/LeIsaac/scripts/evaluation/serve_starvla.py
 AGG=$ROOT/scripts/benchmark/aggregate_distribution.py
 PROMPT="${PROMPT:-Grab orange and place into plate}"

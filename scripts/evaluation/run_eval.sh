@@ -27,7 +27,8 @@
 
 set -euo pipefail
 
-LOG_TAIL="${LEROBOT_SERVER_LOG:-/home/david/work/isaaclab-experience/logs/lerobot_server.log}"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+LOG_TAIL="${LEROBOT_SERVER_LOG:-$ROOT/logs/lerobot_server.log}"
 STARTUP="${TIMEOUT_STARTUP:-60}"             # seconds for Isaac sim cold start
 TIMEOUT_PER_ROUND="${TIMEOUT_PER_ROUND:-90}" # seconds per eval round (user patience)
 

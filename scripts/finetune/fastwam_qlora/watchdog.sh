@@ -12,7 +12,7 @@
 # Examples:
 #   watchdog.sh phase1 2000
 #   watchdog.sh phase2 4000 \
-#       /home/david/work/fastwam-repo/runs/train/fastwam_qlora_pickorange_5phase/phase1/checkpoints/state/step_002000
+#       $HOME/work/fastwam-repo/runs/train/fastwam_qlora_pickorange_5phase/phase1/checkpoints/state/step_002000
 
 set -uo pipefail
 
@@ -25,8 +25,8 @@ MAX_ATTEMPTS="${MAX_ATTEMPTS:-30}"
 # +2 older = fallbacks if the latest one was corrupted by SIGSEGV mid-save.
 KEEP_LAST_N="${KEEP_LAST_N:-3}"
 
-REPO_ROOT="/home/david/work/fastwam-repo"
-LEISAAC_ROOT="/home/david/work/isaaclab-experience"
+REPO_ROOT="${FASTWAM_REPO:-$HOME/work/fastwam-repo}"
+LEISAAC_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
 CONFIG_DIR="${LEISAAC_ROOT}/LeIsaac/scripts/finetune/fastwam_qlora/configs"
 LOG_DIR="${LEISAAC_ROOT}/logs"
 LOG_FILE="${LOG_DIR}/fastwam_qlora_${PHASE_NAME}.log"
@@ -36,7 +36,7 @@ OUTPUT_DIR_ABS="${REPO_ROOT}/runs/train/fastwam_qlora_pickorange_5phase/${PHASE_
 mkdir -p "${LOG_DIR}"
 
 cd "${REPO_ROOT}"
-source /home/david/miniconda3/etc/profile.d/conda.sh
+source $(conda info --base)/etc/profile.d/conda.sh
 # fastwam_stable (torch 2.5.1+cu124 / bnb 0.45.5 / flash-attn 2.7.4.post1)
 # is the stable production env.  Override via CONDA_ENV=... to swap.
 conda activate "${CONDA_ENV:-fastwam_stable}"

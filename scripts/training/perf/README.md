@@ -51,8 +51,8 @@ LeIsaac/scripts/training/perf/analyze_gpu_csv.py /tmp/gpu_baseline.csv
 
 ```bash
 python LeIsaac/scripts/training/perf/precache_videos.py \
-    --dataset_dir /home/david/work/.../leisaac-pick-orange \
-    --cache_dir /home/david/cache/leisaac_pick_orange_frames \
+    --dataset_dir ~/work/.../leisaac-pick-orange \
+    --cache_dir ~/cache/leisaac_pick_orange_frames \
     --workers 8
 ```
 
@@ -66,7 +66,7 @@ python LeIsaac/scripts/training/perf/precache_videos.py \
 ```python
 # Inside the launcher, after gr00t imports
 import sys
-sys.path.insert(0, "/home/david/work/isaaclab-experience/LeIsaac/scripts/training")
+sys.path.insert(0, "~/work/isaaclab-experience/LeIsaac/scripts/training")
 from perf.pipeline_patches import apply_all
 apply_all()
 ```
@@ -75,7 +75,7 @@ apply_all()
 
 ```bash
 # 最小推荐配置
-LEISAAC_FRAME_CACHE_DIR=/home/david/cache/<task>_frames \
+LEISAAC_FRAME_CACHE_DIR=~/cache/<task>_frames \
 DATALOADER_NUM_WORKERS=4 \
 DATALOADER_PREFETCH_FACTOR=4 \
 bash <your_train_launcher.sh>
@@ -103,8 +103,8 @@ mean50 是最近 50 次调用平均。乘以 grad_accum 步数 = 每 step 该 ph
 # 对比 5 mode
 for m in baseline memmap memmap-cached workers-decode workers-memmap; do
     python LeIsaac/scripts/training/perf/bench_dataloader.py \
-        --dataset_dir /home/david/work/.../leisaac-pick-orange \
-        --cache_dir /home/david/cache/leisaac_pick_orange_frames \
+        --dataset_dir ~/work/.../leisaac-pick-orange \
+        --cache_dir ~/cache/leisaac_pick_orange_frames \
         --mode $m --num_samples 400 --frames_per_call 16
 done
 ```

@@ -11,9 +11,9 @@ set -uo pipefail
 
 CKPT="${1:?usage: wallx_strict_eval.sh <ckpt_dir>}"
 CKPT="$(cd "$CKPT" && pwd)"
-ROOT=/home/david/work/isaaclab-experience
-BASE=/home/david/.cache/huggingface/hub/models--x-square-robot--wall-oss-0.5/snapshots/f2119fd2bc888c249ed42a4004f42dc09ed1fa84
-WALLX_PY=/home/david/miniconda3/envs/wallx/bin/python
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+BASE=${HF_HOME:-$HOME/.cache/huggingface}/hub/models--x-square-robot--wall-oss-0.5/snapshots/f2119fd2bc888c249ed42a4004f42dc09ed1fa84
+WALLX_PY=$(conda info --base)/envs/wallx/bin/python
 SERVE=$ROOT/LeIsaac/scripts/evaluation/serve_wallx.py
 PROMPT="Pick three oranges and put them into the plate, then reset the arm to rest state."
 

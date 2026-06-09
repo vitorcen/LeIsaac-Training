@@ -8,13 +8,13 @@
 #
 # Check results:  column -t -s, $OUT/eval_queue.csv      |  live log: tail -f /tmp/eval_queue.log
 set -uo pipefail
-ROOT=/home/david/work/isaaclab-experience
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 OUT=$ROOT/LeIsaac/outputs
 TOOLS=$OUT/_head_sweep_tools
 MERGE=$TOOLS/merge_head.py
 STRICT=$ROOT/LeIsaac/scripts/evaluation/starvla_strict_eval.sh
-EVAL_ENV=/home/david/miniconda3/envs/starvla_eval/bin/python
-QWEN35_ENV=/home/david/miniconda3/envs/starvla_eval_qwen35/bin/python
+EVAL_ENV=$(conda info --base)/envs/starvla_eval/bin/python
+QWEN35_ENV=$(conda info --base)/envs/starvla_eval_qwen35/bin/python
 ROUNDS="${ROUNDS:-3}"; GUI="${GUI:-1}"; POLL_S="${POLL_S:-45}"
 CSV=$OUT/eval_queue.csv
 LOG=/tmp/eval_queue.log
@@ -25,11 +25,11 @@ echo $$ >"$PIDF"
 [ -f "$CSV" ] || echo "family,step,placed_per_ep,E_oranges_pct,timestamp" > "$CSV"
 log(){ echo "[$(date +%T)] $*" | tee -a "$LOG"; }
 
-g8b=$(ls -d /home/david/.cache/huggingface/hub/models--Qwen--Qwen3-VL-8B-Instruct/snapshots/*/ 2>/dev/null|head -1); g8b=${g8b%/}
-cosmos=$(ls -d /home/david/.cache/huggingface/hub/models--nvidia--Cosmos-Reason2-8B/snapshots/*/ 2>/dev/null|head -1); cosmos=${cosmos%/}
-q35=$(ls -d /home/david/.cache/huggingface/hub/models--Qwen--Qwen3.5-2B/snapshots/*/ 2>/dev/null|head -1); q35=${q35%/}
-q35_4b=$(ls -d /home/david/.cache/huggingface/hub/models--Qwen--Qwen3.5-4B/snapshots/*/ 2>/dev/null|head -1); q35_4b=${q35_4b%/}
-q35_9b=$(ls -d /home/david/.cache/huggingface/hub/models--Qwen--Qwen3.5-9B/snapshots/*/ 2>/dev/null|head -1); q35_9b=${q35_9b%/}
+g8b=$(ls -d ${HF_HOME:-$HOME/.cache/huggingface}/hub/models--Qwen--Qwen3-VL-8B-Instruct/snapshots/*/ 2>/dev/null|head -1); g8b=${g8b%/}
+cosmos=$(ls -d ${HF_HOME:-$HOME/.cache/huggingface}/hub/models--nvidia--Cosmos-Reason2-8B/snapshots/*/ 2>/dev/null|head -1); cosmos=${cosmos%/}
+q35=$(ls -d ${HF_HOME:-$HOME/.cache/huggingface}/hub/models--Qwen--Qwen3.5-2B/snapshots/*/ 2>/dev/null|head -1); q35=${q35%/}
+q35_4b=$(ls -d ${HF_HOME:-$HOME/.cache/huggingface}/hub/models--Qwen--Qwen3.5-4B/snapshots/*/ 2>/dev/null|head -1); q35_4b=${q35_4b%/}
+q35_9b=$(ls -d ${HF_HOME:-$HOME/.cache/huggingface}/hub/models--Qwen--Qwen3.5-9B/snapshots/*/ 2>/dev/null|head -1); q35_9b=${q35_9b%/}
 
 # name|heads_dir|vlm_base|base_vlm|env_py|quant|min_step|min_mb|ckdir
 FAM=(
@@ -51,10 +51,10 @@ DP_ON="${DP_ON:-1}"
 DP_OUT=$OUT/dp-6ep-earlytest
 DP_EPOCH=4537                 # 1 epoch = 36293 frames / batch 8
 DP_TARGET=27220               # 6 epochs
-DP_TRAIN_PY=/home/david/miniconda3/envs/lerobot-dp311/bin/lerobot-train
+DP_TRAIN_PY=$(conda info --base)/envs/lerobot-dp311/bin/lerobot-train
 DP_EVAL_FROM=13611            # eval epoch ckpts >= 3 ep
-DP_SERVE_PY=/home/david/miniconda3/envs/lerobot-v040/bin/python  # patched async server
-DP_REPO=/home/david/work/lerobot-v040
+DP_SERVE_PY=$(conda info --base)/envs/lerobot-v040/bin/python  # patched async server
+DP_REPO=$HOME/work/lerobot-v040
 dp_last_step(){ python3 -c "import json;print(json.load(open('$DP_OUT/checkpoints/last/training_state/training_step.json'))['step'])" 2>/dev/null || echo 0; }
 # train one epoch chunk; 0=ran, 1=complete/disabled
 dp_chunk(){

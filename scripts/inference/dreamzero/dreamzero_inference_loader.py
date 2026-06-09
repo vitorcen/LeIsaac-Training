@@ -34,7 +34,7 @@ import bitsandbytes as bnb
 from bitsandbytes.nn import Linear4bit
 
 # Ensure dreamzero-repo is importable
-sys.path.insert(0, "/home/david/work/dreamzero-repo")
+sys.path.insert(0, os.path.expanduser("~/work/dreamzero-repo"))
 
 # Bump dynamo recompile limit BEFORE importing scheduler modules that decorate with @torch.compile
 import torch._dynamo

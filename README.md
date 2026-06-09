@@ -63,7 +63,7 @@ policy_action_horizon = 每 model 不同（见 baselines.tsv）
 - **P(k)** = single-episode placed=k 的概率；**P(≥2)** = 单 ep 至少 2 颗
 - **Strict snapshot**: pre-step obs（避 auto-reset 假阴）+ dz_max=0.20 stacking-aware + plate_r=0.10 cylindrical + velocity-settled gate
 
-**Note (2026-05-25)**：表格升级 5-round (15 ep) → strict 20-round (60 ep)。5-round σ ≈ ±6.4% (Bernoulli)；14/15 是 4σ outlier；20-round 单 ep 级 noise ≈ ±10%，可信对比。Eval 复现：`STRICT_ROUNDS=20 bash scripts/benchmark/run_all_strict.sh`，详见 [`scripts/benchmark/STRICT_LEADERBOARD.md`](../scripts/benchmark/STRICT_LEADERBOARD.md)。
+**Note (2026-05-25)**：表格升级 5-round (15 ep) → strict 20-round (60 ep)。5-round σ ≈ ±6.4% (Bernoulli)；14/15 是 4σ outlier；20-round 单 ep 级 noise ≈ ±10%，可信对比。Eval 复现：`STRICT_ROUNDS=20 bash scripts/benchmark/run_all_strict.sh`，详见 [`scripts/benchmark/STRICT_LEADERBOARD.md`](scripts/benchmark/STRICT_LEADERBOARD.md)。
 
 | Rank | Policy | Params | `policy_type` | h | **Epoch**¹(best→max) | **E(🍊)/ep** | P(3) | P(≥2) | Avg ep | Peak VRAM | 20-ep raw oranges |
 |---|---|---|---|---|---|---|---|---|---|---|---|
@@ -108,7 +108,7 @@ policy_action_horizon = 每 model 不同（见 baselines.tsv）
 - 🚨 **自训 OpenVLA / π0.5 = 0/60；DP 早 epoch 8.3%(4ep)、过拟合后 0/60** — 50-60 demo 不足以喂大 model class（OpenVLA 7B / π0.5 3.36B base）；DP 则吃 epoch 预算(3-4ep 最优,15-22ep 塌)。DP 另有 lerobot async server bug — `predict_action_chunk` 不 `populate_queues` → n_obs_steps=2 stack 空 deque → server crash `'observation.images'` → 臂不动假 0,已在 **`lerobot-v040` editable 一行 patch 修复**。⚠️ 但 `run_one.sh→start_server.sh` 默认用 `envs/lerobot`(v0.5.1,**未打 patch**)→ 评 DP 必须 `LEROBOT_PYTHON=$HOME/miniconda3/envs/lerobot-v040/bin/python` 才走 patched server,否则臂不动。
 - 🍊 **GR00T 多 release env 隔离** — N1.5 / N1.6 / N1.7 各独立 submodule + venv，transformers 4.51.3 (N1.5/N1.6) vs 4.57.3 (N1.7) ABI 冲突；2026-05-24 完成隔离后 N1.6 自训才解锁可推理。详见 [`doc/gr00t_multi_release_env_split.html`](../doc/gr00t_multi_release_env_split.html)。
 
-完整分布表 + per-episode raw + Worst-case (mean−1σ) 参考列：[`scripts/benchmark/STRICT_LEADERBOARD.md`](../scripts/benchmark/STRICT_LEADERBOARD.md)。历史 5-round / 3-round 数据：[`results/benchmark/snapshots/`](../results/benchmark/snapshots/)。
+完整分布表 + per-episode raw + Worst-case (mean−1σ) 参考列：[`scripts/benchmark/STRICT_LEADERBOARD.md`](scripts/benchmark/STRICT_LEADERBOARD.md)。历史 5-round / 3-round 数据：[`results/benchmark/snapshots/`](../results/benchmark/snapshots/)。
 
 ### 3. 设计文档与 postmortem
 _Design docs and postmortems_
@@ -186,7 +186,7 @@ EXTRA_ARGS='--dataset.video_backend=pyav' \
 bash scripts/training/lerobot_finetune.sh
 
 # 3) 启 LeRobot async server / Start LeRobot async server
-bash ~/work/isaaclab-experience/scripts/policy_server.sh start lerobot
+bash ~/work/isaaclab-experience/LeIsaac/scripts/policy_server.sh start lerobot
 
 # 4) Isaac Sim eval — 注意 horizon=32 / Note horizon=32!
 cd ~/work/isaaclab-experience/LeIsaac && \

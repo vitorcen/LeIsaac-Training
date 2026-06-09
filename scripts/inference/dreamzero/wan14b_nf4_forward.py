@@ -24,7 +24,7 @@ from bitsandbytes.nn import Linear4bit
 
 
 os.environ.setdefault("WAN_DISABLE_FLASH", "1")
-sys.path.insert(0, "/home/david/work/dreamzero-repo")
+sys.path.insert(0, os.path.expanduser("~/work/dreamzero-repo"))
 
 from groot.vla.model.dreamzero.modules.wan_video_dit import WanModel
 

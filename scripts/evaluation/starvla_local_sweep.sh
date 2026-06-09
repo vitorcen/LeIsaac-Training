@@ -6,7 +6,7 @@
 #
 # Usage: CKDIR=<run/checkpoints> FULLSIZE=<bytes> [ROUNDS=3] [VLM_QUANT=0] starvla_local_sweep.sh
 set -uo pipefail
-ROOT=/home/david/work/isaaclab-experience
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 CKDIR="${CKDIR:?need CKDIR=<run/checkpoints>}"
 FULLSIZE="${FULLSIZE:?need FULLSIZE=<complete ckpt bytes>}"
 ROUNDS="${ROUNDS:-3}"

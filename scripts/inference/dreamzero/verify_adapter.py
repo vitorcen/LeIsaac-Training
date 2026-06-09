@@ -9,7 +9,7 @@ Checks:
 
 Usage:
     python LeIsaac/scripts/inference/dreamzero/verify_adapter.py \
-        /home/david/work/isaaclab-experience/LeIsaac/outputs/dreamzero-leisaac-so101-lora-r4/checkpoint-1000
+        outputs/dreamzero-leisaac-so101-lora-r4/checkpoint-1000
 
 Exit code 0 = sane, 1 = bad (don't waste compute building a server around a broken adapter).
 """

@@ -344,7 +344,7 @@ batch_imgs = gpu_aug(batch_imgs)   # kornia.augmentation.ColorJitter / RandomCro
 
 <pre><code># 1. video decode → memmap cache（env-gated）
 # 在 lerobot_episode_loader.py:_load_video_data 加 cache 分支
-LEISAAC_FRAME_CACHE_DIR=/home/david/cache/leisaac_pick_orange_frames
+LEISAAC_FRAME_CACHE_DIR=~/cache/leisaac_pick_orange_frames
 
 # 2. non_blocking H2D（monkey-patch Trainer._prepare_input）
 _patch_cuda_pipeline_overlap()
@@ -487,7 +487,7 @@ video_data = self._load_video_data(episode_id, np.arange(actual_length))
 <p>调用模式（在任何 launcher 头部一行）：</p>
 
 <pre><code>import sys
-sys.path.insert(0, "/home/david/work/isaaclab-experience/LeIsaac/scripts/training")
+sys.path.insert(0, "~/work/isaaclab-experience/LeIsaac/scripts/training")
 from perf.pipeline_patches import apply_all
 apply_all()
 </code></pre>

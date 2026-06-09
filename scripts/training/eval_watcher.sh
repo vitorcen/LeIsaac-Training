@@ -47,7 +47,7 @@ case "$POLICY_TYPE" in
 esac
 EVAL_HORIZON="${EVAL_HORIZON:-$DEFAULT_H}"
 
-LEROBOT_PYTHON="${LEROBOT_PYTHON:-/home/david/miniconda3/envs/lerobot-v040/bin/python}"
+LEROBOT_PYTHON="${LEROBOT_PYTHON:-$(conda info --base)/envs/lerobot-v040/bin/python}"
 LEROBOT_REPO="${LEROBOT_REPO:-$HOME/work/lerobot-v040}"
 
 POLL_S="${POLL_S:-30}"

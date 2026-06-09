@@ -15,16 +15,21 @@ fi
 echo $$ >"$PIDF"
 : "${SSHPASS:?need SSHPASS env}"; export SSHPASS
 
-OUT=/home/david/work/isaaclab-experience/LeIsaac/outputs
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+OUT=$ROOT/LeIsaac/outputs
 SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=12 -o ServerAliveInterval=15"
 # tag|port|host|remote-dir|file-glob|local-dir|min-MB
+# Per-box rows (fill in YOUR cloud boxes; these were the 2026-06 sweep boxes, now offline).
+# Override the whole list via PULL_BOXES env (newline-separated rows of the same format),
+# or just edit below. No personal endpoints are committed.
 SRC=(
-  "qwen35|31709|connect.westc.seetacloud.com|/root/autodl-tmp/starvla-outputs/so101_qwen3_5_2b_pi_v3/heads|steps_*_head.pt|$OUT/starvla-qwen35-2b-run/heads|700"
-  "qwen35_4b|22263|connect.bjb1.seetacloud.com|/root/autodl-tmp/starvla-outputs/so101_qwen3_5_4b_pi_v3/heads|steps_*_head.pt|$OUT/starvla-qwen35-4b-run/heads|900"
-  "qwen35_9b|52021|connect.bjb1.seetacloud.com|/root/autodl-tmp/starvla-outputs/so101_qwen3_5_9b_pi_v3/heads|steps_*_head.pt|$OUT/starvla-qwen35-9b-run/heads|900"
+  "qwen35|<PORT>|<USER>@<HOST>|/root/autodl-tmp/starvla-outputs/so101_qwen3_5_2b_pi_v3/heads|steps_*_head.pt|$OUT/starvla-qwen35-2b-run/heads|700"
+  "qwen35_4b|<PORT>|<USER>@<HOST>|/root/autodl-tmp/starvla-outputs/so101_qwen3_5_4b_pi_v3/heads|steps_*_head.pt|$OUT/starvla-qwen35-4b-run/heads|900"
+  "qwen35_9b|<PORT>|<USER>@<HOST>|/root/autodl-tmp/starvla-outputs/so101_qwen3_5_9b_pi_v3/heads|steps_*_head.pt|$OUT/starvla-qwen35-9b-run/heads|900"
 )
+[ -n "${PULL_BOXES:-}" ] && mapfile -t SRC <<<"$PULL_BOXES"
 
-rsh(){ timeout 40 sshpass -e ssh -p "$1" $SSH_OPTS "root@$2" "$3"; }
+rsh(){ timeout 40 sshpass -e ssh -p "$1" $SSH_OPTS "$2" "$3"; }
 
 while true; do
   for row in "${SRC[@]}"; do

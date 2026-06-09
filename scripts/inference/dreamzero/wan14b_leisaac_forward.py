@@ -11,7 +11,7 @@ Usage:
 
 Example:
     python LeIsaac/scripts/inference/dreamzero/wan14b_leisaac_forward.py \
-        /home/david/work/isaaclab-experience/LeIsaac/outputs/dreamzero-leisaac-so101-lora-r4/checkpoint-1000
+        outputs/dreamzero-leisaac-so101-lora-r4/checkpoint-1000
 """
 import gc
 import os
@@ -26,7 +26,7 @@ from safetensors import safe_open
 import bitsandbytes as bnb
 from bitsandbytes.nn import Linear4bit
 
-sys.path.insert(0, "/home/david/work/dreamzero-repo")
+sys.path.insert(0, os.path.expanduser("~/work/dreamzero-repo"))
 from groot.vla.model.dreamzero.modules.wan_video_dit import WanModel
 
 

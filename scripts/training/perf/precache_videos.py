@@ -16,7 +16,7 @@ gr00t/data/dataset/lerobot_episode_loader.py:_load_video_data fast-path).
 Usage:
     python precache_videos.py \
         --dataset_dir /path/to/lerobot_dataset \
-        --cache_dir /home/david/cache/<task>_frames \
+        --cache_dir /path/to/cache/<task>_frames \
         --workers 8
 """
 from __future__ import annotations

@@ -4,7 +4,7 @@ train:
     # LeRobot v2.1 format (per-episode parquet + tasks.jsonl).
     # The v3.0 `leisaac-pick-orange/` uses tasks.parquet which the bundled
     # lerobot doesn't parse — `_old` is the v2.1 snapshot of the same data.
-    - /home/david/work/isaaclab-experience/LeIsaac/datasets/raw/leisaac-pick-orange_old
+    - ${oc.env:HOME}/work/isaaclab-experience/LeIsaac/datasets/raw/leisaac-pick-orange_old
   shape_meta:
     images:
       # base_lerobot_dataset.py:71 prepends "observation.images." → key="front" matches "observation.images.front".

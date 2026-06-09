@@ -262,7 +262,7 @@ REMOVED (harmful):
 - 显存 ~13GB，4090 24GB 仍 fit；inference 全 bf16 不依赖 bnb runtime
 </div>
 
-<p>server 实现：<code>/home/david/work/isaaclab-experience/server/fastwam_leisaac/server_qlora.py</code><br>
+<p>server 实现：<code>~/work/isaaclab-experience/LeIsaac/server/fastwam_leisaac/server_qlora.py</code><br>
 prompt 改成只用 cached（UMT5 在 CPU 上 4 分钟 / 次，re-encode 会让 ZMQ 死等）。</p>
 
 <h3>7.5 训练稳定性 <span class="en">(Training Stability)</span></h3>
@@ -437,8 +437,8 @@ loss_total = self.loss_lambda_video * loss_video + self.loss_lambda_action * los
 <ul>
 <li><a href="fastwam_finetune_plan.html">fastwam_finetune_plan.html</a> — 原始 QLoRA 设计</li>
 <li><a href="fastwam_lora_vs_qlora_24gb.html">fastwam_lora_vs_qlora_24gb.html</a> — 24GB 显存账</li>
-<li><code>/home/david/.claude/projects/.../memory/fastwam-qlora-finetune.md</code> — 训练 patches 记录</li>
-<li><code>/home/david/work/isaaclab-experience/server/fastwam_leisaac/server_qlora.py</code> — 当前 inference server（待路线 C 改造）</li>
+<li><code>~/.claude/projects/.../memory/fastwam-qlora-finetune.md</code> — 训练 patches 记录</li>
+<li><code>~/work/isaaclab-experience/LeIsaac/server/fastwam_leisaac/server_qlora.py</code> — 当前 inference server（待路线 C 改造）</li>
 </ul>
 
 </body>

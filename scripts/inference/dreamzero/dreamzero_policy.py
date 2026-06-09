@@ -29,7 +29,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
-sys.path.insert(0, "/home/david/work/dreamzero-repo")
+sys.path.insert(0, os.path.expanduser("~/work/dreamzero-repo"))
 sys.path.insert(0, str(Path(__file__).parent))
 
 from hydra.utils import instantiate
@@ -114,7 +114,7 @@ def _build_fake_groot_sim_policy(trained_model, full_cfg, metadata_dict, embodim
                     except (PermissionError, OSError):
                         is_local_ok = False
                     if not is_local_ok:
-                        local_default = "/home/david/.cache/huggingface/hub/models--Wan-AI--Wan2.1-I2V-14B-480P/snapshots/6b73f84e66371cdfe870c72acd6826e1d61cf279/google/umt5-xxl"
+                        local_default = os.path.join(os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface")), "hub/models--Wan-AI--Wan2.1-I2V-14B-480P/snapshots/6b73f84e66371cdfe870c72acd6826e1d61cf279/google/umt5-xxl")
                         print(f"[policy] rewrite tokenizer_path {p} → {local_default}", flush=True)
                         node[k] = local_default
                 else:

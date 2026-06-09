@@ -12,7 +12,7 @@ Use to localise the decode portion of CPU bottleneck before / after attacking it
 Usage:
     python bench_dataloader.py \
         --dataset_dir /path/to/lerobot_dataset \
-        --cache_dir   /home/david/cache/<task>_frames   # for memmap modes
+        --cache_dir   /path/to/cache/<task>_frames   # for memmap modes
         --mode {baseline,memmap,memmap-cached,workers-decode,workers-memmap} \
         --num_samples 400 --frames_per_call 16
 """

@@ -38,7 +38,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger("serve_starvla")
 
 # StarVLA repo on the local clone
-STARVLA_DIR = os.environ.get("STARVLA_DIR", "/home/david/work/isaaclab-experience/dependencies/starVLA")
+STARVLA_DIR = os.environ.get("STARVLA_DIR", os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../dependencies/starVLA")))
 sys.path.insert(0, STARVLA_DIR)
 
 IMG_SIZE_DEFAULT = 448  # MUST match training _pack_sample(448); 224 = vision death zone
