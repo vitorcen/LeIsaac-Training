@@ -25,6 +25,18 @@
 
 **Trigger**: after a model card / leaderboard row is published (the eval result is now external truth, the intermediate ckpts are no longer load-bearing). Confirm with the user before `rm -rf` — irreversible.
 
+**Frozen-backbone runs — collapse to base+deltas (mandatory, default for EVERY new run)**: if the run froze its backbone (StarVLA frozen-VLM, Wall-X `freeze_vlm`, π0.5 expert-only FT, GR00T frozen-VLM…), the frozen weights are byte-identical in every ckpt → keeping N fulls = (N-1)× dead weight. Run the **committed** universal tool once the run is benchmarked:
+
+```bash
+python scripts/ckpt/prune_ckpts.py \
+  --fulls 'outputs/<run>/checkpoints/steps_*_pytorch_model.pt' \
+  --keep  'outputs/<run>/checkpoints/steps_<best>_pytorch_model.pt' \
+  --base  'outputs/_head_sweep_tools/vlm_base_<fam>.pt' \
+  --heads 'outputs/<run>/heads'      # dry-run; add --apply to delete non-best fulls
+```
+
+It diffs each full against a shared frozen base (not prefix slicing → works for cleanly-prefixed StarVLA *and* interleaved Wall-X/π0.5), GOLD-verifies byte-exact reconstruction before deleting anything, and **auto-refuses on full-FT models** (`frozen_frac < 0.5` → keep-best only). Reconstruct any step with `scripts/ckpt/merge_ckpt.py base delta out`. Keep the best full intact (serve/publish); base+delta reconstruct every other step. Code lives in `scripts/ckpt/` (committed); the big `.pt`/`.safetensors` base+deltas stay in gitignored `outputs/`. **This is lossless even for resume**: the tool only deletes `model.safetensors` (reconstructible byte-exact from base+delta) and never touches `training_state/optimizer_state.safetensors` — resume from any extracted step = merge model + the kept optimizer state. **Keep `optimizer_state.safetensors`** (do NOT delete it for disk — it is the resume料). See `scripts/ckpt/README.md` for the per-family verdict table.
+
 ## AutoDL cloud training
 
 When fine-tuning on AutoDL (no-local-GPU mode for setup + GPU mode for training), see [docs/training/autodl_cloud_finetune_playbook.html](docs/training/autodl_cloud_finetune_playbook.html) for: HF gated vs public download paths, `/etc/network_turbo` quirks, single-stream curl recipe for big LFS files, git-lfs prep, `uv sync` + tensorrt-cu12 GPU-mode requirement, 140 GB disk budget with `LossDrivenPruneCallback(top_k=5)`, and a failure playbook.
