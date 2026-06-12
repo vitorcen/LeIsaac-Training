@@ -92,7 +92,7 @@ policy_action_horizon = 每 model 不同（见 baselines.tsv）
 > **`policy_type` 备注**：
 > - `gr00t` = ZMQ flat-wire client，统一适配 N1.5 / N1.6 / N1.7 三 release（release-specific 通过 server_kind + GR00T_DIR 路由 + GR00T_WRAP_OBSERVATION envelope 切换；见 [`doc/gr00t_multi_release_env_split.html`](../doc/gr00t_multi_release_env_split.html)）。
 > - `pi05` = msgpack-ndarray wire 协议，X-VLA / OpenVLA / π0.5 三个 server 共用此 client（端口不同：5556 / 5557 / 5558）。
-> - `starvla` = StarVLA (Qwen3-VL **4B / 8B** + GR00T flow-matching head) 的 websocket client（openpi msgpack-numpy 协议，stateless 双相机 @ 448）；近乎 Wall-X client 的复刻，见 `serve_starvla.py` + `StarVLAServicePolicyClient`。换骨干零源码改动（`cross_attention_dim` 运行时对齐所载 VLM `hidden_size`：4B=2560 / 8B=4096）；8B 本机 24G 用 `STARVLA_VLM_8BIT=1` int8 eval（serve+Isaac 共卡 18 GB）。
+> - `starvla` = StarVLA (Qwen3-VL **4B / 8B** + GR00T flow-matching head) 的 websocket client（openpi msgpack-numpy 协议，stateless 双相机 @ 448）；近乎 Wall-X client 的复刻，见 `serve_starvla.py` + `StarVLAServicePolicyClient`。引擎 = 自带嵌套 submodule `dependencies/starVLA`，指向 [`vitorcen/StarVLA`](https://github.com/vitorcen/StarVLA) fork 的 `starVLA_dev` 分支（本地改动已打成 commit，`--recursive` clone 即得，无需 apply patch）。换骨干零源码改动（`cross_attention_dim` 运行时对齐所载 VLM `hidden_size`：4B=2560 / 8B=4096）；8B 本机 24G 用 `STARVLA_VLM_8BIT=1` int8 eval（serve+Isaac 共卡 18 GB）。
 >
 > **Peak VRAM** = `nvidia-smi` 总 GPU 内存峰值（含 Isaac Sim ~5-6 GB baseline + policy server）。SmolVLA 23-24GB 是因 backbone 全权重 +Sim 共占；ACT 9.5GB 是 policy ~3GB + Sim 6GB。
 

@@ -47,12 +47,18 @@ starvla/common/         →  $REPO/examples/SO101_PickOrange/train_files/{modali
 数据集 `/root/autodl-tmp/datasets/`（LeRobot v2.1，经 v2.0 路径读），输出
 `/root/autodl-tmp/starvla-outputs/`，base `/root/autodl-tmp/models/<backbone>/`。
 
-## StarVLA repo 源码 patch（不在本目录）/ upstream patches
+## StarVLA 引擎 = vitorcen/StarVLA fork / engine submodule
 
-`dependencies/starVLA` 已转 submodule + 3 patch 维护，见 `patches/starvla/`（apply 顺序见其 README）：
-- **0001** 224→448 vision 死穴（橙子 10–40px，224 判死）
-- **0002** dataloader `num_workers 16→4 / prefetch 4→2`（16 worker 爆 62G RAM-cap）
-- **0003** 原子 save + keep-last-N 裁剪（无裁剪填满盘 → ENOSPC 崩）
+`dependencies/starVLA` 是 LeIsaac 自带的嵌套 submodule，指向
+[`vitorcen/StarVLA`](https://github.com/vitorcen/StarVLA) fork 的 `starVLA_dev`
+分支（基于上游 `e8f8fbb`）。**本地改动已作为 commit 打进 fork，不再用本仓 patch 文件**
+（clone `--recursive` 即得，无需 apply）。fork 当前相对上游的改动（见 fork 内 `CLAUDE.md`）：
+- 448 pack-sample（橙子 10–40px，224 判死）
+- dataloader `num_workers 16→4 / prefetch 4→2`（16 worker 爆 62G RAM-cap）
+- 原子 save + keep-last-N 裁剪（无裁剪填满盘 → ENOSPC 崩）
+- pyav codec context 泄漏 gc 修复（长训练 `avcodec_open2` ENOMEM）
+- config-gated proprio history（默认 0=无行为变化，LeSONIC P0 用）
+- `QwenPI_CE` FSQ-aware CE head（新文件，LeSONIC SONIC token 用）
 
 ## Run-1 配方 / recipe（`so101_qwen_gr00t.yaml`）
 

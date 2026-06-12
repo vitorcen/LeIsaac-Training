@@ -19,7 +19,7 @@ REPO=${REPO:-/root/autodl-tmp/starVLA}
 CONFIG=${CONFIG:-examples/SO101_PickOrange/train_files/configs/so101_qwen_gr00t.yaml}
 DATA_ROOT=${DATA_ROOT:-/root/autodl-tmp/datasets}
 RUN_ROOT=${RUN_ROOT:-/root/autodl-tmp/starvla-outputs}
-KEEP=${KEEP:-2}                 # patches/starvla/0003 prunes to newest-N -> never ENOSPC
+KEEP=${KEEP:-2}                 # fork's keep-last-N save prunes to newest-N -> never ENOSPC
 cd "$REPO"
 
 export CUDA_VISIBLE_DEVICES=0
