@@ -2,7 +2,7 @@
 
 ## Training: incremental sanity eval (mandatory, auto-on)
 
-**Rule**: split total steps into **10 slices** (`SAVE_FREQ = STEPS/10`). After each ckpt, run X-VLA-style quick eval: `EVAL_ROUNDS=3 EPISODE_LENGTH_S=60 MAX_ROUND_WALL_S=90` (~3-5 min). Abort if 3 consecutive slices show 0 oranges or arm stuck < 30s.
+**Rule**: split total steps into **10 slices** (`SAVE_FREQ = STEPS/10`). After each ckpt, run X-VLA-style quick eval: `EVAL_ROUNDS=5 EPISODE_LENGTH_S=60 MAX_ROUND_WALL_S=90` (~5-8 min). **Quick-screen = 5-round (not 3): 3-round closed-loop variance is ±20-40% so a 3-round peak/abort call is unreliable — user standard 2026-06-12.** Abort if 3 consecutive slices show 0 oranges or arm stuck < 30s.
 
 **Default ON in `scripts/training/lerobot_finetune.sh`** (env `AUTO_EVAL=1`): the wrapper spawns `scripts/training/eval_watcher.sh` in background, which polls `$OUTPUT_DIR/checkpoints/` and runs quick eval per new ckpt. If 3 consecutive slices fail, watcher writes `$OUTPUT_DIR/.eval_abort` and the wrapper SIGTERMs training — so you do not burn N more hours on a broken config. CSV at `$OUTPUT_DIR/auto_eval.csv`, log at `$OUTPUT_DIR/auto_eval.log`. Override with `AUTO_EVAL=0` only when intentionally training a non-evalable variant.
 

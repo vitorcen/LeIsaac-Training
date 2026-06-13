@@ -1,0 +1,84 @@
+# SO-101 PickOrange — StarVLA QwenGR00T_v2 (Qwen3-VL-8B frozen + GR00T N1.7-style head)
+# Head upgraded from the N1.5 design to the N1.7 PickOrange SOTA ckpt design:
+# VLLN + AlternateVLDiT (image/text alternating cross-attn) + DiT-N17 (16L x 1536)
+# + no future tokens + state_dropout 0.2. Single-variable A/B against
+# so101_qwen3vl8b_gr00t.yaml (53.3%): same backbone / data / horizon / trainer,
+# ONLY the head changes. Design doc: LeIsaac/docs/training/starvla_gr00t_v2_head_design.html
+run_id: so101_pickorange_qwen3vl8b_gr00t_v2
+run_root_dir: /root/autodl-tmp/starvla-outputs
+seed: 42
+wandb_entity: ""
+wandb_project: starVLA_SO101
+is_debug: false
+version_id: "0.21"
+
+framework:
+  name: QwenGR00T_N17
+  qwenvl:
+    base_vlm: /root/autodl-tmp/models/Qwen3-VL-8B-Instruct
+    attn_implementation: flash_attention_2   # dead on Qwen3 path (forced sdpa); kept for parity
+    vl_hidden_dim: 4096
+  action_model:
+    action_dim: 6
+    state_dim: 6
+    action_horizon: 16                # benchmark口径, same as v1/PI_v3
+    action_model_type: "DiT-N17"      # inner 1536 = 32 heads x 48 (N1.7 ckpt shape)
+    use_vlln: true
+    use_alternate_vl_dit: true
+    attend_text_every_n_blocks: 2
+    state_dropout_prob: 0.2           # N1.7 finetune value (NOT the 0.8 pretrain value)
+    num_target_vision_tokens: 0       # future tokens removed (N1.7)
+    vl_self_attention_cfg: null       # N1.7 PickOrange ckpt: Identity; ablation-only
+    vl_proj_dim: null                 # OOM fallback lever #2: set 2048 (LN+Linear)
+    # repeated_diffusion_steps default 8 = OOM lever #1: drop to 4 first
+    diffusion_model_cfg:
+      dropout: 0.2
+      final_dropout: true
+      interleave_self_attention: true
+      norm_type: ada_norm
+      num_layers: 16
+      output_dim: 1024                # explicit: action_decoder input dim depends on it
+      positional_embeddings: null     # explicit: N1.7 ckpt = null; DiT class default is
+                                      # sinusoidal -> not writing this would silently diverge
+
+datasets:
+  vla_data:
+    dataset_py: lerobot_datasets
+    data_root_dir: /root/autodl-tmp/datasets
+    data_mix: so101_pickorange
+    lerobot_version: v2.0
+    sequential_step_sampling: false
+    per_device_batch_size: 4
+    load_all_data_for_training: true
+    video_backend: torchvision_av
+
+trainer:
+  max_train_steps: 60000             # peak window 12k-36k is the priority; early-stop
+                                     # when 3 consecutive ckpts decline after a peak
+  num_warmup_steps: 1500
+  save_interval: 3000                # denser than v1's 6000: peak region is sharp and a
+                                     # 3x-larger head may peak earlier (review point)
+  eval_interval: 100000
+  keep_last_checkpoints: 12          # 3000-interval doubles ckpt count; cap disk
+  learning_rate:
+    base: 2.5e-05
+    qwen_vl_interface: 1.0e-05
+    action_model: 1.0e-04
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-06
+  freeze_modules: 'qwen_vl_interface'
+  loss_scale:
+    vla: 1.0
+    vlm: 0.1
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  logging_frequency: 10
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 1
+  gradient_checkpointing: true       # dead field on Qwen3 path; parity only
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-08

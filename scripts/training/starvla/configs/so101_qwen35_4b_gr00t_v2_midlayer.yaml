@@ -1,0 +1,92 @@
+# SO-101 PickOrange — StarVLA QwenGR00T_v2 on Qwen3.5-4B, MID-LAYER feature (E1).
+#
+# E1 = the decisive single-variable experiment after the 3-model review (2026-06-13,
+# Fable+codex+mimo) overturned the "N1.7 head doesn't transfer" reading. The 8B v2-full
+# negative (strict 13.3% vs v1 53.3%) was confounded by a PORTING GAP: the head read the
+# VLM's LAST layer (hidden_states[-1]) while real GR00T N1.7 reads a MID layer
+# (select_layer=12, qwen3_backbone.py pops the upper LLM layers). The last layer's
+# image-position hidden has lost its visual semantics, which is poison for AlternateVLDiT's
+# image-attending cross blocks. This config fixes ONLY that one variable.
+#   - Qwen3.5-4B = 24 LLM layers → select_layer 12 = exact mid layer (matches N1.7's 12).
+#   - Everything else identical to the v2-full head (VLLN + AlternateVLDiT + DiT-N17 +
+#     no future tokens + state_dropout 0.2), frozen-VLM head-only (tune_top_llm_layers 0).
+# Acceptance: if this recovers toward v1's 53.3% (P(3)>0), the 8B negative was a porting
+# hole, not a real "head doesn't transfer" finding → retract that conclusion. If it stays
+# ~13%, run v2-lite (E2) to attribute which delta hurts. Design doc §6.5 review block + §12.
+run_id: so101_pickorange_qwen35_4b_gr00t_v2_midlayer
+run_root_dir: /root/autodl-tmp/starvla-outputs
+seed: 42
+wandb_entity: ""
+wandb_project: starVLA_SO101
+is_debug: false
+version_id: "0.21"
+
+framework:
+  name: QwenGR00T_N17
+  qwenvl:
+    # StarVLA auto-selects the Qwen3.5-VL interface because the path contains "Qwen3.5".
+    base_vlm: /root/autodl-tmp/models/Qwen3.5-4B
+    attn_implementation: flash_attention_2   # dead on Qwen3 path (forced sdpa); kept for parity
+    vl_hidden_dim: 2560                       # Qwen3.5-4B text hidden; auto-overridden at runtime
+    tune_top_llm_layers: 0                    # head-only (frozen VLM); E1 isolates the feature layer, not unfreeze
+    select_layer: 12                          # ← THE single variable: mid layer of 24 (was -1 = last). Matches N1.7.
+  action_model:
+    action_dim: 6
+    state_dim: 6
+    action_horizon: 16                # benchmark口径, same as v1/PI_v3
+    action_model_type: "DiT-N17"      # inner 1536 = 32 heads x 48 (N1.7 ckpt shape)
+    use_vlln: true
+    use_alternate_vl_dit: true
+    attend_text_every_n_blocks: 2
+    state_dropout_prob: 0.2           # N1.7 finetune value (NOT the 0.8 pretrain value)
+    num_target_vision_tokens: 0       # future tokens removed (N1.7)
+    vl_self_attention_cfg: null       # N1.7 PickOrange ckpt: Identity; ablation-only
+    vl_proj_dim: null                 # cross_attention_dim aligns to 2560 at runtime
+    diffusion_model_cfg:
+      dropout: 0.2
+      final_dropout: true
+      interleave_self_attention: true
+      norm_type: ada_norm
+      num_layers: 16
+      output_dim: 1024
+      positional_embeddings: null
+
+datasets:
+  vla_data:
+    dataset_py: lerobot_datasets
+    data_root_dir: /root/autodl-tmp/datasets
+    data_mix: so101_pickorange
+    lerobot_version: v2.0
+    sequential_step_sampling: false
+    per_device_batch_size: 8          # 4B backbone + frozen-VLM head-only; smoke-confirm then raise
+    load_all_data_for_training: true
+    video_backend: torchvision_av
+
+trainer:
+  max_train_steps: 30000             # 4B converges faster than 8B; sweep from 5k
+  num_warmup_steps: 1500
+  save_interval: 3000                # 10 even slices; peak region is sharp
+  eval_interval: 100000
+  keep_last_checkpoints: 12
+  learning_rate:
+    base: 2.5e-05
+    qwen_vl_interface: 1.0e-05        # no-op here (VLM frozen); kept for parity
+    action_model: 1.0e-04
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-06
+  freeze_modules: 'qwen_vl_interface'
+  loss_scale:
+    vla: 1.0
+    vlm: 0.1
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  logging_frequency: 10
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 1
+  gradient_checkpointing: true       # dead field on Qwen3 path; parity only
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-08

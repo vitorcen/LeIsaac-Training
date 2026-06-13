@@ -1,0 +1,374 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>StarVLA GR00T_v2 动作头设计 — N1.5 头升级到 N1.7 设计 / GR00T_v2 Action Head Design</title>
+<style>
+  :root { color-scheme: light; }
+  body { background:#fff; color:#1a1a1a; font-family:-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+         max-width:1080px; margin:0 auto; padding:24px 32px 80px; line-height:1.65; }
+  h1 { font-size:1.7em; border-bottom:3px solid #2563eb; padding-bottom:8px; }
+  h2 { font-size:1.3em; margin-top:2em; border-left:5px solid #2563eb; padding-left:10px; }
+  h3 { font-size:1.08em; margin-top:1.5em; }
+  .en { color:#64748b; font-size:0.92em; font-style:italic; }
+  table { border-collapse:collapse; width:100%; margin:14px 0; font-size:0.9em; background:#fff; color:#1a1a1a; }
+  th,td { border:1px solid #cbd5e1; padding:6px 9px; text-align:left; vertical-align:top; }
+  th { background:#eff6ff; color:#1e3a8a; }
+  tr:nth-child(even) td { background:#f8fafc; }
+  code { background:#f1f5f9; color:#be123c; padding:1px 5px; border-radius:3px; font-size:0.9em; }
+  pre { background:#0f172a; color:#e2e8f0; padding:14px 16px; border-radius:8px; overflow-x:auto; font-size:0.85em; line-height:1.5; }
+  pre code { background:none; color:inherit; padding:0; }
+  .tldr { background:#eff6ff; color:#1a1a1a; border:1px solid #bfdbfe; border-left:6px solid #2563eb; padding:14px 18px; border-radius:6px; }
+  .warn { background:#fef2f2; color:#1a1a1a; border:1px solid #fecaca; border-left:6px solid #dc2626; padding:12px 16px; border-radius:6px; margin:12px 0; }
+  .ok   { background:#f0fdf4; color:#1a1a1a; border:1px solid #bbf7d0; border-left:6px solid #16a34a; padding:12px 16px; border-radius:6px; margin:12px 0; }
+  .note { background:#fffbeb; color:#1a1a1a; border:1px solid #fde68a; border-left:6px solid #d97706; padding:12px 16px; border-radius:6px; margin:12px 0; }
+  .adopt { color:#15803d; font-weight:600; } .skip { color:#b91c1c; font-weight:600; } .gate { color:#b45309; font-weight:600; }
+  svg { background:#fff; display:block; margin:18px auto; max-width:100%; }
+  .small { font-size:0.85em; color:#475569; }
+  .kbd { font-family:ui-monospace,monospace; }
+</style>
+</head>
+<body>
+
+<h1>StarVLA GR00T_v2 动作头：把 N1.5 血统的头升级到 N1.7 设计</h1>
+<p class="en">Upgrading starVLA's N1.5-lineage QwenGR00T action head to the GR00T N1.7 head design,
+then training <b>StarVLA-Qwen3-VL-8B-GR00T_v2-PickOrange</b> to challenge the PI_v3 entry (63.3%) and close in on the N1.7 SOTA (68.3%).</p>
+<p class="small">2026-06-12 · LeIsaac/docs/training · 代码落点：<code>vitorcen/StarVLA</code> fork（<code>starVLA_dev</code> 分支，只加新文件不改上游）· 评审：codex (gpt-5.5) + mimo-v2.5-pro，见 §10</p>
+
+<div class="tldr">
+<b>TL;DR</b>　starVLA 的 <code>QwenGR00T</code> 头是 GR00T <b>N1.5 的瘦身移植</b>（DiT-B 768×16L、全 VL token 盲 cross-attn、32 个 future tokens、无 VLLN、无 state dropout），同骨干下被自家 PI_v3 头压 10 个点（53.3% vs 63.3%）。
+N1.7 SOTA ckpt（68.3%）的头实测配置是：<b>DiT 16L × inner 1536 + AlternateVLDiT（图/文 token 交替 cross-attn）+ VLLN + state_dropout 0.2 + 去掉 future tokens</b>。
+GR00T_v2 = 把这五件事搬进 starVLA（新文件 <code>QwenGR00T_N17.py</code> + <code>GR00T_N17_ActionHeader.py</code>，全部 config 开关化），冻结 Qwen3-VL-8B 重训。
+<b>两段式跑法（双评审一致建议，§10）</b>：先跑 <b>v2-lite</b>（VLLN+删 future tokens+state_dropout，DiT-B 不扩，~30k 步便宜验证统计/正则收益），再跑 <b>v2-full</b>（+AlternateVLDiT+1536，头<b>实测 612M</b>，与 PI_v3 的 634M 几乎同参数——公平对比成立）——同一份头实现，两份 yaml。
+<br><span class="en"><b>EN:</b> starVLA's QwenGR00T head is a slimmed N1.5 port. The actual N1.7 SOTA checkpoint uses a 16-layer/1536-dim DiT with image/text-alternating cross-attention, VL LayerNorm, state dropout 0.2, and no future tokens. GR00T_v2 ports these deltas as NEW config-gated files in the fork. Per both external reviews, roll out in two stages: v2-lite (cheap 3-delta run, DiT-B unchanged) then v2-full (~0.7B head, sized to match PI_v3).</span>
+</div>
+
+<h2>1. 背景与目标 / Goal</h2>
+<p>当前 PickOrange strict 20-round 榜单（节选，<code>LeIsaac/README.md</code>）：</p>
+<table>
+<tr><th>排名</th><th>模型</th><th>头</th><th>E(🍊)/ep</th><th>P(3)</th><th>备注</th></tr>
+<tr><td>🥇</td><td>GR00T-N1.7-PickOrange (ours, ckpt-6000)</td><td>N1.7 原生头（16L×1536 + Alternate + VLLN）</td><td><b>68.3%</b></td><td>50%</td><td>Cosmos-Reason2-2B 骨干，头带<b>机器人预训练</b>，relative action</td></tr>
+<tr><td>🥈</td><td>hi-space GR00T-N1.7</td><td>同上</td><td>66.7%</td><td>45%</td><td>—</td></tr>
+<tr><td>🥉</td><td>StarVLA-Qwen3-VL-8B-<b>PI_v3</b> (ours, step-78k)</td><td>LayerwiseFM（36 层逐层 cross-attn，0.63B）</td><td><b>63.3%</b></td><td>40%</td><td>冻 VLM、头从零训</td></tr>
+<tr><td>5</td><td>StarVLA-Qwen3-VL-8B-<b>GR00T</b> (ours, step-30k)</td><td>QwenGR00T（DiT-B 768×16L，0.24B）</td><td>53.3%</td><td>35%</td><td>冻 VLM、头从零训 ← <b>本次的 baseline</b></td></tr>
+</table>
+<p><b>假设（hypothesis）</b>：N1.7 SOTA 的领先里有一部分来自<b>动作头设计本身</b>（不只是 Cosmos 骨干和预训练）。
+验证方式 = 控制变量：<b>同一个冻结 Qwen3-VL-8B、同数据、同训练预算，只把头从 v1（N1.5 设计）换成 v2（N1.7 设计）</b>。
+若 v2 ≥ 63.3% 即超越 PI_v3、若显著 &gt; 53.3% 即证明头设计贡献为真。
+<span class="en">Single-variable test: same frozen backbone, same data/budget, head v1→v2. Beating 53.3% confirms the head-design contribution; beating 63.3% dethrones PI_v3.</span></p>
+
+<h2>2. 四代头横向对比（全部读自本仓代码与 ckpt config，非论文转述）</h2>
+<p class="small">来源：starVLA <code>GR00T_ActionHeader.py</code> / N1.5 <code>flow_matching_action_head.py</code> / N1.6 <code>gr00t_n1d6.py</code> / N1.7 <code>gr00t_n1d7.py</code> + 两个实测 ckpt config（<code>gr00t-n17-leisaac-pick-orange-autodl-v2/checkpoint-6000/config.json</code>、<code>gr00t-n16-leisaac-pick-orange/config.json</code>）。</p>
+<table>
+<tr><th>维度</th><th>starVLA QwenGR00T（现状）</th><th>GR00T N1.5</th><th>GR00T N1.6 (PickOrange ckpt)</th><th>GR00T N1.7 (PickOrange SOTA ckpt)</th></tr>
+<tr><td>DiT 规模</td><td><b>DiT-B：inner 768</b>（12 头×64），16 层</td><td>inner 1536（32×48），32 层</td><td>inner 1536，<b>32 层</b></td><td>inner 1536，<b>16 层</b>（SONIC-G1 变体用 32 层）</td></tr>
+<tr><td>VL 条件机制</td><td>偶数层 cross-attn <b>盲扫全部 VL token</b></td><td>同左</td><td><b>AlternateVLDiT</b>：cross-attn 在图 token / 文 token 间交替（<code>attend_text_every_n_blocks=2</code>）</td><td>同 N1.6（<code>use_alternate_vl_dit=True</code> 默认开）</td></tr>
+<tr><td>VL 特征规范化</td><td><b>无</b>，VLM last_hidden 裸喂</td><td>VLLN（LayerNorm）</td><td>VLLN ✓</td><td>VLLN ✓</td></tr>
+<tr><td>VL self-attention 预处理</td><td>无</td><td>config 可选</td><td>无</td><td><b>PickOrange ckpt 无</b>（Identity）；SONIC-G1 ckpt 用 4 层</td></tr>
+<tr><td>future tokens</td><td><b>32 个可学习 token</b> 前缀</td><td>32 个（<code>num_target_vision_tokens</code>）</td><td>无</td><td><b>无</b>（序列 = [state, action]）</td></tr>
+<tr><td>state dropout</td><td><b>无</b></td><td>无</td><td>0.0（字段存在）</td><td><b>0.2</b>（预训练默认 0.8）</td></tr>
+<tr><td>embodiment 处理</td><td>普通 MLP（单 embodiment）</td><td colspan="3">CategorySpecific 权重组（32 套 W 按 embodiment_id 选）</td></tr>
+<tr><td>flow matching</td><td colspan="4">完全同源：velocity 目标 MSE、t∼Beta(1.5,1.0) 翻向 0（starVLA <code>(0.999−u)/0.999</code> ≡ N1.7 <code>(1−u)×0.999</code>，已逐行核验非 bug）、1000 桶离散、推理 4 步 Euler</td></tr>
+<tr><td>action_horizon</td><td>16（我们 SO-101 口径）</td><td>16–50 per-embodiment</td><td>50</td><td>40 + <code>use_relative_action=True</code></td></tr>
+<tr><td>头参数量（对 4096 hidden 骨干）</td><td>~0.24B</td><td>~1.0B</td><td>~1.2B</td><td><b>~0.7B</b></td></tr>
+</table>
+
+<div class="ok"><b>核心洞察 / Key insight</b>：N1.6→N1.7 NVIDIA 自己把 DiT 从 32 层<b>砍回 16 层</b>、删掉 future tokens、删掉 4 层 post-VLM adapter——但加了 AlternateVLDiT + state dropout，结果 PickOrange 上 N1.7(68.3%) &gt; N1.6。<b>方向不是堆深度，是改 VL 条件质量 + 正则</b>。这正合本仓品味：v2 不是"更大的头"，是"消除两个坏特殊情况"（裸 hidden 无规范化、cross-attn 不分图文盲扫）。
+<span class="en">NVIDIA themselves went 32→16 layers from N1.6 to N1.7 while adding alternating VL attention and state dropout — the win came from conditioning quality and regularization, not depth.</span></div>
+
+<h2>3. 架构框图：v1 vs v2 / Dataflow diagram</h2>
+<svg viewBox="0 0 1020 560" xmlns="http://www.w3.org/2000/svg" font-family="sans-serif" font-size="13">
+  <!-- v1 column -->
+  <text x="240" y="24" text-anchor="middle" font-size="16" font-weight="bold" fill="#b91c1c">v1 现状 QwenGR00T（N1.5 瘦身版）</text>
+  <rect x="80" y="40" width="320" height="44" rx="6" fill="#eff6ff" stroke="#2563eb"/>
+  <text x="240" y="58" text-anchor="middle" fill="#1e3a8a">Qwen3-VL-8B（冻结） last_hidden</text>
+  <text x="240" y="76" text-anchor="middle" fill="#64748b" font-size="11">[B, seq≈700, 4096]，图文 token 混排</text>
+  <line x1="240" y1="84" x2="240" y2="112" stroke="#94a3b8" stroke-width="2" marker-end="url(#a)"/>
+  <text x="320" y="103" fill="#b91c1c" font-size="11">裸喂，无 LayerNorm</text>
+  <rect x="80" y="112" width="320" height="120" rx="6" fill="#fef2f2" stroke="#dc2626"/>
+  <text x="240" y="132" text-anchor="middle" font-weight="bold" fill="#7f1d1d">DiT-B 16L × inner 768</text>
+  <text x="240" y="152" text-anchor="middle" fill="#7f1d1d" font-size="11">偶数层 cross-attn → 全部 VL token（图文不分）</text>
+  <text x="240" y="170" text-anchor="middle" fill="#7f1d1d" font-size="11">奇数层 self-attn · ada_norm(t)</text>
+  <text x="240" y="190" text-anchor="middle" fill="#7f1d1d" font-size="11">序列 = [state(1) | future_tokens(32) | action(16)]</text>
+  <text x="240" y="210" text-anchor="middle" fill="#b91c1c" font-size="11">32 个 future tokens = N1.7 已删除的死重</text>
+  <line x1="240" y1="232" x2="240" y2="260" stroke="#94a3b8" stroke-width="2" marker-end="url(#a)"/>
+  <rect x="120" y="260" width="240" height="38" rx="6" fill="#f8fafc" stroke="#64748b"/>
+  <text x="240" y="284" text-anchor="middle">action_decoder MLP → velocity [B,16,6]</text>
+  <text x="240" y="330" text-anchor="middle" fill="#b91c1c" font-weight="bold">strict 20rd = 53.3%</text>
+
+  <!-- v2 column -->
+  <text x="760" y="24" text-anchor="middle" font-size="16" font-weight="bold" fill="#15803d">v2 设计（N1.7 头移植）</text>
+  <rect x="600" y="40" width="320" height="44" rx="6" fill="#eff6ff" stroke="#2563eb"/>
+  <text x="760" y="58" text-anchor="middle" fill="#1e3a8a">Qwen3-VL-8B（冻结） last_hidden</text>
+  <text x="760" y="76" text-anchor="middle" fill="#64748b" font-size="11">+ image_mask = (input_ids == image_token_id)</text>
+  <line x1="760" y1="84" x2="760" y2="108" stroke="#94a3b8" stroke-width="2" marker-end="url(#a)"/>
+  <rect x="640" y="108" width="240" height="34" rx="6" fill="#f0fdf4" stroke="#16a34a"/>
+  <text x="760" y="130" text-anchor="middle" fill="#14532d">VLLN：LayerNorm(4096) ← 新增①</text>
+  <line x1="760" y1="142" x2="760" y2="166" stroke="#94a3b8" stroke-width="2" marker-end="url(#a)"/>
+  <rect x="600" y="166" width="320" height="150" rx="6" fill="#f0fdf4" stroke="#16a34a"/>
+  <text x="760" y="186" text-anchor="middle" font-weight="bold" fill="#14532d">AlternateVLDiT 16L × inner 1536 ← 新增②③</text>
+  <text x="760" y="206" text-anchor="middle" fill="#14532d" font-size="11">cross-attn 块交替：图 token 块 ↔ 文 token 块</text>
+  <text x="760" y="224" text-anchor="middle" fill="#14532d" font-size="11">（attend_text_every_n_blocks=2，按 image_mask 路由）</text>
+  <text x="760" y="244" text-anchor="middle" fill="#14532d" font-size="11">奇数层 self-attn · ada_norm(t) · dropout 0.2</text>
+  <text x="760" y="264" text-anchor="middle" fill="#14532d" font-size="11">序列 = [state(1) | action(16)]，future tokens 删除 ← ④</text>
+  <text x="760" y="284" text-anchor="middle" fill="#14532d" font-size="11">state_dropout 0.2（训练时 80% 概率保留）← ⑤</text>
+  <text x="760" y="304" text-anchor="middle" fill="#64748b" font-size="11">flow matching / Euler 4 步：与 v1 逐 bit 相同，不动</text>
+  <line x1="760" y1="316" x2="760" y2="340" stroke="#94a3b8" stroke-width="2" marker-end="url(#a)"/>
+  <rect x="640" y="340" width="240" height="38" rx="6" fill="#f8fafc" stroke="#64748b"/>
+  <text x="760" y="364" text-anchor="middle">action_decoder MLP → velocity [B,16,6]</text>
+  <text x="760" y="408" text-anchor="middle" fill="#15803d" font-weight="bold">目标：&gt;63.3%（超 PI_v3），冲 68.3%</text>
+
+  <!-- legend bottom -->
+  <rect x="80" y="450" width="840" height="86" rx="6" fill="#fffbeb" stroke="#d97706"/>
+  <text x="100" y="474" fill="#92400e" font-weight="bold">五个 delta（全部来自 N1.7 实测 ckpt config，非论文）：</text>
+  <text x="100" y="496" fill="#92400e" font-size="12">① VLLN 规范化冻结 VLM 的特征统计　② DiT inner 768→1536（16 层不变）　③ AlternateVLDiT 图/文交替 cross-attn</text>
+  <text x="100" y="516" fill="#92400e" font-size="12">④ 删 32 个 future tokens（N1.7 已证明是死重）　⑤ state_dropout 0.2 逼头看视觉（PickOrange 本质是视觉任务）</text>
+  <defs><marker id="a" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="#94a3b8"/></marker></defs>
+</svg>
+
+<h2>4. 设计决策清单：N1.7 的每一项，采纳还是不采纳 / Adopt-or-skip ledger</h2>
+<table>
+<tr><th>N1.7 机制</th><th>决策</th><th>理由（一句话说清）</th></tr>
+<tr><td>AlternateVLDiT（图/文交替 cross-attn）</td><td class="adopt">采纳</td><td>v1 最大的坏味道：448² 双相机 ≈ 数百图 token 淹没十几个文 token，盲扫 cross-attn 等于指令信号被稀释；交替路由让两路各有专属带宽。image_mask 可直接从 <code>input_ids == image_token_id</code> 得到，零额外成本。</td></tr>
+<tr><td>VLLN（VL 特征 LayerNorm）</td><td class="adopt">采纳</td><td>骨干冻结 → 头无法适配 VLM 输出的尺度漂移，一个 LayerNorm(4096) 即消除该特殊情况；8K 参数，免费。</td></tr>
+<tr><td>DiT inner 768→1536（32头×48），16 层</td><td class="adopt">采纳</td><td>对齐 N1.7-PickOrange SOTA ckpt 实测值；头 ~0.7B 与 PI_v3 0.63B 同量级 → 赢了不能被"参数更多"解释。</td></tr>
+<tr><td>删 future tokens（32 个）</td><td class="adopt">采纳</td><td>N1.6/N1.7 都已删；它们是任务无关的可学习前缀，60 demo 小数据上是纯过拟合面。</td></tr>
+<tr><td>state_dropout 0.2</td><td class="adopt">采纳（只做特征层一遍）</td><td>SO-101 6 维 proprio 在小数据上易成捷径特征；20% 置零逼头依赖视觉。取 N1.7 微调值 0.2，不取预训练值 0.8。<b>注意 N1.7 实际有两层 dropout</b>（processor 数据侧 + head 特征侧，叠加有效率 36%）——我们只在 <code>state_encoder</code> 输出后按样本整 token 置零、training only，与 <code>gr00t_n1d7.py:206-212</code> 对齐（双评审一致）。</td></tr>
+<tr><td>VL self-attention 预处理（4 层）</td><td class="gate">config 开关，默认关</td><td>N1.7-PickOrange SOTA ckpt 本身没用（Identity）——单任务下 VL 特征大概率不需要额外 self-attn 整理（SONIC-G1 多动作语料才用 4 层）；留 <code>vl_self_attention_cfg</code> 字段供消融，默认 null = 无行为。</td></tr>
+<tr><td>CategorySpecific 多 embodiment 权重组</td><td class="skip">不采纳</td><td>我们只有 SO-101 一个 embodiment，32 套权重选 1 套 = 为不存在的问题加 32 倍参数面；普通 MLP 即可。<b>好品味 = 消除特殊情况，不是搬运特殊情况。</b></td></tr>
+<tr><td>RTC 实时纠正 inpainting</td><td class="skip">不采纳</td><td>benchmark 是开环 chunk 重放（per-model action_horizon=16），无 RTC 介入点。</td></tr>
+<tr><td>state_history_length &gt; 1</td><td class="skip">不采纳</td><td>N1.7 默认也是 1；与 v1 对照要单变量。</td></tr>
+<tr><td>relative action（<code>use_relative_action=True</code>）</td><td class="skip">本期不采纳</td><td>这是<b>数据侧</b>改动（N1.7 SOTA 的潜在混淆因子之一，见 §8），动了它 head-swap 归因就不干净；列为 v2 之后的独立消融。</td></tr>
+<tr><td>4096→低维投影后再 cross-attn</td><td class="gate">config 开关，默认直连</td><td>N1.7 是 backbone 维度直连（2048），我们默认 4096 直连少一个部件；但 4096 与 N1.7 的 2048 <b>尺度不等价</b>（codex 评审点），留 <code>vl_proj_dim</code> 开关（LN+Linear 4096→2048）作为 OOM / 训练不稳时的 P0 fallback。</td></tr>
+</table>
+
+<h2>5. 实现方案 / Implementation</h2>
+<p>落点 = <code>vitorcen/StarVLA</code> fork（<code>starVLA_dev</code>），遵守 fork 内 <code>CLAUDE.md</code> 铁律：<b>只加新文件，不改上游已有文件</b>，单行 commit。
+<span class="en">New files only in the fork; upstream files untouched; one-line commits; user pushes.</span></p>
+<div class="warn"><b>命名决策：代码标识符用 <code>QwenGR00T_N17</code>，不用 <code>QwenGR00T_v2</code></b>。
+实现时发现上游 <code>.gitignore:264</code>（commit <code>ea78f0e</code> #316）精确忽略了
+<code>starVLA/model/framework/VLM4A/QwenGR00T_v2.py</code> 这个路径——说明上游有自己的 WIP v2 头。
+强占该名 = 未来 rebase 在同一路径撞文件 + framework registry key 静默覆盖（import 顺序决定谁生效）。
+所以：<b>代码 = <code>QwenGR00T_N17</code>（也更诚实——它就是 N1.7 头设计）；文档/模型/榜单命名照旧用 "GR00T_v2"</b>（如 <code>StarVLA-Qwen3-VL-8B-GR00T_v2-PickOrange</code>）。</div>
+<table>
+<tr><th>文件</th><th>内容</th><th>新/改</th></tr>
+<tr><td><code>starVLA/model/modules/action_model/GR00T_N17_ActionHeader.py</code></td><td><code>FlowmatchingActionHeadN17</code>：VLLN + state_dropout + [state|action] 序列（无 future tokens）；<code>AlternateVLDiT</code> + <code>SelfAttentionTransformer</code> 从 N1.7 <code>dit.py</code> 移植（保留 NVIDIA 版权头）；DiT 主体复用 fork 已有 <code>cross_attention_dit.py</code> 的块实现，只在 forward 加 image_mask 路由</td><td><b>新增</b></td></tr>
+<tr><td><code>starVLA/model/framework/VLM4A/QwenGR00T_N17.py</code></td><td>框架类：在 v1 基础上 (a) 从 <code>qwen_inputs["input_ids"]</code> 算 image_mask 传给头；(b) 运行时对齐 <code>cross_attention_dim = model.config.hidden_size</code>（沿用 v1 机制）；registry 按文件名自动发现，<code>framework.name: QwenGR00T_N17</code> 即生效</td><td><b>新增</b></td></tr>
+<tr><td><code>LeIsaac/scripts/training/starvla/configs/so101_qwen3vl8b_gr00t_v2.yaml</code></td><td>训练配置（下方）；LeIsaac 侧，不进 fork</td><td><b>新增</b></td></tr>
+<tr><td>eval：<code>serve_starvla.py</code></td><td><b>零改动</b>——它从 ckpt 的 <code>config.yaml</code> 重建框架（VLM-agnostic），<code>repoint_base_vlm</code> 命中的 <code>framework.qwenvl.base_vlm</code> 键 v2 保持同名</td><td>不动</td></tr>
+</table>
+
+<h3>配置（关键差异 diff v1 8B yaml）</h3>
+<pre><code>framework:
+  name: QwenGR00T_N17                  # ← 唯一的框架切换点
+  qwenvl:
+    base_vlm: /root/autodl-tmp/models/Qwen3-VL-8B-Instruct
+    vl_hidden_dim: 4096
+  action_model:
+    action_dim: 6
+    state_dim: 6
+    action_horizon: 16                # 与 v1/PI_v3 同口径，单变量对照
+    action_model_type: "DiT-N17"      # 新词条：inner 1536 = 32 heads × 48
+    use_vlln: true                    # ① VL LayerNorm
+    use_alternate_vl_dit: true        # ③ 图/文交替 cross-attn
+    attend_text_every_n_blocks: 2
+    state_dropout_prob: 0.2           # ⑤ 只在 head 特征层做一遍（见 §4）
+    num_target_vision_tokens: 0       # ④ future tokens 删除
+    vl_self_attention_cfg: null       # 默认关；消融时给 {num_layers:4, num_attention_heads:32, attention_head_dim:64}
+    vl_proj_dim: null                 # 默认 4096 直连；OOM/不稳 fallback 设 2048（LN+Linear）
+    diffusion_model_cfg:
+      num_layers: 16
+      dropout: 0.2
+      norm_type: ada_norm
+      interleave_self_attention: true
+      positional_embeddings: null     # 显式写死：N1.7 ckpt 实测 null；starVLA DiT 类签名默认
+                                      # sinusoidal，不写就埋静默架构差异（mimo 评审点）
+      output_dim: 1024                # 显式写死，action_decoder 输入维度依赖它（mimo 评审点）
+# trainer 与 v1 8B run 完全一致：bs=4 / head lr 1e-4 / cosine_with_min_lr /
+# freeze qwen_vl_interface；save_interval 改 3000（峰区尖，6000 会漏 best，codex 评审点）
+</code></pre>
+
+<h3>v2-lite 配置（先行验证跑，双评审一致建议）</h3>
+<pre><code># so101_qwen3vl8b_gr00t_v2_lite.yaml — 与 v2-full 同一份头实现，只关两个开关：
+#   action_model_type: "DiT-B"        # 不扩容（768×16L 同 v1）
+#   use_alternate_vl_dit: false       # 不开图/文交替
+# 保留：use_vlln / num_target_vision_tokens=0 / state_dropout_prob=0.2
+# 头 ~0.24B 不变 → 30k 步 ≈ v1 同速 ~13h。若 lite 即从 53.3% 拉到 ~58%+，
+# 说明统计+正则是大头，v2-full 的扩容/路由再上去做归因才有意义。</code></pre>
+
+<h3>image_mask 取得（唯一的新管线接缝，<b>train/predict 双路径都要传</b>）</h3>
+<pre><code># QwenGR00T_N17.forward（训练）：
+image_token_id = self.qwen_vl_interface.model.config.image_token_id   # Qwen3-VL = 151655，已核验
+image_mask = qwen_inputs["input_ids"] == image_token_id               # [B, seq] bool
+# ⚠ repeated_diffusion_steps：image_mask 必须与 last_hidden / attention_mask 同步 repeat，
+#   漏掉不报错但路由全错（静默广播）——双评审都点名的头号硬伤
+image_mask_rep = image_mask.repeat(R, 1)
+assert image_mask_rep.shape[0] == last_hidden_rep.shape[0]
+action_loss = self.action_model(last_hidden_rep, actions_rep, state_rep,
+    encoder_attention_mask=mask_rep, image_mask=image_mask_rep)
+
+# QwenGR00T_N17.predict_action（推理）：无 repeat，但同样必须传 image_mask。
+# mask 语义照抄 N1.7（bool = "可 attend"，不是 HF additive negative mask）：
+#   图块:  cross_mask = image_mask & backbone_attention_mask
+#   文块:  cross_mask = ~image_mask & backbone_attention_mask
+# 冒烟断言（mimo 评审点）：
+assert image_mask.sum() > 0
+assert image_mask.sum() == expected_vision_patch_count   # 与 processor grid 对账
+# 注意 video_token_id=151656 是另一个 id，双相机静帧走 image 路径不受影响
+</code></pre>
+
+<h2>6. 训练与评测计划 / Training & eval plan</h2>
+<table>
+<tr><th>阶段</th><th>内容</th><th>判据 / 预算</th></tr>
+<tr><td>0. 本地静态冒烟</td><td>CPU/单卡构图：config 解析、head forward 一个假 batch、参数量打印；image_mask 断言（sum&gt;0 且 == vision patch 数）；<b>打印 optimizer state 实测显存</b>（codex 评审点：38–44G 只是纸面估算）</td><td>不崩、shape 对、v2-full 参数量 0.6–0.8B / lite ~0.24B</td></tr>
+<tr><td>1. 云端 500 步冒烟</td><td><code>MAX_STEPS=500 SAVE_INTERVAL=500</code>，拉回 ckpt-500 起 serve，看机械臂会动（标准流程：smoke-500 快判）</td><td>~20min；loss 下降、VRAM 峰值实测、eval 臂会动</td></tr>
+<tr><td>2a. <b>v2-lite 30k 步</b>（先行）</td><td>DiT-B 不扩 + VLLN + 删 future + state_dropout；bs=4、save_interval 3000</td><td>~1.0s/step ≈ 13h；若 strict 落到 ~58%+ → 统计/正则是大头，归因明确</td></tr>
+<tr><td>2b. <b>v2-full 60k 步</b></td><td>+AlternateVLDiT+1536；bs=4、<b>save_interval 3000（3k–36k 段）之后 6000</b>（峰区尖，6000 漏 best——codex 评审点）、watchdog RESUME、keep-last-N 裁剪</td><td>实测 step 时间再定（评审估 2.0–2.5s/step ≈ 33–42h，比文初稿 1.6–1.8s 悲观）；重点覆盖 12k–36k，后半低优先级</td></tr>
+<tr><td>3. ckpt sweep</td><td><code>starvla_sweep_watcher.sh</code> 逐 ckpt 拉回本地 8bit eval（VLM int8 + head bf16），先 3-round 粗扫</td><td>v1 峰 30k；v2-full 头大 3×，<b>峰可能提前到 10–15k</b>；<b>提前终止</b>：峰后连续 3 个 ckpt 单调下滑即停训，不必跑满 60k</td></tr>
+<tr><td>4. strict 20-round</td><td>粗扫 top-2 ckpt 跑 <code>run_one_strict.sh</code> 20-round 终评；<b>best ckpt 云端 bf16 复核一次</b>（v2 头更依赖 VL 特征细节，排除 int8 归因噪音）</td><td>榜单口径：E(🍊)/ep + P(placed=k) 分布</td></tr>
+</table>
+<div class="note"><b>验收标准 / Acceptance</b>（按评审收紧）：
+<b>有效胜利</b> = 比 53.3% <b>高 ≥5 个点</b>（≥58.3%）或 P(3) 显著改善——20-round 的 5-round σ 大，+2 点不算赢（codex）；
+<b>目标</b> ≥ 63.3%（PI_v3 8B）→ GR00T_v2 成为 starVLA 系最强头；现实区间评审估 <b>58–62%</b>（mimo），<b>未达 63.3% 不解读为 N1.7 deltas 无效</b>（PI_v3 是同骨干强 baseline，追平已是强结果）；
+<b>冲刺</b> → 68.3%（N1.7 SOTA，§8 混淆因子使其非对等比较）。
+任一 ckpt 三连切片 0 oranges → abort 查 config（LeIsaac 长训练铁律）。</div>
+
+<h2>6.5 实测结果 / Actual results（2026-06-13）—— 🟠 负面但混淆未控（结论下调为"待复测"）/ NEGATIVE but CONFOUNDED</h2>
+<div class="warn">
+<b>初判结论：N1.7 头移植到冻 Qwen3-VL-8B head-only PickOrange 上没带来提升，远不如 N1.5 血统的 v1（13.3% ≪ 53.3%）。</b><br>
+<b>⚠️ 事后三方评审（Fable / codex-gpt5.5 / mimo，2026-06-13）推翻了"这是 N1.7 头设计不迁移的干净负面"这一归因</b>——发现一处<b>移植缺口</b>使本次对比不成立（详见下方评审裁决）。结论从"NEGATIVE（头设计不行）"<b>下调为"INCONCLUSIVE / 待一次单变量复测"</b>。
+<span class="en"><b>EN:</b> A 3-model review overturned the clean "N1.7-head-doesn't-transfer" reading: a porting gap (wrong VLM feature layer) confounds the v1-vs-v2 comparison. Downgraded from NEGATIVE to INCONCLUSIVE pending one single-variable re-measure.</span>
+</div>
+<p><b>训练 + sweep（10k→42.5k 全扫，覆盖 4.7 epoch，本地 GUI 5-round headless 180 quick-screen）</b>：v2-full（QwenGR00T_N17，612M 头，rep=8/bs=4/50k 步，weste 4090，~0.62s/step）训练健康。
+sweep 曲线确认 <b>N17 是早峰型</b>——峰在 <b>step-17500（1.9 epoch）quick-screen 53.3%</b>，22500=33.3% 次高，之后 25k–42.5k 一路低位（6.7–26.7%，40000 甚至卡死 0%），<b>无二次爬升晚峰</b>（37500 的 33.3% 是噪声）。早峰<b>印证了 §2 的预判</b>（N17 大头比 v1 的 3.3-epoch 峰更早），但峰<b>质量</b>差。</p>
+<table>
+<tr><th>模型 / head</th><th>strict 20-round 口径</th><th>E(🍊)/ep</th><th>P(3)</th><th>P(≥2)</th></tr>
+<tr><td>v1 <b>QwenGR00T (N1.5)</b> 8B step-30k</td><td>headless 180</td><td><b>53.3%</b></td><td>35%</td><td>45%</td></tr>
+<tr><td><b>v2 QwenGR00T_N17</b> 8B step-17500</td><td>headless 180</td><td>🔴 <b>13.3%</b> (8/60)</td><td><b>0%</b></td><td><b>0%</b></td></tr>
+<tr><td>（参考）PI_v3 / N1.7 SOTA</td><td>—</td><td>63.3% / 68.3%</td><td>40% / 50%</td><td>55% / 70%</td></tr>
+</table>
+<p><b>两个独立信号都负面</b>：① strict 真值 <b>13.3% ≪ 53.3%</b>；② <b>P(3) 恒 0</b>——20 round 每轮最多放 1 颗（仅 8/20 round 放到 1），<b>即便 GUI 360-cap 给够时间也从没放满 3 颗（只 ~2/3，vs v1 35%）</b>，说明不是单纯"612M 大头推理慢（~1.3s/query → 120s sim >180s 墙钟 → 每轮 wall_cap 截断）"的测量问题，而是 <b>policy 在完整任务上确实更弱</b>。
+<b>quick-screen 的 53.3% 是 5-round 噪声乐观离群点</b>（strict 20-round 真值仅 13.3%）——又一次印证 20-round 必要性。</p>
+<div class="note"><b>为什么没赢 / Why it failed</b>：§7 把 VLLN 排为预期收益最大，但实测整套 N1.7 deltas（VLLN + AlternateVLDiT + state_dropout + 无 future tokens）在<b>冻 VLM + 60-demo</b> 这套约束下学不出来。NVIDIA N1.7 在机器人上赢，靠的是 <b>Cosmos-Reason2 具身预训练骨干 + 头的机器人预训练 + relative action</b>（§8 列的混淆因子，都是<b>数据/骨干侧</b>），<b>纯头设计移植无法复刻</b>。同骨干下真正赢 v1 的是 PI_v3 的 LayerwiseFM（per-layer cross-attn + 状态离散进文本），不是 N1.7 的这几个 delta。
+<span class="en"><b>EN:</b> The N1.7 advantage is data/backbone-side (Cosmos embodied pretraining + robot-pretrained head + relative action), not the head-design deltas — which don't transfer to a frozen-VLM head-only setup. PI_v3's LayerwiseFM, not the N1.7 deltas, is what actually beats v1 on the same backbone.</span></div>
+<p class="small"><b>测量踩坑（可复用）</b>：(1) 8bit 8B + 612M 大头推理慢，strict 180 口径每轮都 wall_cap 截断（v1 240M 小头能塞进 180s 不截断，同口径 N17 双重吃亏）；GUI 更慢需 wall_cap 360 但非可比口径。(2) <code>starvla_strict_eval.sh</code> 的 RETEST 引用 <code>$ROOT/scripts/benchmark/flag_serve_hang.py</code>（伞仓），但重构后该工具搬到 <code>LeIsaac/scripts/benchmark/</code> → 找不到报错被误判成"serve-hang"→ 假 RETEST 重跑（首轮 20-round 结果有效，杀掉即可；BENCH 路径待修）。(3) headless eval 能跑（早先 sweep 一次卡死是偶发）。</p>
+
+<div class="note" style="border-left:4px solid #ea580c">
+<b>📋 三方独立评审裁决 / 3-model review verdict（Fable + codex-gpt5.5 + mimo，2026-06-13）</b><br>
+评审目标：13.3% ≪ 53.3% 究竟是<b>真发现</b>还是<b>实现 bug / 移植缺口</b>。逐行核对了头、框架接缝、与真 Isaac-GR00T N1.7 参考实现。结论收敛于<b>三点共识</b>：
+<ul>
+<li><b>① [移植缺口·最可能根因] VLM 特征取层错位：<code>hidden_states[-1]</code>（第 36 层）vs 真 N1.7 <code>select_layer=12</code>（中层）</b>。<span class="en">Fable + mimo 一致首要。</span>真 N1.7（<code>qwen3_backbone.py</code>）<b>物理 pop 掉第 13–36 层</b>、头吃<b>第 12 层中层特征</b>；fork 取最后一层。最后一层特征为 next-token 语言预测优化，<b>且 image 位置的 hidden 到末层已丢失视觉语义</b>——而 AlternateVLDiT 有 4 个 cross block <b>只准看 image 位置 token</b>（强耦合），等于被 mask 强制喂垃圾。这是<b>静默退化、不崩</b>，对 v2 的杀伤远大于 v1（v1 全 token cross-attn 可绕开坏位）。<b>本次"N1.7 头"从未在正确特征层上测过。</b></li>
+<li><b>② [真 bug] 部分解冻当前是静默 no-op</b>（Fable + codex + 代码实锤；mimo 误判为无 bug，其自身 trace 自相矛盾）。<code>build_param_lr_groups</code> 按 <code>freeze_modules='qwen_vl_interface'</code> 把<b>整个 VLM 的 param 全列入 frozen 集合</b>并从所有 optimizer group 剔除（<code>trainer_tools.py:132/140</code>）；optimizer 在 <code>main()</code> 中<b>先于</b> <code>prepare_training()</code> 的 freeze+unfreeze 构建（<code>train_starvla.py:462</code> vs <code>:473</code>）。之后 <code>apply_partial_unfreeze</code> 翻 <code>requires_grad=True</code> 的那些 param <b>已不在任何 optimizer group</b> → <code>optimizer.step()</code> 永不更新它们。<b>照现状跑 unfreeze4 = 又一次 head-only，白烧整轮。</b>（§11 line 340 旧注"时序正确"<b>是错的</b>，已更正。）</li>
+<li><b>③ [次生 bug，修②后才暴露] 解冻层裸 bf16 训练、无 fp32 master copy</b>。真 N1.7 把 trainable backbone 参数 cast 回 fp32（<code>backbone_trainable_params_fp32</code>）；lr=1e-5 对 bf16 权重的相对更新贴着 ULP，<b>大量更新静默量化为零</b>。（DeepSpeed ZeRO-2 会兜底 fp32 master，但当前非 DeepSpeed 路径有风险。）</li>
+</ul>
+<b>无 bug 项（评审一致）</b>：AlternateVLDiT 路由 / image_mask 构建 / repeat-lockstep / VLLN+dim 对齐 / flow-matching 数学 / state-dropout / 去 future tokens —— 均忠实移植，无实现 bug。<b>Brief 担心的"Qwen3-VL token 布局 ≠ Eagle/Cosmos 致路由失效"不成立</b>（Cosmos-Reason2 本身就是 Qwen3-VL 架构）。
+<br><br>
+<b>🎯 裁决：① 把"N1.7 头设计不迁移"这一结论<u>撤回</u>，降为"不完整移植（错特征层 + 5 个 delta 同开 + 推理延迟压低绝对值）下显著差于 v1"。② 部分解冻不是当前该跑的实验</b>——v1 用<b>一模一样的 100% 冻结通用 Qwen3-VL</b> 拿了 53.3%，"冻结通用 VLM"解释不了 v1→v2 的暴跌（这才是要解释的现象）。<b>最高 ROI 的单变量决定性实验 = 把 <code>hidden_states[-1]</code> 改成中层（≈第 12 层）后重跑 head-only</b>：若从 13% 回到 ≥ v1，则负面是移植窟窿、非头设计；若仍低，再跑已写好的 v2-lite 做 delta 归因。<b>解冻须先修 ② + ③ 才值得排队，且应同时给 v1 头跑解冻对照，否则仍无法归因。</b>
+<span class="en"><b>EN verdict:</b> Retract "N1.7 head doesn't transfer." The decisive, cheap next experiment is mid-layer feature select (<code>[-1]</code>→layer-12) head-only, NOT unfreeze (which is a silent no-op as wired + bf16-lossy, and can't explain a v1→v2 drop both share the same frozen generic VLM).</span>
+</div>
+
+<h2>7. 为什么 v2 应该赢 v1 —— 机制论证与收益排序 / Why it should win（事后看：预期落空）</h2>
+<p>按双评审收敛后的<b>预期收益排序</b>（两位评审独立给出几乎相同的顺序）：</p>
+<ol>
+<li><b>VLLN（预期收益最大）</b>：冻结 VLM 的 hidden 不为从零训的头做任何尺度保证，4096 维裸喂是最根本的分布错配；一个 LayerNorm 8K 参数直接修输入统计。PI_v3 的 per-layer projector 内含 LayerNorm，干的是同一件事——这可能是它赢 v1 的一半原因。</li>
+<li><b>删 future tokens</b>：32 个任务无关可学习前缀在 60-demo 上是纯过拟合面，N1.6/N1.7 都已删；免费，但别指望它单独值 10 个点。</li>
+<li><b>AlternateVLDiT（收益中等，初稿高估处已修正）</b>：448² 双相机出 ~600+ 图 token、文 token 仅 ~20。<b>但 PickOrange 是单任务，指令是常量</b>——此项的真实收益是"图 token 条件不被 padding/文本稀释"的质量提升，而非语言理解跃迁（双评审一致指出初稿的"指令带宽"论证在单任务下高估，预计 1–3 点）。</li>
+<li><b>state_dropout 0.2（辅助正则）</b>：6 维 proprio 的捷径风险存在但 PickOrange 重心在视觉定位，预计 0–2 点。</li>
+<li><b>DiT 768→1536（收益最不确定、风险最大）</b>：砍半 5.3× 压缩瓶颈、0.7B ≈ PI_v3 0.63B 排除参数量解释——但 3× 参数在 60-demo 上同样可能把 v1 的 30k 悬崖<b>提前</b>。这正是 v2-lite 先行的原因：先确认 1+2+4 的统计/正则收益，扩容的归因才干净。</li>
+</ol>
+
+<h2>8. 风险与混淆因子（如实写）/ Risks & confounds</h2>
+<table>
+<tr><th>风险</th><th>说明</th><th>对策</th></tr>
+<tr><td>对 N1.7 的比较<b>不对等</b></td><td>N1.7 SOTA 的头经过<b>机器人数据预训练</b>（我们 from-scratch）+ <code>use_relative_action=True</code>（数据侧）+ Cosmos-Reason2 具身预训练骨干。即使 v2 头逐件对齐，68.3% 也可能够不着。</td><td>诚实归因：v2 的对照组是 v1(53.3%) 与 PI_v3(63.3%)，对 N1.7 只是"逼近"；relative action 列为后续独立消融。</td></tr>
+<tr><td>头变大 → 过拟合更快</td><td>0.24B→0.7B，60 demo；v1 已有 30k 悬崖</td><td>state_dropout/dropout 0.2 已是对冲；save 6000 密集存档 + 增量 eval 抓峰；若 10k 内即峰，缩 <code>num_layers 16→12</code> 重跑</td></tr>
+<tr><td>VRAM / 速度</td><td>头 0.7B：AdamW fp32 状态 ~8.4G + bf16 权重/梯度 ~2.8G + 冻结 8B VLM ~16G + 激活（<code>repeated_diffusion_steps=8</code> 把 4096 hidden ×8 喂 cross-attn）→ 纸面峰 ~38–44G，<b>双评审都警告这只是估算</b>；step 时间评审估 2.0–2.5s（1536 attention O(n²d)）</td><td><b>冒烟实测 peak memory + optimizer state 后才准开长训</b>；OOM 第一杠杆 <code>repeated_diffusion_steps 8→4</code>，第二杠杆 <code>vl_proj_dim: 2048</code>，第三杠杆 bs 4→2（步数×2）</td></tr>
+<tr><td>image_mask 接缝错位（<b>双评审头号硬伤</b>）</td><td>三个坑：(a) 训练侧 repeat 漏对齐 → 静默广播路由全错；(b) predict 路径漏传 mask；(c) mask 语义写反（N1.7 是"可 attend"bool，不是 HF additive mask）</td><td>§5 代码已写死 repeat+断言；冒烟断言 image_mask.sum()&gt;0 且 == vision patch 数（已核验 Qwen3-VL-8B <code>image_token_id=151655</code>、video=151656 不混淆；dataloader 里的 151655 硬编码不在本路径）；单测一个 batch 可视化 mask</td></tr>
+<tr><td>静默架构差异：PE / output_dim</td><td>starVLA DiT 类签名默认 <code>positional_embeddings="sinusoidal"</code>，N1.7 ckpt 实测 <code>null</code>；output_dim 决定 action_decoder 输入维度</td><td>v2 yaml 显式写 <code>positional_embeddings: null</code> + <code>output_dim: 1024</code>（v1 config 本来就传 None，保持一致）</td></tr>
+<tr><td>8bit eval 量化差异</td><td>v2 头更依赖 VL 特征细节，VLM int8 或损更明显</td><td>v1/PI_v3 已实锤 8bit≈bf16（35.0%=35.0%）；若 v2 异常再用云端 bf16 复核一个 ckpt</td></tr>
+<tr><td>上游 rebase 冲突</td><td>—</td><td>全部新文件，零冲突面（fork CLAUDE.md 铁律的设计目的）</td></tr>
+</table>
+
+<h2>9. 不做什么 / Non-goals</h2>
+<ul>
+<li>不改 v1 <code>QwenGR00T.py</code>/<code>GR00T_ActionHeader.py</code> 一行——榜单上 53.3% 的 ckpt 必须永远可复现（Never break userspace）。</li>
+<li>不动数据管线、归一化、benchmark 口径（action_horizon=16、448、STEP_HZ 等）。</li>
+<li>不在本期做 relative action / action_horizon 40 / VL self-attn 消融——它们是 v2 落地后的独立实验。</li>
+</ul>
+
+<h2>9.5 实现状态 / Implementation status（2026-06-12）</h2>
+<div class="ok"><b>代码已落地 + 静态冒烟通过</b>（fork 新文件，上游零改动）：
+<ul>
+<li><code>starVLA/model/modules/action_model/GR00T_N17_ActionHeader.py</code> — <code>FlowmatchingActionHeadN17</code> + <code>AlternateVLDiT</code>（继承 fork 已有 DiT）+ 可选 <code>SelfAttentionTransformer</code>；DiT-N17 词条 = 1536/32×48。</li>
+<li><code>starVLA/model/framework/VLM4A/QwenGR00T_N17.py</code> — <code>framework.name: QwenGR00T_N17</code> 经 registry 自动发现；image_mask 在 train（同步 repeat+断言）与 predict 双路径都传。</li>
+<li>LeIsaac 配置：<code>scripts/training/starvla/configs/so101_qwen3vl8b_gr00t_v2{,_lite}.yaml</code>。</li>
+</ul>
+CPU 假 batch 冒烟（<code>/tmp/smoke_gr00t_v2_head.py</code>）4 个变体全过：
+<b>v2-full 612.0M</b>（≈PI_v3 634M ✓）/ v2-lite 180.3M / +proj2048 570.1M / +vlsa4L 838.6M；
+forward loss 有限值、predict shape (B,16,6) ✓；state_dropout 实测 22/100 ≈ 0.2 ✓；
+<b>漏传 image_mask、漏 repeat 的 mask 均触发 AssertionError</b>（不会静默错路由）✓。
+待办 = 云端 500 步冒烟（实测 VRAM/step 时间）→ 按 §6 两段式开跑。</div>
+
+<h2>10. 评审记录 / Review log</h2>
+<p class="small">2026-06-12，两个独立评审（均给只读源码权限，自主核对了 starVLA 头 / N1.7 头 / SOTA ckpt config）：
+<b>codex</b>（gpt-5.5，26 条意见）与 <b>mimo-v2.5-pro</b>（5 大节）。本节记录收敛意见与采纳情况；初稿据此已全文修订。</p>
+
+<h3>双评审收敛点（全部采纳）</h3>
+<table>
+<tr><th>意见</th><th>采纳动作</th></tr>
+<tr><td><b>优先级重排</b>：VLLN 收益最大（冻结 VLM 尺度错配是根本问题），DiT 768→1536 扩容收益最不确定/风险最大（60-demo 上 3× 参数可能让悬崖提前）；初稿§7 把扩容排太前</td><td>§7 按 VLLN &gt; 删 future &gt; Alternate &gt; state_dropout &gt; 扩容 重写，每项标预期点数</td></tr>
+<tr><td><b>两段式跑法</b>：先跑 v2-lite（VLLN+删 future+state_dropout，DiT-B 不扩，~20 行/13h 便宜验证），到 ~58%+ 再上 v2-full，归因才干净</td><td>TL;DR、§5（lite yaml）、§6（2a/2b 两阶段）全部落入；同一头实现两份 config</td></tr>
+<tr><td><b>image_mask 是头号硬伤面</b>：train 侧必须与 last_hidden/attention_mask 同步 repeat（漏了静默广播路由全错）；predict 路径也必须传；mask 语义照抄 N1.7 的"可 attend"bool 不要反</td><td>§5 代码段写死 repeat+assert+双路径+语义注释；§8 风险行展开为三个坑</td></tr>
+<tr><td><b>AlternateVLDiT 语言收益在单任务下被初稿高估</b>：PickOrange 指令是常量，真实收益是图 token 条件质量，预计 1–3 点</td><td>§7 第 3 条改写</td></tr>
+<tr><td><b>state_dropout 只做特征层一遍</b>：N1.7 实际 processor+head 两层叠加（有效 36%），照搬会过正则</td><td>§4 对应行注明只在 state_encoder 后置零、training only</td></tr>
+<tr><td><b>验收收紧</b>：20-round 的 5-round σ 大，+2 点不算赢；有效胜利 = +5 点或 P(3) 显著改善；63.3% 偏激进（现实 58–62%），未达不解读为 deltas 无效</td><td>§6 验收标准重写</td></tr>
+<tr><td><b>显存/速度别信纸面</b>：0.7B 头 AdamW 状态沉重，38–44G 是估算；step 可能 2.0–2.5s（33–42h）</td><td>§6 阶段 0 加"实测 optimizer state 后才开长训"；§8 行更新</td></tr>
+</table>
+
+<h3>单方意见与裁决</h3>
+<table>
+<tr><th>来源</th><th>意见</th><th>裁决</th></tr>
+<tr><td>codex #16</td><td>4096 直连与 N1.7 的 2048 直连<b>不等价</b>，4096→2048 LN+Linear 投影该做 P0 fallback（mimo 认为不需要：cross-attn 原生支持维度差）</td><td><b>折中采纳</b>：默认直连（少一个部件），<code>vl_proj_dim</code> config 开关留作 OOM/不稳 fallback（§4/§5）</td></tr>
+<tr><td>codex #17/18</td><td>60k 偏长（重点 12k–36k）；save_interval 6000 太稀漏 best → 3000</td><td><b>采纳</b>：§6 改 save 3000（3k–36k 段）+ 峰后三连降即停</td></tr>
+<tr><td>mimo</td><td><code>positional_embeddings</code>/<code>output_dim</code> 不显式写会埋静默架构差异（starVLA DiT 类签名默认 sinusoidal，N1.7 ckpt 是 null）</td><td><b>采纳</b>：v2 yaml 显式 null/1024；另核验 v1 config 本就传 None，无历史污染（§5/§8）</td></tr>
+<tr><td>mimo</td><td>151655 硬编码兼容性风险</td><td><b>核验后降级</b>：Qwen3-VL-8B 实测 <code>image_token_id=151655</code> 恰好一致，且 dataloader 硬编码不在 QwenGR00T 模型路径；保留冒烟断言兜底</td></tr>
+<tr><td>mimo</td><td>提前终止：ckpt-6000 3-round 塌到 &lt;30% 直接 abort</td><td><b>变体采纳</b>：沿用 LeIsaac 三连 0 abort 铁律 + 新增"峰后连续 3 ckpt 单调下滑即停训"（§6）</td></tr>
+<tr><td>codex #20</td><td>v2 best ckpt 云端 bf16 复核一次，排除 int8 归因噪音</td><td><b>采纳</b>（§6 阶段 4）</td></tr>
+</table>
+<p class="small">两份原始评审全文：<code>/tmp/codex_gr00t_v2_review.log</code>、<code>/tmp/mimo_gr00t_v2_review.log</code>（临时文件，要点已全部沉淀进本文档）。</p>
+
+<h2>11. 下一轮：部分解冻 VLM 顶层 / Next: partial VLM unfreeze</h2>
+<div class="warn"><b>⚠️ 本节前提已被 §6.5 三方评审推翻（2026-06-13），保留作为"修好+对照后才排队"的备选。</b>
+评审指出：v1 用<b>同一个</b> 100% 冻结的通用 Qwen3-VL 拿了 53.3%，所以"冻结通用 VLM"<b>解释不了 v1→v2 的暴跌</b>；且当前解冻实现是<b>静默 no-op</b>（见下"已知 bug"）。<b>正确的下一步是先跑 §6.5 裁决里的"中层特征"单变量复测</b>（<code>hidden_states[-1]</code>→≈第 12 层），而非本节的解冻。解冻仅在 ① bug 修复 ② 同时给 v1 头跑解冻对照 之后才有归因价值。
+<span class="en"><b>EN:</b> Premise overturned by the §6.5 review — v1 used the SAME frozen generic VLM and hit 53.3%, so "frozen VLM" can't explain the v1→v2 drop, and the unfreeze is a silent no-op as wired. Do the mid-layer re-measure first.</span></div>
+<div class="note"><b>动机（原始，已下调）/ Motivation (original, downgraded)</b>：§6.5 的 head-only 负面（17500 strict 13.3% / P(3)=0）曾被推测根因是 <b>100% 冻结一个通用网络预训练的 Qwen3-VL</b>——head 单独无法把"不懂机器人"的视觉特征适配到任务上。
+<span class="en"><b>EN:</b> The head-only negative most likely stems from fully freezing a GENERIC web-pretrained Qwen3-VL — the head alone can't adapt non-embodiment features to the task.</span></div>
+<p><b>官方先例（读自本地 GR00T 代码，非论文）</b>：GR00T 用 <code>tune_top_llm_layers</code> 解冻 LLM 顶部 N 层（<code>eagle_backbone.py</code> / N1.7 <code>qwen3_backbone.py</code>：<code>for layer in language_model.layers[-N:]: requires_grad=True</code>）。</p>
+<table>
+<tr><th>release</th><th><code>tune_top_llm_layers</code> 默认</th><th>backbone</th><th>含义</th></tr>
+<tr><td>N1.6</td><td><b>4</b></td><td>Eagle（<b>通用</b> VLM）</td><td>head + 顶 4 层 LLM 一起训</td></tr>
+<tr><td>N1.7</td><td>0（重新全冻）</td><td><b>Cosmos-Reason2</b>（<b>具身预训练</b>）</td><td>骨干已"懂"机器人 → 冻住够用</td></tr>
+<tr><td>我们 v1/v2</td><td>—（=0，全冻）</td><td>Qwen3-VL（<b>通用</b>）</td><td>🔴 head-only = 让不懂机器人的特征器硬扛</td></tr>
+</table>
+<p><b>关键判断</b>：N1.7 重新全冻是<b>因为换了具身预训练的 Cosmos 骨干，不是因为冻结更好</b>。我们的 Qwen3-VL 是通用骨干，情形对应 <b>N1.6 的 Eagle</b>——应当<b>解冻顶 N 层</b>（N1.6 用 4）。榜上自训 GR00T-N1.6（46.7%）正是 <code>tune_top_llm_layers=4</code> 训的，先例有效。</p>
+<h3>实现（已落地，config 开关化）</h3>
+<ul>
+<li><code>QwenGR00T_N17.py</code>：新增 <code>framework.qwenvl.tune_top_llm_layers</code>（默认 0=全冻，向后兼容）+ <code>apply_partial_unfreeze()</code> 方法——定位 <code>qwen_vl_interface.model.model.language_model.layers</code>（8B=36 层）放开末 N 层 <code>requires_grad</code>，路径带多重 fallback。</li>
+<li><code>train_starvla.py</code>：在 <code>freeze_backbones</code> 后加一行通用 hook <code>if hasattr(model,"apply_partial_unfreeze"): model.apply_partial_unfreeze()</code>。其它框架无此方法时自动 no-op。<br><b>🔴 已知 bug（三方评审锁定，2026-06-13，未修勿跑）</b>：此 hook 在 <code>prepare_training()</code> 内执行，而 optimizer 在 <code>main()</code> 中<b>更早</b>构建（<code>:462</code> 先于 <code>:473</code>），且 <code>build_param_lr_groups</code> 按 <code>freeze_modules</code> 把整个 VLM 剔出所有 optimizer group——故被 <code>requires_grad=True</code> 放开的顶 N 层<b>不在任何 optimizer group，永不更新</b>=静默 no-op。<b>修法</b>：把 optimizer 构建移到 freeze+unfreeze 之后，并让 <code>build_param_lr_groups</code> 改按 <code>requires_grad</code>（而非 freeze_modules pattern）判定 frozen；启动日志按每个 LR group 打印实际 param 数防呆。<b>另需</b>：解冻层 <code>.data.to(torch.float32)</code>（fp32 master，仿真 N1.7 <code>backbone_trainable_params_fp32</code>）。</li>
+<li>配置 <code>configs/so101_qwen3vl8b_gr00t_v2_unfreeze4.yaml</code>：<code>tune_top_llm_layers=4</code>，顶层走 <code>qwen_vl_interface</code> LR=1e-5（温和、防灾难性遗忘），head 走 1e-4。</li>
+</ul>
+<h3>VRAM / 预算</h3>
+<p>解冻顶 4 层（8B：~880M 可训参数）新增：AdamW 状态 ~7G + 梯度 ~1.8G + 顶 4 层 backward 激活。head-only 峰值 37.3G/48G → 直接加会逼近/超 48G。<b>杠杆顺序</b>：① <code>repeated_diffusion_steps 8→4</code>（已在 config）；② <code>per_device_batch_size 4→2</code>（步数×2）；③ <code>tune_top_llm_layers 4→2</code>。<code>gradient_checkpointing</code> 在此<b>真正生效</b>（顶层有 backward 可省激活，不像 head-only 时是死字段）。</p>
+<div class="note"><b>验收 / 假设（仅在 bug 修复 + v1 解冻对照齐备后才成立）</b>：若解冻顶 4 层把 strict 拉到 ≳ v1 的 53.3%（且 P(3)&gt;0）<b>且 v1 头同样解冻没有同等提升</b>，才能归因到"通用骨干需解冻"；否则是公共抬升、对 v1→v2 暴跌零分辨力。<span class="en"><b>EN:</b> Only valid after fixing the no-op/bf16 bugs AND running a v1-head unfreeze control; otherwise a shared lift with zero discriminating power on the v1→v2 gap.</span></div>
+
+<h2>12. 实验阶梯（评审后修订）/ Experiment ladder (post-review)</h2>
+<table>
+<tr><th>#</th><th>实验</th><th>改动</th><th>成本</th><th>判据</th></tr>
+<tr><td><b>E1（首选·决定性）</b></td><td>中层特征复测</td><td>仅 <code>QwenGR00T_N17.py</code> 取 <code>hidden_states[≈12]</code>（新增 <code>select_layer</code> config），其余 v2-full 不变，head-only</td><td>1 轮训练</td><td>回到 ≥ v1 → 负面=移植窟窿（撤回结论）；仍 ~13% → 进 E2</td></tr>
+<tr><td>E2</td><td>v2-lite delta 归因</td><td>已写好的 <code>_lite.yaml</code>（DiT-B + VLLN + 去 future + state_dropout，<b>关</b> AlternateVLDiT）</td><td>1 轮</td><td>定位是 AlternateVLDiT / 扩容 / VLLN 哪个砸锅（codex 也指向关 AlternateVLDiT）</td></tr>
+<tr><td>E3（条件触发）</td><td>部分解冻（§11）</td><td><b>先修</b> no-op + bf16 两 bug，<b>再</b>跑 4B unfreeze4 + <b>v1 头解冻对照</b></td><td>2 轮（含对照）</td><td>仅当 E1/E2 排除移植因素后才有意义</td></tr>
+</table>
+
+</body>
+</html>

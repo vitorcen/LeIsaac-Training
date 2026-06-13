@@ -37,7 +37,7 @@ fi
 # Qwen3-VL/Cosmos use the default tf-4.57 env (starvla_eval).
 STARVLA_PY="${STARVLA_PY:-$(conda info --base)/envs/starvla_eval/bin/python}"
 SERVE=$ROOT/LeIsaac/scripts/evaluation/serve_starvla.py
-AGG=$ROOT/scripts/benchmark/aggregate_distribution.py
+AGG=$ROOT/LeIsaac/scripts/benchmark/aggregate_distribution.py
 PROMPT="${PROMPT:-Grab orange and place into plate}"
 
 PORT="${PORT:-8013}"
@@ -97,7 +97,7 @@ nvidia-smi --query-gpu=memory.used --format=csv,noheader | head -1
 
 RENDER=(--headless)
 [ "$GUI" = 1 ] && RENDER=()
-BENCH="$ROOT/scripts/benchmark"
+BENCH="$ROOT/LeIsaac/scripts/benchmark"
 # run_eval ROUNDS METRICS_OUT LOGFILE  — one policy_inference pass against the live serve.
 run_eval(){
   ( cd "$ROOT/LeIsaac" && DISPLAY="${DISPLAY:-:0}" conda run -n isaaclab --no-capture-output \

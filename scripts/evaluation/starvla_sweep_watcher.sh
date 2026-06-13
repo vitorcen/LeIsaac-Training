@@ -27,7 +27,7 @@ PROMPT="Grab orange and place into plate"
 
 PORT="${PORT:-8002}"
 POLL_S="${POLL_S:-180}"
-EVAL_ROUNDS="${EVAL_ROUNDS:-3}"
+EVAL_ROUNDS="${EVAL_ROUNDS:-5}"   # quick-screen = 5-round (user标准 2026-06-12; 3-round variance太大)
 # MATCH scripts/benchmark/run_one.sh authoritative params (else numbers are not
 # leaderboard-comparable): ep_len=120 sim-s + wall_cap=180s, BOTH timeouts active.
 EPISODE_LENGTH_S="${EPISODE_LENGTH_S:-120}"

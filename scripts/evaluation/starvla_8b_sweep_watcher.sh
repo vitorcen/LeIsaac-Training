@@ -26,7 +26,7 @@ PROMPT="Grab orange and place into plate"
 
 PORT="${PORT:-8014}"                       # distinct from 4B watcher (8002) / strict (8013)
 POLL_S="${POLL_S:-300}"                     # 6k ckpts arrive ~every 50min; poll every 5min
-EVAL_ROUNDS="${EVAL_ROUNDS:-3}"            # LeIsaac incremental quick-eval rule (per 1/10 slice)
+EVAL_ROUNDS="${EVAL_ROUNDS:-5}"            # quick-screen = 5-round (user标准 2026-06-12; 3-round variance太大)
 EPISODE_LENGTH_S="${EPISODE_LENGTH_S:-120}"
 MAX_ROUND_WALL_S="${MAX_ROUND_WALL_S:-180}"
 STEP_HZ="${STEP_HZ:-30}"

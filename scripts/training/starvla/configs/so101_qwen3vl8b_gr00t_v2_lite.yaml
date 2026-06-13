@@ -1,0 +1,80 @@
+# SO-101 PickOrange — StarVLA QwenGR00T_v2-LITE (cheap 3-delta validation run)
+# Both external reviews (codex gpt-5.5 + mimo-v2.5-pro) converged on running this
+# FIRST: keep the v1-sized DiT-B (0.24B head) and apply only the cheap N1.7 deltas
+# (VLLN + no future tokens + state_dropout). If this alone lifts 53.3% -> ~58%+,
+# the statistics/regularization deltas are the main course and the expensive
+# DiT-N17 + AlternateVLDiT expansion (v2-full) gets clean attribution.
+# Same head implementation as v2-full — only two switches differ.
+run_id: so101_pickorange_qwen3vl8b_gr00t_v2_lite
+run_root_dir: /root/autodl-tmp/starvla-outputs
+seed: 42
+wandb_entity: ""
+wandb_project: starVLA_SO101
+is_debug: false
+version_id: "0.21"
+
+framework:
+  name: QwenGR00T_N17
+  qwenvl:
+    base_vlm: /root/autodl-tmp/models/Qwen3-VL-8B-Instruct
+    attn_implementation: flash_attention_2
+    vl_hidden_dim: 4096
+  action_model:
+    action_dim: 6
+    state_dim: 6
+    action_horizon: 16
+    action_model_type: "DiT-B"        # ← lite: no expansion (768 x 16L, same as v1)
+    use_vlln: true
+    use_alternate_vl_dit: false       # ← lite: no image/text alternation
+    state_dropout_prob: 0.2
+    num_target_vision_tokens: 0
+    vl_self_attention_cfg: null
+    vl_proj_dim: null
+    diffusion_model_cfg:
+      dropout: 0.2
+      final_dropout: true
+      interleave_self_attention: true
+      norm_type: ada_norm
+      num_layers: 16
+      output_dim: 1024
+      positional_embeddings: null
+
+datasets:
+  vla_data:
+    dataset_py: lerobot_datasets
+    data_root_dir: /root/autodl-tmp/datasets
+    data_mix: so101_pickorange
+    lerobot_version: v2.0
+    sequential_step_sampling: false
+    per_device_batch_size: 4
+    load_all_data_for_training: true
+    video_backend: torchvision_av
+
+trainer:
+  max_train_steps: 30000             # head size unchanged -> v1 peak was ~30k (3.3 ep)
+  num_warmup_steps: 1500
+  save_interval: 3000
+  eval_interval: 100000
+  keep_last_checkpoints: 12
+  learning_rate:
+    base: 2.5e-05
+    qwen_vl_interface: 1.0e-05
+    action_model: 1.0e-04
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-06
+  freeze_modules: 'qwen_vl_interface'
+  loss_scale:
+    vla: 1.0
+    vlm: 0.1
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  logging_frequency: 10
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 1
+  gradient_checkpointing: true
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-08
