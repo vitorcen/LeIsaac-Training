@@ -1,0 +1,98 @@
+# SO-101 PickOrange — StarVLA QwenGR00T_v2 on Qwen3.5-4B, MID-LAYER feature + top-4 UNFREEZE (E3).
+#
+# E3 = partial-unfreeze experiment, GATED behind E1 (mid-layer feature). It builds on the
+# CORRECTED feature layer (select_layer=12), NOT the old broken last-layer config — so it
+# tests "does unfreezing the top-N VLM layers add anything on top of the feature-layer fix",
+# not a re-confounded variable.
+#
+# ⚠️ PREREQUISITE BUGS — fixed 2026-06-13 (before this config is meaningful):
+#   ② build_param_lr_groups excluded VLM params by NAME (freeze_modules) → unfrozen top-N
+#      layers never entered the optimizer (silent no-op). FIXED: now filters by requires_grad,
+#      and the optimizer is built AFTER freeze+unfreeze in train_starvla.main(). A baked-in
+#      assert (V1) fails fast if any unfrozen VLM param is missing from the optimizer.
+#   ③ "unfrozen layers are raw bf16, no fp32 master" → under the real launcher
+#      (accelerate + deepspeed_zero2.yaml, bf16.enabled=true, ZeRO-2) DeepSpeed keeps an fp32
+#      master for every optimizer-managed trainable param, so ③ is resolved once ② is fixed.
+#      Do NOT manually cast these layers to fp32 — that fights DeepSpeed's bf16 contract.
+#
+# Acceptance: vs the frozen head-only mid-layer baseline (E1) AND a v1-head unfreeze CONTROL,
+# strict 20-round. Lift over BOTH = unfreezing the generic Qwen3.5 backbone helps on 60-demo
+# PickOrange (GR00T N1.6 precedent: tune_top_llm_layers=4). No lift / catastrophic forgetting
+# on 60 demos = the deltas/feature layer were the lever, unfreeze is not. Design doc §11/§12.
+run_id: so101_pickorange_qwen35_4b_gr00t_v2_midlayer_unfreeze4
+run_root_dir: /root/autodl-tmp/starvla-outputs
+seed: 42
+wandb_entity: ""
+wandb_project: starVLA_SO101
+is_debug: false
+version_id: "0.21"
+
+framework:
+  name: QwenGR00T_N17
+  qwenvl:
+    base_vlm: /root/autodl-tmp/models/Qwen3.5-4B
+    attn_implementation: flash_attention_2   # dead on Qwen3 path (forced sdpa); kept for parity
+    vl_hidden_dim: 2560                       # Qwen3.5-4B text hidden; auto-overridden at runtime
+    tune_top_llm_layers: 4                    # ← THE single variable vs E1: unfreeze top 4 of 32 LLM layers
+    select_layer: 12                          # corrected mid layer (= E1); held fixed, NOT a variable here
+    truncate_to_select_layer: true   # GR00T-faithful pop -> unfreeze layers 8-11 (used top), not discarded 28-31 (E3a no-op fix 2026-06-14)
+  action_model:
+    action_dim: 6
+    state_dim: 6
+    action_horizon: 16
+    action_model_type: "DiT-N17"
+    use_vlln: true
+    use_alternate_vl_dit: true
+    attend_text_every_n_blocks: 2
+    state_dropout_prob: 0.2
+    num_target_vision_tokens: 0
+    vl_self_attention_cfg: null
+    vl_proj_dim: null
+    diffusion_model_cfg:
+      dropout: 0.2
+      final_dropout: true
+      interleave_self_attention: true
+      norm_type: ada_norm
+      num_layers: 16
+      output_dim: 1024
+      positional_embeddings: null
+
+datasets:
+  vla_data:
+    dataset_py: lerobot_datasets
+    data_root_dir: /root/autodl-tmp/datasets
+    data_mix: so101_pickorange
+    lerobot_version: v2.0
+    sequential_step_sampling: false
+    per_device_batch_size: 4          # ↓ from 8: unfreeze adds ~4 layers of grads + AdamW state; smoke-confirm VRAM then raise
+    load_all_data_for_training: true
+    video_backend: pyav              # see midlayer config: torchvision_av leaks dav1d threads
+
+trainer:
+  max_train_steps: 30000
+  num_warmup_steps: 1500
+  save_interval: 3000                # 10 even slices
+  eval_interval: 100000
+  keep_last_checkpoints: 6
+  learning_rate:
+    base: 2.5e-05
+    qwen_vl_interface: 1.0e-05        # ← NOW ACTIVE: lr for the unfrozen top-4 VLM layers (gentle, anti-forgetting)
+    action_model: 1.0e-04            # head
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-06
+  freeze_modules: 'qwen_vl_interface'  # freezes whole VLM; apply_partial_unfreeze re-enables top-4 AFTER
+  loss_scale:
+    vla: 1.0
+    vlm: 0.1
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  logging_frequency: 10
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 1
+  gradient_checkpointing: true       # dead field on Qwen3 path; if VRAM tight, lower per_device_batch_size instead
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-08

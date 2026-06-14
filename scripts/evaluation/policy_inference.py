@@ -842,5 +842,25 @@ def main():
 
 
 if __name__ == "__main__":
-    # run the main function
-    main()
+    # Isaac's headless SimulationApp hangs in teardown when the interpreter shuts
+    # down with the app still alive — both on an exception escaping main() (e.g.
+    # the policy server never came up -> "Failed to connect to policy server")
+    # and sometimes on the normal exit path. That freeze defeats the eval
+    # wrapper's fast server-crash retry (run_one never returns, the log goes
+    # stale, the GPU stays pinned for ~12 min until a hard timeout). So bypass
+    # the hanging teardown with an immediate hard exit in BOTH cases — the
+    # metrics file is written incrementally during the run, so nothing is lost.
+    import os
+    import sys
+    import traceback
+
+    try:
+        main()
+    except BaseException:  # noqa: BLE001 — print the cause, then hard-exit
+        traceback.print_exc()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(1)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)

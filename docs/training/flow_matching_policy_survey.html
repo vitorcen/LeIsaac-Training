@@ -1,0 +1,272 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>Flow-Matching 策略选型 — 替代 ACT/DP 的非-VLM baseline 调研</title>
+<style>
+  :root {
+    color-scheme: light;
+    --bg: #fafafa; --fg: #1a1a1a; --muted: #555;
+    --accent: #1f6feb; --warn: #d29922; --bad: #cf222e; --good: #1a7f37;
+    --code-bg: #f3f3f3; --border: #d0d7de;
+  }
+  body { font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+         background: #fff; color: var(--fg);
+         max-width: 1040px; margin: 28px auto; padding: 0 22px; line-height: 1.62; }
+  h1 { border-bottom: 2px solid var(--fg); padding-bottom: 6px; }
+  h2 { margin-top: 38px; border-left: 4px solid var(--accent); padding-left: 10px; }
+  h3 { margin-top: 24px; color: var(--accent); }
+  .en { color: var(--muted); font-style: italic; font-size: 0.92em; }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0; font-size: 0.92em; background:#fff; }
+  th, td { border: 1px solid var(--border); padding: 6px 10px; text-align: left; vertical-align: top; color: var(--fg); }
+  th { background: #f0f3f6; }
+  code, pre { font-family: "JetBrains Mono", Menlo, Consolas, monospace; }
+  pre { background: var(--code-bg); color: var(--fg); padding: 12px; border-radius: 4px; overflow-x: auto; font-size: 0.86em; }
+  code { background: var(--code-bg); color: var(--fg); padding: 1px 5px; border-radius: 3px; }
+  .tag-good { color: var(--good); font-weight: 600; }
+  .tag-warn { color: var(--warn); font-weight: 600; }
+  .tag-bad  { color: var(--bad); font-weight: 600; }
+  .callout { border-left: 4px solid var(--warn); background: #fff8e6; padding: 10px 14px; margin: 14px 0; }
+  .callout.bad { border-color: var(--bad); background: #ffeef0; }
+  .callout.good { border-color: var(--good); background: #e6f4ea; }
+  .callout.info { border-color: var(--accent); background: #eef4ff; }
+  svg { display: block; margin: 16px auto; background: #fff; }
+  ul { padding-left: 22px; } li { margin: 4px 0; }
+  .meta { color: var(--muted); font-size: 0.9em; }
+  .star { font-weight: 700; }
+  .s1{color:var(--bad)} .s3{color:var(--warn)} .s5{color:var(--good)}
+</style>
+</head>
+<body>
+
+<h1>Flow-Matching 策略选型调研</h1>
+<p class="meta">SO-101 PickOrange · 为 ACT/Diffusion-Policy 寻找<b>非-VLM</b> flow-matching 替代 baseline · 2026-06-13</p>
+<p class="en"><b>Goal:</b> survey 5 open-source flow-matching manipulation policies, pick the best fit for the
+RGB-only SO-101 PickOrange contract — or conclude none drop in and write a minimal one. Three independent
+reviews (Claude + codex/gpt-5.5 + mimo-v2.5-pro) converge on the same answer.</p>
+
+<h2>0. TL;DR</h2>
+<div class="callout good">
+<b>结论：5 个仓库没有一个能直接 drop-in。</b>
+<ul>
+<li>2 个是<b>点云/深度</b>派（PointFlowMatch、FlowPolicy）→ 被 PickOrange <b>RGB-only</b> 硬约束<span class="tag-bad">直接淘汰</span>。</li>
+<li>A2A_Flow_Matching 是最佳外部候选（RGB + 单臂 + Isaac + 1-step 0.56ms + Apache-2.0），但<b>绑死 RoboVerse</b>、需写 LeRobot 桥 + serve 适配 → 是 <b>port 不是 swap</b>。</li>
+<li>streaming / HRI-EU：前者无 LICENSE 且图像变体打不过 DP，后者深度+affordance 为主 → 都只能<b>借思想</b>。</li>
+</ul>
+<b>推荐路线 <span class="tag-good">自己写最小 CFM head</span>：</b> 复用现成 lerobot Diffusion-Policy 全套接线
+（image encoder + UNet1D + LeRobotDataset loader + serve/eval 适配器），<b>只把 DDPM 噪声预测目标换成
+直线 conditional flow-matching（rectified flow）速度场</b>。零新耦合、真·drop-in、RGB 原生。
+</div>
+<div class="callout bad">
+<b>三方评审一致的最强警告 <span class="en">the head is the wrong bottleneck</span>：</b>
+DP 现在 8.3% vs ACT 43.3% 的 5× 差距，<b>大概率不是 head 问题，是 DP 把图像缩到 240×320 把橙子（10–40px）糊没了</b>。
+换 flow-matching head <b>不会</b>修好视觉 grounding。
+<b>所以第一步不是写 FM，而是：先把 DP 分辨率拉回高分辨率重测 DP baseline</b>，否则你是在跟一个被蒙住眼的对手比，FM 赢了也不知道是 FM 赢还是分辨率赢。
+</div>
+
+<h2>1. PickOrange 硬约束（候选必须满足）<span class="en">the contract</span></h2>
+<table>
+<tr><th>维度</th><th>取值</th><th>对 FM 选型的含义</th></tr>
+<tr><td><b>观测模态</b></td><td><b>RGB-only</b>：front + wrist 两路 480×640×3 uint8，<b>无深度/无点云</b></td><td class="tag-bad">点云/深度派全部淘汰</td></tr>
+<tr><td>State / Action</td><td>6-D 绝对关节角 / 6-D 绝对关节角，chunk horizon</td><td>需绝对动作 + chunk 输出 (B,T,6)</td></tr>
+<tr><td>数据</td><td>LeRobotDataset；60 demos / ~36k frames（<b>极小</b>）</td><td>小数据 → 越简单的生成先验越好</td></tr>
+<tr><td>Eval</td><td>Isaac 闭环 · serve_&lt;policy&gt;.sh（WebsocketPolicyServer）+ ServicePolicyClient · strict 20-round · &lt;30s 返回 chunk</td><td>需 serve 适配器；非 LeRobot 原生 = 要写桥</td></tr>
+<tr><td>现有 baseline</td><td>ACT <b>43.3%</b> · Diffusion-Policy <b>8.3%</b>（DP 缩到 240×320）</td><td>新 FM 要先打平 ACT 才有意义</td></tr>
+<tr><td><b>视觉分辨率铁律</b></td><td>橙子 10–40px，需 ≥448-class encoder；SigLIP@224 曾把 π0.5 拖到 1.7%</td><td class="tag-warn">真正瓶颈在 encoder，不在 head</td></tr>
+</table>
+<p class="en"><b>In-tree note:</b> lerobot v0.5.2 already ships flow-matching heads — pi0 / pi05 / EO1 (all VLM, excluded
+by "non-VLM"), and Multi-Task-DiT (<code>objective="flow_matching"</code>) which is non-VLM but uses a weak CLIP-CLS@224
+vision tower (历史 5–30%). 所以"现成可用的非-VLM FM"几乎只有 Multi-Task-DiT，且视觉同样弱。</p>
+
+<h2>2. Flow-Matching 策略族谱 <span class="en">the modality split decides everything</span></h2>
+<svg width="960" height="300" viewBox="0 0 960 300" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,Segoe UI,PingFang SC,sans-serif">
+  <rect x="0" y="0" width="960" height="300" fill="#fff"/>
+  <rect x="370" y="14" width="220" height="40" rx="6" fill="#eef4ff" stroke="#1f6feb"/>
+  <text x="480" y="39" text-anchor="middle" font-size="14" fill="#1a1a1a" font-weight="700">Flow-Matching manipulation policies</text>
+
+  <!-- left branch: point cloud -->
+  <line x1="480" y1="54" x2="190" y2="88" stroke="#cf222e" stroke-width="1.5"/>
+  <rect x="40" y="88" width="300" height="44" rx="6" fill="#ffeef0" stroke="#cf222e"/>
+  <text x="190" y="106" text-anchor="middle" font-size="13" fill="#cf222e" font-weight="700">3D / 点云 · 深度派</text>
+  <text x="190" y="124" text-anchor="middle" font-size="11.5" fill="#555">需 depth/point cloud → RGB-only 淘汰</text>
+  <rect x="40" y="146" width="146" height="40" rx="5" fill="#fff" stroke="#cf222e"/>
+  <text x="113" y="163" text-anchor="middle" font-size="12" fill="#1a1a1a" font-weight="600">PointFlowMatch</text>
+  <text x="113" y="178" text-anchor="middle" font-size="10.5" fill="#555">Freiburg · CoRL'24 · 50 NFE</text>
+  <rect x="194" y="146" width="146" height="40" rx="5" fill="#fff" stroke="#cf222e"/>
+  <text x="267" y="163" text-anchor="middle" font-size="12" fill="#1a1a1a" font-weight="600">FlowPolicy</text>
+  <text x="267" y="178" text-anchor="middle" font-size="10.5" fill="#555">AAAI'25 · 1-step 19.9ms (DP3)</text>
+  <text x="190" y="210" text-anchor="middle" font-size="13" fill="#cf222e" font-weight="700">Fit 1/5 — 模态不符</text>
+
+  <!-- right branch: RGB -->
+  <line x1="480" y1="54" x2="700" y2="88" stroke="#1a7f37" stroke-width="1.5"/>
+  <rect x="540" y="88" width="380" height="44" rx="6" fill="#e6f4ea" stroke="#1a7f37"/>
+  <text x="730" y="106" text-anchor="middle" font-size="13" fill="#1a7f37" font-weight="700">RGB / 图像派（候选区）</text>
+  <text x="730" y="124" text-anchor="middle" font-size="11.5" fill="#555">共同不变量：UNet/DiT 上换 CFM 速度场</text>
+  <rect x="540" y="146" width="118" height="50" rx="5" fill="#fff" stroke="#1a7f37"/>
+  <text x="599" y="164" text-anchor="middle" font-size="12" fill="#1a1a1a" font-weight="600">A2A_FM</text>
+  <text x="599" y="179" text-anchor="middle" font-size="10" fill="#555">RSS'26 · 1-step</text>
+  <text x="599" y="191" text-anchor="middle" font-size="10" fill="#1a7f37" font-weight="700">Fit 3/5</text>
+  <rect x="666" y="146" width="118" height="50" rx="5" fill="#fff" stroke="#d29922"/>
+  <text x="725" y="164" text-anchor="middle" font-size="12" fill="#1a1a1a" font-weight="600">streaming-FP</text>
+  <text x="725" y="179" text-anchor="middle" font-size="10" fill="#555">MIT · 无 license</text>
+  <text x="725" y="191" text-anchor="middle" font-size="10" fill="#d29922" font-weight="700">Fit 2/5</text>
+  <rect x="792" y="146" width="118" height="50" rx="5" fill="#fff" stroke="#d29922"/>
+  <text x="851" y="164" text-anchor="middle" font-size="12" fill="#1a1a1a" font-weight="600">HRI-EU FM</text>
+  <text x="851" y="179" text-anchor="middle" font-size="10" fill="#555">Honda · RGB-D</text>
+  <text x="851" y="191" text-anchor="middle" font-size="10" fill="#d29922" font-weight="700">Fit 2/5</text>
+
+  <!-- bottom: our move -->
+  <line x1="599" y1="196" x2="599" y2="232" stroke="#1f6feb" stroke-width="1.5" stroke-dasharray="4 3"/>
+  <line x1="725" y1="196" x2="640" y2="232" stroke="#888" stroke-width="1" stroke-dasharray="3 3"/>
+  <line x1="851" y1="196" x2="660" y2="232" stroke="#888" stroke-width="1" stroke-dasharray="3 3"/>
+  <rect x="320" y="232" width="500" height="52" rx="6" fill="#eef4ff" stroke="#1f6feb" stroke-width="2"/>
+  <text x="570" y="253" text-anchor="middle" font-size="13" fill="#1f6feb" font-weight="700">自研最小 CFM head（借三者的不变量思想）</text>
+  <text x="570" y="271" text-anchor="middle" font-size="11.5" fill="#555">复用 lerobot DP backbone + serve/eval；只换训练目标 DDPM → rectified-flow</text>
+</svg>
+
+<h2>3. 五仓详评 <span class="en">scored against the contract</span></h2>
+<table>
+<tr><th>仓库</th><th>来源/许可</th><th>模态</th><th>推理</th><th>动作表示</th><th>成熟度</th><th class="star">Fit</th><th>淘汰/障碍</th></tr>
+<tr>
+  <td><b>PointFlowMatch</b></td><td>Freiburg · CoRL'24 · GPL-3.0</td>
+  <td class="tag-bad">点云（5×RGB-D 投影 4096 点）</td><td>50 NFE · 354ms</td><td>10-D 绝对 EE 位姿 · PointNet+UNet1D</td>
+  <td>82★ · 冻结 · RLBench 绑死</td><td class="s1">1/5</td><td>RGB-only 淘汰；GPL；CoppeliaSim 绑死</td>
+</tr>
+<tr>
+  <td><b>FlowPolicy</b></td><td>UESTC · AAAI'25 Oral · MIT</td>
+  <td class="tag-bad">3D 点云（DP3 派生）</td><td><b>1-step · 19.9ms</b>（consistency-FM）</td><td>chunk · DP3 编码器</td>
+  <td>167★ · 论文 dump · MuJoCo</td><td class="s1">1/5</td><td>RGB-only 淘汰；无 RGB 编码器；MetaWorld 绑死</td>
+</tr>
+<tr>
+  <td><b>A2A_Flow_Matching</b></td><td>NTU(杨建飞) · RSS'26 · Apache-2.0</td>
+  <td class="tag-good">RGB + proprio 历史</td><td><b>1-step · 0.56ms</b></td><td>8-step chunk · action-from-history（流源=执行过的动作非高斯）· ResNet-18</td>
+  <td>163★ · 新 · <b>RoboVerse 绑死</b></td><td class="s3">3/5</td><td>非 LeRobot；要写桥+serve；ResNet-18 视觉分辨率存疑</td>
+</tr>
+<tr>
+  <td><b>streaming-flow-policy</b></td><td>MIT CSAIL · CoRL'25 Oral · <b>无 LICENSE</b></td>
+  <td class="tag-warn">主要 state/keypoint；图像变体弱</td><td>8.8ms · 积分时间=执行时间，流式吐</td><td>绝对 setpoint · chunk≈8</td>
+  <td>122★ · 公开码=toy+state</td><td class="s3">2/5</td><td>图像变体打不过 DP；<b>无 license 不能 vendor</b></td>
+</tr>
+<tr>
+  <td><b>HRI-EU flow_matching</b></td><td>Honda · arXiv'24 · BSD-3</td>
+  <td class="tag-warn">RGB-D + affordance（Azure Kinect 深度）</td><td>1-NFE · 13ms（TorchCFM）</td><td>32 waypoint 绝对 · 冻结 ViT + UNet</td>
+  <td>266★ · 论文 dump · zarr</td><td class="s3">2/5</td><td>深度+affordance 为主；zarr 非 LeRobot；旧 PL 1.x</td>
+</tr>
+</table>
+
+<h3>3.1 为什么 A2A 是"最佳外部"但仍不直接用</h3>
+<p>A2A 在<b>架构层面完全对口</b>：RGB-only、单臂、Isaac Sim 5.0 跑过、绝对/关节 chunk、Apache-2.0、单步极快、在它自己的 sim
+bench 上打赢 ACT/DDPM-UNet。它的创新点"action-to-action"——把 flow 的<b>起点从高斯噪声换成执行过的动作历史</b>——
+利用运动时序连续性缩短 ODE 路径，因此能 1 步。但：</p>
+<ul>
+<li><b>绑死 RoboVerse</b>：不是 <code>policy.predict(obs)</code> 库，要写 RoboVerse→LeRobot 数据桥 + serve 适配器（同 serve_starvla/serve_wallx 工作量）。</li>
+<li><b>proprio 历史是结构性承重</b>：流源依赖干净的执行动作历史 → 对 state 归一化/置换极敏感（正中我们踩过的 <code>sonic-serve-state-permutation-bug</code> 雷区）。</li>
+<li><b>视觉是 ResNet-18</b>、分辨率未明 → 正是 PickOrange 选型铁律警告的小目标瓶颈。</li>
+</ul>
+<p class="callout info">codex 的判词最锋利：<i>"best external repo ≠ best experiment"</i>。把 A2A 移植进来，会同时引入
+RoboVerse 耦合、history 语义、图像预处理、proprio 约定 4 个不受控变量——它若赢了，你分不清是 FM 赢、A2A 的历史先验赢、
+还是移植时<b>顺手修好了 DP 的视觉通路</b>赢。要做<b>干净的 A/B</b>，就只能改一个变量。</p>
+
+<h2>3.2 Transformer / DiT 对比 <span class="en">why E2 is conv-UNet, not a DiT</span></h2>
+<p><b>5 个项目里谁用了 Transformer?</b> 只有一个。其余清一色 CNN/MLP/PointNet——这本身就是社区在这个数据规模下的共识信号。</p>
+<table>
+<tr><th>项目</th><th>视觉编码</th><th>速度/去噪网络</th><th>Transformer?</th></tr>
+<tr><td>PointFlowMatch</td><td>PointNet</td><td>conditional UNet1D（conv）</td><td>❌</td></tr>
+<tr><td>FlowPolicy</td><td>DP3 点云 MLP</td><td>DP3 conv denoiser</td><td>❌</td></tr>
+<tr><td>A2A</td><td>ResNet-18</td><td>CNN 历史编码 + MLP 速度场</td><td>❌</td></tr>
+<tr><td>streaming-FP</td><td>state / ResNet</td><td>MLP 速度场</td><td>❌</td></tr>
+<tr><td><b>HRI-EU</b></td><td><b>冻结 ViT-B/16</b>（affordance）</td><td>UNet <b>或</b> transformer 两版</td><td>⚠️ 有选项，但实测 <b>CNN &gt; transformer</b></td></tr>
+</table>
+<p><b>CNN-UNet1D（E2 选用） vs DiT Policy（transformer 去噪，如 lerobot <code>multi_task_dit</code> / π0 / RDT 的 DiT action expert）:</b></p>
+<table>
+<tr><th>维度</th><th>CNN-UNet1D（E2）</th><th>DiT / Transformer</th></tr>
+<tr><td>小数据（本项目 60 demo）</td><td class="tag-good">✅ 强归纳偏置（时序局部+权重共享），数据高效</td><td class="tag-bad">❌ 数据饥渴，60 demo 欠/过拟合更重</td></tr>
+<tr><td>扩展性（数百+ demo / 多任务）</td><td>❌ 容量见顶</td><td class="tag-good">✅ scaling laws，数据一大反超</td></tr>
+<tr><td>条件灵活性</td><td>FiLM 全局向量（够用）</td><td class="tag-good">✅ attention 吃 image-token/语言/多视角</td></tr>
+<tr><td>与 VLM token 底座整合</td><td>差</td><td class="tag-good">✅ 天然（VLA 用 DiT 的原因）</td></tr>
+<tr><td>算力 / 显存 / 速度</td><td class="tag-good">✅ 轻、快</td><td>❌ 重、慢、超参敏感</td></tr>
+<tr><td>本项目直接证据</td><td class="tag-good">HRI-EU A/B: CNN&gt;transformer；lerobot DP 只 ship CNN</td><td><code>multi_task_dit</code> 绑 CLIP@224 弱视觉，历史 5-30%</td></tr>
+<tr><td>A/B 干净度</td><td class="tag-good">✅ 与现有 DP baseline 单变量对照</td><td>❌ 同时换 backbone+目标 → 混淆</td></tr>
+</table>
+<div class="callout">
+<b>判断：E2 坚决用 conv-UNet，不上 DiT。</b>① 60 demo 是 CNN 的主场、DiT 的死穴；② 调研里唯一做过直接 A/B 的 HRI-EU 结论是 CNN 胜；③ 单变量对照要求 backbone 不变。
+<b>DiT 的入场条件 = 数据扩到数百+ demo / 多任务，或回到 VLM token 底座（本轮明确绕开的 VLA）</b>，且必须<b>先修视觉分辨率</b>——否则就是拿弱视觉喂数据饥渴架构，双输。记为「E-later 选项」。
+</div>
+
+<h2>4. 三方独立评审一致结论 <span class="en">Claude × codex/gpt-5.5 × mimo-v2.5-pro</span></h2>
+<table>
+<tr><th>问题</th><th>三方共识</th></tr>
+<tr><td><b>Q1</b> 自研 vs 移植 A2A？</td><td class="tag-good">自研最小 CFM head。</b> fork 现成 lerobot DP 接线，dataset/server/eval/动作归一化全保持一致，<b>只换 DDPM→rectified-flow 速度预测</b>。这才是可辩护的 A/B。</td></tr>
+<tr><td><b>Q2</b> FM 能打赢 ACT 43.3% 吗？</td><td class="tag-warn"><b>视觉不修好就别赌。</b>橙子 10–40px 被 224/240 缩没了，再好的动作生成器也救不回被毁的视觉证据。FM 主要赢在推理速度/chunk 平滑/更少步数/小数据上比 DDPM 更稳——<b>不会</b>提升视觉 grounding。<br>预期：ACT(高清) &gt; FM(弱视觉) ≈ DP(弱视觉)。真正该测的：<b>FM(高清) vs ACT(高清)</b>。</td></tr>
+<tr><td><b>Q3</b> 最小第一版怎么搭？</td><td>rectified/线性 CFM · noise→action · 同 DP UNet/chunk/horizon · 同 obs/state/action 契约 · <b>高分辨率编码器（≥448 路径）</b> · 推理扫 1/2/4/8 Euler 步 · <b>不</b>上 consistency、<b>不</b>上 streaming、<b>不</b>上 A2A 历史源（留 v1）。理由：隔离"目标函数"这一个变量。</td></tr>
+<tr><td><b>Q4</b> 漏了什么？</td><td>两个独立都点出：<b>(a) 先 root-cause DP 的 8.3%</b>——多半是 240×320 缩放，修了 DP 可能直接跳到 ~30%，FM 才是在跟诚实的对手比；<b>(b) 抄 π₀ 的 action head 设计</b>（标准 CFM 模块、与 VLM 解耦），而不是抄这 5 个学术 side-project。其他可留作后续：ManiFlow（consistency 1-2 步通用操作）、VFP（变分 FM 解多模态）、RTC（real-time chunking 隐藏延迟）、Latent Action Flow（时序连贯 latent）。</td></tr>
+</table>
+
+<h2>5. 决策与实验阶梯 <span class="en">the honest A/B ladder</span></h2>
+<div class="callout good">
+<b>核心洞察（三方一致）：ACT↔DP 的 5× 差距是"穿着 action-head 外衣的视觉问题"。</b>
+所以先控视觉变量，再问 FM 是否有用。
+</div>
+<table>
+<tr><th>阶段</th><th>实验</th><th>变量</th><th>判据</th></tr>
+<tr><td><b>E0</b></td><td>DP 原版（240×320 低清）</td><td>—（已有 8.3%）</td><td>参照点</td></tr>
+<tr><td><b>E1 ⭐先做</b></td><td><b>DP 高分辨率</b>（不缩，≥448 路径）重训重测</td><td>仅分辨率</td><td>若跳到 ~30% → 证实瓶颈是视觉非 head</td></tr>
+<tr><td><b>E2</b></td><td><b>CFM head</b>（高清，同 DP backbone）</td><td>仅"DDPM→rectified-flow 目标"</td><td>vs E1：FM head 净收益</td></tr>
+<tr><td><b>E3</b></td><td>CFM 推理步数扫 1/2/4/8 Euler</td><td>仅推理步数</td><td>速度/精度权衡（FM 的真卖点）</td></tr>
+<tr><td><b>E4（可选）</b></td><td>ACT 高清对照</td><td>—</td><td>FM(高清) vs ACT(高清) = 终极问题</td></tr>
+<tr><td><b>v1（赢了才做）</b></td><td>consistency-FM(1步) / A2A 历史源 / streaming</td><td>逐个加</td><td>速度或多模态增益</td></tr>
+</table>
+<p class="en"><b>Fair A/B matrix:</b> DP-lowres → DP-highres → CFM-highres(same backbone) → ACT. 只有走完才知道 FM 是否真有位置。</p>
+
+<h2>6. 实现草图 <span class="en">minimal CFM head = a small diff on lerobot DP</span></h2>
+<div class="callout good">
+<b>已落地：<code>LeIsaac/FlowDP</code> submodule</b>（<code>git@github.com:vitorcen/FlowDP.git</code>）。
+<code>FlowMatchingModel(DiffusionModel)</code> 只覆写 <code>compute_loss</code>（DDPM→线性插值速度场）+ <code>conditional_sample</code>（DDIM→Euler），
+encoder/UNet/processor/normalization 全继承；靠 lerobot 命名约定让 <code>processor_flowdp</code> 自动被发现，
+<code>train.py</code> 补丁 <code>get_policy_class</code> 注册 <code>--policy.type=flowdp</code>。启动 <code>scripts/train_e2.sh</code>。
+</div>
+<p>DDPM 与 rectified-flow 在 UNet 输出<b>形状完全相同</b>（都是 (B,T,6)），改动集中在三处：</p>
+<pre>
+# 1) 训练目标：噪声预测 → 直线速度场（rectified flow / linear CFM）
+#    x0 = 高斯噪声, x1 = 真实 action chunk;  x_t = (1-t)*x0 + t*x1
+#    target velocity  v = x1 - x0   （时间无关，直线）
+t   = torch.rand(B, 1, 1, device=dev)            # U(0,1)
+x0  = torch.randn_like(actions)
+xt  = (1 - t) * x0 + t * actions
+v_pred = unet(xt, t.squeeze(-1), global_cond=obs_feat)   # 复用 DP 的 FiLM-UNet1D
+loss = F.mse_loss(v_pred, actions - x0)          # 唯一变化：target 从 noise 改成 (x1-x0)
+
+# 2) 推理：Euler 积分 N 步（N=1/2/4/8 扫），替代 DDIM 32-step
+x = torch.randn(B, T, 6, device=dev)
+for i in range(N):
+    tt = torch.full((B,), i / N, device=dev)
+    x  = x + (1.0 / N) * unet(x, tt, global_cond=obs_feat)
+action_chunk = x                                 # 绝对关节角，直接喂 serve 适配器
+
+# 3) 视觉：去掉 resize 到 240×320，保留 ≥448 路径（E1/E2 的关键控制变量）
+</pre>
+<p>数据加载、归一化、WebsocketPolicyServer/ServicePolicyClient、benchmark harness <b>全部不动</b>——
+这正是"自研最小 head"相对"移植 A2A"的最大优势：<b>新增耦合为零</b>，且与 DP 形成单变量对照。</p>
+
+<h2>7. 不做 / 范围外</h2>
+<ul>
+<li>不碰点云/深度派（PointFlowMatch、FlowPolicy）——模态不符，除非加深度传感器（不在范围）。</li>
+<li>不在 v0 引入 consistency-FM / streaming / A2A 历史源——先隔离"目标函数"单变量。</li>
+<li>不移植任何研究 dump 的数据管线（zarr/RoboVerse）——保持 LeRobotDataset 原生。</li>
+<li>不先写 FM——<b>先做 E1（DP 高清重测）</b>，否则 baseline 不诚实。</li>
+</ul>
+
+<h2>参考 <span class="en">references</span></h2>
+<ul>
+<li>PointFlowMatch — Chisari et al., CoRL 2024, arXiv:2409.07343 · <code>robot-learning-freiburg/PointFlowMatch</code></li>
+<li>FlowPolicy — Zhang et al., AAAI 2025 Oral, arXiv:2412.04987 · <code>zql-kk/FlowPolicy</code></li>
+<li>A2A Flow Matching — Jia et al., RSS 2026, arXiv:2602.07322 · <code>JIAjindou/A2A_Flow_Matching</code></li>
+<li>Streaming Flow Policy — Jiang et al., CoRL 2025 Oral, arXiv:2505.21851 · <code>siddancha/streaming-flow-policy</code></li>
+<li>Affordance-based FM — Zhang &amp; Gienger (HRI-EU), arXiv:2409.01083 · <code>HRI-EU/flow_matching</code></li>
+<li>π₀ (action head 参考) — Physical Intelligence, 2024 · flow-matching action expert decoupled from VLM</li>
+<li>lerobot v0.5.2 in-tree FM：pi0 / pi05 / EO1 / Multi-Task-DiT(<code>objective="flow_matching"</code>)</li>
+<li>三方评审：Claude（本文）· codex/gpt-5.5 · opencode mimo-v2.5-pro（2026-06-13，结论一致）</li>
+</ul>
+
+</body>
+</html>

@@ -5,3 +5,6 @@
 	path = dependencies/starVLA
 	url = git@github.com:vitorcen/StarVLA.git
 	branch = starVLA_dev
+[submodule "FlowHeads"]
+	path = FlowHeads
+	url = git@github.com:vitorcen/FlowHeads.git
